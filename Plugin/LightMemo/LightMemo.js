@@ -144,10 +144,24 @@ class LightMemoPlugin {
         const {
             query, maid, folder, k = 5, rerank = false,
             search_all_knowledge_bases = false,
-            tag_boost = 0.5,
+            tag_boost: rawTagBoost = 0.5,
             core_tags = [],
             core_boost_factor = 1.33
         } = args;
+
+        // 🌟 Wave v8: 解析 tag_boost 的 "+" 后缀
+        // tag_boost:「始」0.6「末」  → 正常浪潮 (tagBoost=0.6, geodesic=false)
+        // tag_boost:「始」0.6+「末」 → 浪潮v8 (tagBoost=0.6, geodesic=true)
+        let useGeodesicRerank = false;
+        let tag_boost = rawTagBoost;
+        if (typeof rawTagBoost === 'string') {
+            if (rawTagBoost.endsWith('+')) {
+                useGeodesicRerank = true;
+                tag_boost = parseFloat(rawTagBoost.slice(0, -1)) || 0;
+            } else {
+                tag_boost = parseFloat(rawTagBoost) || 0;
+            }
+        }
 
         let isMusicSearch = false;
         let actualQuery = query || "";
@@ -155,6 +169,41 @@ class LightMemoPlugin {
         if (actualQuery.includes('[音乐检索]')) {
             isMusicSearch = true;
             actualQuery = actualQuery.replace('[音乐检索]', '').trim();
+        }
+
+        // --- 时间范围约束语法解析 ---
+        let timeRange = null;
+        const timeRangeRegex = /\[\s*(20\d{2}[-./]\d{1,2}(?:[-./]\d{1,2})?)\s*[~到-]\s*(20\d{2}[-./]\d{1,2}(?:[-./]\d{1,2})?)\s*\]/;
+        let timeMatch = actualQuery.match(timeRangeRegex);
+
+        const parseDateToNumber = (dateStr, isEnd) => {
+            const parts = dateStr.split(/[-./]/);
+            const y = parts[0];
+            const m = (parts[1] || (isEnd ? '12' : '01')).padStart(2, '0');
+            const d = (parts[2] || (isEnd ? '31' : '01')).padStart(2, '0');
+            return parseInt(`${y}${m}${d}`, 10);
+        };
+
+        if (timeMatch) {
+            const startNum = parseDateToNumber(timeMatch[1], false);
+            const endNum = parseDateToNumber(timeMatch[2], true);
+            timeRange = { start: startNum, end: endNum };
+            actualQuery = actualQuery.replace(timeMatch[0], '').trim();
+            console.log(`[LightMemo] Parsed time range constraint: ${timeMatch[1]} to ${timeMatch[2]} (${startNum} - ${endNum})`);
+        } else {
+            const singleDateRegex = /\[\s*(20\d{2}[-./]\d{1,2}(?:[-./]\d{1,2})?)\s*\]/;
+            const singleDateMatch = actualQuery.match(singleDateRegex);
+            if (singleDateMatch) {
+                const dateNumStart = parseDateToNumber(singleDateMatch[1], false);
+                const dateNumEnd = parseDateToNumber(singleDateMatch[1], true);
+                timeRange = { start: dateNumStart, end: dateNumEnd };
+                actualQuery = actualQuery.replace(singleDateMatch[0], '').trim();
+                console.log(`[LightMemo] Parsed single date constraint: ${singleDateMatch[1]} (${dateNumStart} - ${dateNumEnd})`);
+            }
+        }
+
+        if (!actualQuery && timeRange) {
+            actualQuery = maid || folder || "记录"; // 如果只有时间约束，给予默认查询词避免向量化报错
         }
 
         if (!isMusicSearch && (!query || (!maid && !folder))) {
@@ -170,7 +219,8 @@ class LightMemoPlugin {
             maid: effectiveMaid,
             folder: effectiveFolder,
             searchAll: effectiveSearchAll,
-            ignoreExcludedFolders: isMusicSearch
+            ignoreExcludedFolders: isMusicSearch,
+            timeRange: timeRange
         });
 
         if (candidates.length === 0) {
@@ -240,7 +290,8 @@ class LightMemoPlugin {
         // 🚀【新步骤】如果启用了 TagMemo，则调用 KBM 的功能来增强向量
         if (tag_boost > 0 && this.vectorDBManager && typeof this.vectorDBManager.applyTagBoost === 'function') {
             const hasCore = Array.isArray(core_tags) && core_tags.length > 0;
-            console.log(`[LightMemo] Applying TagMemo V3 boost (Factor: ${tag_boost}${hasCore ? `, CoreTags: ${core_tags.length}` : ''})`);
+            const waveLabel = useGeodesicRerank ? 'TagMemo+ (Wave v8)' : 'TagMemo V6';
+            console.log(`[LightMemo] Applying ${waveLabel} boost (Factor: ${tag_boost}${hasCore ? `, CoreTags: ${core_tags.length}` : ''})`);
 
             // 即使 core_tags 为空，KBM 内部也会处理好默认逻辑
             const boostResult = this.vectorDBManager.applyTagBoost(
@@ -258,10 +309,10 @@ class LightMemoPlugin {
                     const matched = tagBoostInfo.matchedTags || [];
                     const coreMatched = tagBoostInfo.coreTagsMatched || [];
                     if (coreMatched.length > 0) {
-                        console.log(`[LightMemo] TagMemo V3 Spotlight: [${coreMatched.join(', ')}]`);
+                        console.log(`[LightMemo] TagMemo V6 Spotlight: [${coreMatched.join(', ')}]`);
                     }
                     if (matched.length > 0) {
-                        console.log(`[LightMemo] TagMemo V3 Matched: [${matched.slice(0, 5).join(', ')}]`);
+                        console.log(`[LightMemo] TagMemo V6 Matched: [${matched.slice(0, 5).join(', ')}]`);
                     }
                 }
             }
@@ -298,12 +349,83 @@ class LightMemoPlugin {
             };
         }).sort((a, b) => b.hybridScore - a.hybridScore);
 
+        // 🌟 Wave v8: 测地线重排 (Geodesic Rerank)
+        let rankedCandidates = hybridScored;
+        if (useGeodesicRerank && tag_boost > 0 && tagBoostInfo && this.vectorDBManager && this.vectorDBManager.geodesicRerank) {
+            console.log(`[LightMemo] 🌟 Wave v8: Applying geodesic rerank to ${hybridScored.length} candidates...`);
+
+            // geodesicRerank expects candidates with `id` (chunk ID) and `score` fields
+            const geoInput = hybridScored.map(c => ({
+                ...c,
+                id: c.label,  // label is chunk.id from SQLite
+                score: c.hybridScore || c.vectorScore || 0
+            }));
+
+            const geoConfig = this.vectorDBManager.ragParams?.KnowledgeBaseManager?.geodesicRerank || {};
+            const reranked = this.vectorDBManager.geodesicRerank(geoInput, {
+                alpha: geoConfig.alpha ?? 0.3,
+                minGeoSamples: geoConfig.minGeoSamples ?? 4
+            });
+
+            // Map results back with geodesic metadata
+            rankedCandidates = reranked.map(r => ({
+                ...r,
+                hybridScore: r.score,
+                tagBoostInfo: tagBoostInfo,
+                waveV8: r.geo_score > 0
+            }));
+
+            const geoCount = rankedCandidates.filter(r => r.waveV8).length;
+            console.log(`[LightMemo] 🌟 Wave v8: Geodesic rerank complete. ${geoCount}/${rankedCandidates.length} candidates with geo contribution.`);
+        }
+
         // 取top K
-        let finalResults = hybridScored.slice(0, k);
+        let finalResults = rankedCandidates.slice(0, k);
 
         // --- 第三阶段：Rerank（可选） ---
-        if (rerank && finalResults.length > 0) {
-            finalResults = await this._rerankDocuments(actualQuery, finalResults, k);
+        // 🌟 Rerank+ (RRF): rerank 参数支持多种形式
+        //   false          → 不使用 Rerank
+        //   true           → 标准 Rerank（纯精排，无融合）
+        //   "rrf"          → RRF 融合 (α=0.5)
+        //   "rrf0.7"       → RRF 融合 (α=0.7, Reranker 占 70% 权重)
+        //   0.7 (数字)     → RRF 融合 (α=0.7)，等价于 "rrf0.7"
+        //   "0.7" (字符串) → RRF 融合 (α=0.7)，等价于 "rrf0.7"
+        let useRerank = false;
+        let rrfOptions = null;
+
+        if (rerank === true) {
+            useRerank = true;
+        } else if (typeof rerank === 'number' && rerank > 0 && rerank <= 1.0) {
+            // 直接传数字 → RRF 融合
+            useRerank = true;
+            rrfOptions = { alpha: rerank };
+            console.log(`[LightMemo] 🌟 Rerank+ (RRF) 数字模式启用: α=${rerank}`);
+        } else if (typeof rerank === 'string') {
+            const lowerRerank = rerank.toLowerCase().trim();
+            if (lowerRerank.startsWith('rrf')) {
+                // "rrf" / "rrf0.7" 形式
+                useRerank = true;
+                const alphaMatch = lowerRerank.match(/rrf(\d+\.?\d*)/);
+                const alpha = alphaMatch ? Math.min(1.0, Math.max(0.0, parseFloat(alphaMatch[1]))) : 0.5;
+                rrfOptions = { alpha };
+                console.log(`[LightMemo] 🌟 Rerank+ (RRF) 模式启用: α=${alpha}`);
+            } else {
+                // 尝试解析为数字字符串 "0.7"
+                const numericAlpha = parseFloat(lowerRerank);
+                if (!isNaN(numericAlpha) && numericAlpha > 0 && numericAlpha <= 1.0) {
+                    useRerank = true;
+                    rrfOptions = { alpha: numericAlpha };
+                    console.log(`[LightMemo] 🌟 Rerank+ (RRF) 数字字符串模式启用: α=${numericAlpha}`);
+                } else if (lowerRerank === 'true') {
+                    useRerank = true;
+                }
+            }
+        }
+
+        if (useRerank && finalResults.length > 0) {
+            // 🌟 Rerank+: 注入检索排位 (retrieval_rank) 用于 RRF 融合
+            finalResults.forEach((doc, idx) => { doc.retrieval_rank = idx + 1; });
+            finalResults = await this._rerankDocuments(actualQuery, finalResults, k, rrfOptions);
         }
 
         return this.formatResults(finalResults, query);
@@ -352,7 +474,9 @@ class LightMemoPlugin {
                 // 使用解构默认值，确保即使 tagBoostInfo 结构不完整也能安全运行
                 const { matchedTags = [], coreTagsMatched = [] } = r.tagBoostInfo;
                 if (matchedTags.length > 0 || coreTagsMatched.length > 0) {
-                    let boostLine = `    [TagMemo 增强: `;
+                    // 🌟 Wave v8: 根据是否有测地线贡献显示不同标签
+                    const memoLabel = r.waveV8 ? 'TagMemo+ v8' : 'TagMemo';
+                    let boostLine = `    [${memoLabel} 增强: `;
                     // 只有当确实命中了核心标签时，才显示 🌟 标志
                     if (coreTagsMatched.length > 0) {
                         boostLine += `🌟${coreTagsMatched.join(', ')} `;
@@ -378,7 +502,7 @@ class LightMemoPlugin {
         return Math.ceil(chineseChars * 1.5 + otherChars * 0.25);
     }
 
-    async _rerankDocuments(query, documents, originalK) {
+    async _rerankDocuments(query, documents, originalK, rrfOptions = null) {
         if (!this.rerankConfig.url || !this.rerankConfig.apiKey || !this.rerankConfig.model) {
             console.warn('[LightMemo] Rerank not configured. Skipping.');
             return documents.slice(0, originalK);
@@ -480,18 +604,48 @@ class LightMemoPlugin {
             }
         }
 
-        // 👇 修复：安全排序
-        allRerankedDocs.sort((a, b) => {
-            const scoreA = a.rerank_score ?? 0;
-            const scoreB = b.rerank_score ?? 0;
-            return scoreB - scoreA;
-        });
+        // 🌟 Rerank+ (RRF Fusion) 或标准 Rerank 排序
+        if (rrfOptions) {
+            // --- Reciprocal Rank Fusion (RRF) ---
+            const RRF_K = 60;
+            const alpha = rrfOptions.alpha ?? 0.5;
 
-        const finalDocs = allRerankedDocs.slice(0, originalK);
-        console.log(`[LightMemo] Rerank complete. Final scores:`,
-            finalDocs.map(d => (d.rerank_score || 0).toFixed(3)).join(', '));
+            // Step 1: 按 rerank_score 降序排列，赋予 rerank_rank (1-based)
+            allRerankedDocs.sort((a, b) => (b.rerank_score ?? -1) - (a.rerank_score ?? -1));
+            allRerankedDocs.forEach((doc, idx) => { doc.rerank_rank = idx + 1; });
 
-        return finalDocs;
+            // Step 2: 计算 RRF 融合分数
+            allRerankedDocs.forEach(doc => {
+                const retrievalRank = doc.retrieval_rank || allRerankedDocs.length;
+                const rerankRank = doc.rerank_rank;
+                doc.rrf_score = alpha * (1 / (RRF_K + rerankRank))
+                              + (1 - alpha) * (1 / (RRF_K + retrievalRank));
+            });
+
+            // Step 3: 按 RRF 融合分数降序排列
+            allRerankedDocs.sort((a, b) => b.rrf_score - a.rrf_score);
+
+            const finalDocs = allRerankedDocs.slice(0, originalK);
+            console.log(`[LightMemo] 🌟 Rerank+ (RRF) 完成: ${finalDocs.length}篇文档 (α=${alpha})`);
+            finalDocs.forEach((doc, idx) => {
+                console.log(`  [RRF #${idx + 1}] rrf=${doc.rrf_score?.toFixed(6)} | retrieval_rank=${doc.retrieval_rank} | rerank_rank=${doc.rerank_rank} | rerank_score=${doc.rerank_score?.toFixed(4) ?? 'N/A'} | hybrid_score=${doc.hybridScore?.toFixed(4) ?? 'N/A'}`);
+            });
+
+            return finalDocs;
+        } else {
+            // --- 标准 Rerank 排序（原有逻辑，不变） ---
+            allRerankedDocs.sort((a, b) => {
+                const scoreA = a.rerank_score ?? 0;
+                const scoreB = b.rerank_score ?? 0;
+                return scoreB - scoreA;
+            });
+
+            const finalDocs = allRerankedDocs.slice(0, originalK);
+            console.log(`[LightMemo] Rerank complete. Final scores:`,
+                finalDocs.map(d => (d.rerank_score || 0).toFixed(3)).join(', '));
+
+            return finalDocs;
+        }
     }
 
     /**
@@ -522,7 +676,7 @@ class LightMemoPlugin {
      * 从所有相关日记本中收集chunks（带署名过滤）
      * 适配 KnowledgeBaseManager (SQLite)
      */
-    async _gatherCandidateChunks({ maid, folder, searchAll, ignoreExcludedFolders = false }) {
+    async _gatherCandidateChunks({ maid, folder, searchAll, ignoreExcludedFolders = false, timeRange = null }) {
         const db = this.vectorDBManager.db;
         if (!db) {
             console.error('[LightMemo] Database not initialized in KnowledgeBaseManager.');
@@ -570,6 +724,24 @@ class LightMemoPlugin {
             // 流式遍历过滤后的 chunks
             for (const row of stmt.iterate(...params)) {
                 const text = row.content || '';
+
+                // --- 2.5 时间范围过滤 ---
+                if (timeRange) {
+                    const header = text.substring(0, 100);
+                    const chunkTimeMatch = header.match(/\[?(20\d{2}[-./]\d{1,2}(?:[-./]\d{1,2})?)\]?/);
+                    if (!chunkTimeMatch) {
+                        continue; // 无时间戳，被时间约束丢弃
+                    }
+                    const parts = chunkTimeMatch[1].split(/[-./]/);
+                    const y = parts[0];
+                    const m = (parts[1] || '01').padStart(2, '0');
+                    const d = (parts[2] || '01').padStart(2, '0');
+                    const chunkDateNum = parseInt(`${y}${m}${d}`, 10);
+
+                    if (chunkDateNum < timeRange.start || chunkDateNum > timeRange.end) {
+                        continue;
+                    }
+                }
 
                 // 3. 署名过滤 (如果不是搜索全部且没有指定文件夹)
                 if (!searchAll && targetFolders.length === 0 && maid) {

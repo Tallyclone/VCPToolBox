@@ -5,6 +5,25 @@ const contextManager = require('./contextManager.js');
 const roleDivider = require('./roleDivider.js');
 const fs = require('fs').promises;
 const path = require('path');
+const http = require('http');
+const https = require('https');
+
+// 🌟 核心网络优化：引入防御性长连接池 (Keep-Alive Pool)
+// 解决 "-1s Socket Hang Up" 与上游代理秒断僵尸连接的问题
+const agentOptions = {
+  keepAlive: true,
+  keepAliveMsecs: 1000,     // 维持 Node.js 默认的 1s TCP 探针间隔
+  freeSocketTimeout: 8000,  // 绝杀机制：空闲 Socket 8 秒后主动销毁，防止复用到被上游代理 (如 Nginx) 静默杀死的僵尸连接
+  scheduling: 'lifo',       // 后进先出：永远优先复用刚刚才活跃过、最新鲜的热连接
+  maxSockets: 10000         // 维持全局高并发上限
+};
+const keepAliveHttpAgent = new http.Agent(agentOptions);
+const keepAliveHttpsAgent = new https.Agent(agentOptions);
+
+const getFetchAgent = function(_parsedURL) {
+  return _parsedURL.protocol === 'http:' ? keepAliveHttpAgent : keepAliveHttpsAgent;
+};
+
 const { getAuthCode } = require('./captchaDecoder');
 const ToolCallParser = require('./vcpLoop/toolCallParser');
 const ToolExecutor = require('./vcpLoop/toolExecutor');
@@ -133,6 +152,7 @@ async function fetchWithRetry(
     try {
       const response = await fetch(url, {
         ...options,
+        agent: getFetchAgent, // 注入防御性长连接池
         signal: attemptController.signal,
       });
       cleanup();
@@ -309,6 +329,7 @@ class ChatCompletionHandler {
       pluginManager,
       activeRequests,
       writeDebugLog,
+      writeChatLog,
       handleDiaryFromAIResponse,
       webSocketServer,
       DEBUG_MODE,
@@ -478,41 +499,46 @@ class ChatCompletionHandler {
         detectors: this.config.detectors,
         superDetectors: this.config.superDetectors,
         DEBUG_MODE,
-        messages: tavernProcessedMessages // 将近期消息列表传递下去，用于支持上下文动态折叠 (Contextual Folding)
+        messages: tavernProcessedMessages, // 将近期消息列表传递下去，用于支持上下文动态折叠 (Contextual Folding)
+        // 🔒 灵魂级占位符去重：跨消息共享展开状态
+        // Agent 类：整个上下文只允许展开一个 agent（第一个遇到的），后续所有 agent 占位符均不展开
+        // Toolbox 类：每种 toolbox 各允许展开一次，同名重复出现时不再展开
+        expandedAgentName: null,    // string | null - 已展开的唯一 Agent 别名
+        expandedToolboxes: new Set() // Set<string> - 已展开的 Toolbox 别名集合
       };
 
-      // 调用一个主函数来递归处理所有变量，确保Agent优先展开
-      let processedMessages = await Promise.all(
-        tavernProcessedMessages.map(async msg => {
-          const newMessage = JSON.parse(JSON.stringify(msg));
-          if (newMessage.content && typeof newMessage.content === 'string') {
-            // messageProcessor.js 中的 replaceAgentVariables 将被改造为处理所有变量的主函数
-            newMessage.content = await messageProcessor.replaceAgentVariables(
-              newMessage.content,
-              originalBody.model,
-              msg.role,
-              processingContext,
-            );
-          } else if (Array.isArray(newMessage.content)) {
-            newMessage.content = await Promise.all(
-              newMessage.content.map(async part => {
-                if (part.type === 'text' && typeof part.text === 'string') {
-                  const newPart = JSON.parse(JSON.stringify(part));
-                  newPart.text = await messageProcessor.replaceAgentVariables(
-                    newPart.text,
-                    originalBody.model,
-                    msg.role,
-                    processingContext,
-                  );
-                  return newPart;
-                }
-                return part;
-              }),
-            );
+      // 🔒 顺序处理消息（非并发），确保 agent/toolbox 的"首次展开"语义正确
+      // 如果使用 Promise.all 并发，多条消息可能同时展开同一个 agent，违反"只展开一个"的约束
+      let processedMessages = [];
+      for (const msg of tavernProcessedMessages) {
+        const newMessage = JSON.parse(JSON.stringify(msg));
+        if (newMessage.content && typeof newMessage.content === 'string') {
+          newMessage.content = await messageProcessor.replaceAgentVariables(
+            newMessage.content,
+            originalBody.model,
+            msg.role,
+            processingContext,
+          );
+        } else if (Array.isArray(newMessage.content)) {
+          const newParts = [];
+          for (const part of newMessage.content) {
+            if (part.type === 'text' && typeof part.text === 'string') {
+              const newPart = JSON.parse(JSON.stringify(part));
+              newPart.text = await messageProcessor.replaceAgentVariables(
+                newPart.text,
+                originalBody.model,
+                msg.role,
+                processingContext,
+              );
+              newParts.push(newPart);
+            } else {
+              newParts.push(part);
+            }
           }
-          return newMessage;
-        }),
-      );
+          newMessage.content = newParts;
+        }
+        processedMessages.push(newMessage);
+      }
       if (DEBUG_MODE) await writeDebugLog('LogAfterVariableProcessing', processedMessages);
 
       // --- 媒体处理器 ---
@@ -682,6 +708,13 @@ class ChatCompletionHandler {
             }
           }
 
+          if (writeChatLog) {
+            writeChatLog(originalBody,
+              [ {
+                request: originalBody,
+                response: { error: true, status: upstreamStatus, body: errorBodyText }
+              } ]);
+          }
           // We are done with this request. Return early.
           return;
         }
@@ -779,6 +812,13 @@ class ChatCompletionHandler {
         } else {
           // Non-streaming failure
           res.status(500).json({ error: 'Internal Server Error', details: error.message });
+        }
+        if (writeChatLog) {
+          writeChatLog(originalBody,
+            [ {
+              request: originalBody,
+              response: { error: true, message: error.message }
+            } ]);
         }
       } else if (!res.writableEnded) {
         // Headers already sent (error during streaming loop)

@@ -34,7 +34,7 @@ async function _sendBatch(batchTexts, config, batchNumber) {
                 if (response.status === 429) {
                     // 429 限流时，增加等待时间
                     const waitTime = 5000 * attempt;
-                    console.warn(`[Embedding] Batch ${batchNumber} rate limited (429). Retrying in ${waitTime/1000}s...`);
+                    console.warn(`[Embedding] Batch ${batchNumber} rate limited (429). Retrying in ${waitTime / 1000}s...`);
                     await new Promise(r => setTimeout(r, waitTime));
                     continue;
                 }
@@ -54,7 +54,7 @@ async function _sendBatch(batchTexts, config, batchNumber) {
             if (!data) {
                 throw new Error(`API returned empty/null response`);
             }
-            
+
             // 检查是否是错误响应
             if (data.error) {
                 const errorMsg = data.error.message || JSON.stringify(data.error);
@@ -65,14 +65,14 @@ async function _sendBatch(batchTexts, config, batchNumber) {
                 console.error(`  Hint: Check if embedding model "${config.model}" is available on your API server`);
                 throw new Error(`API Error ${errorCode}: ${errorMsg}`);
             }
-            
+
             if (!data.data) {
                 console.error(`[Embedding] Missing 'data' field in response for Batch ${batchNumber}`);
                 console.error(`Response keys: ${Object.keys(data).join(', ')}`);
                 console.error(`Response preview: ${JSON.stringify(data).substring(0, 500)}`);
                 throw new Error(`Invalid API response structure: missing 'data' field`);
             }
-            
+
             if (!Array.isArray(data.data)) {
                 console.error(`[Embedding] 'data' field is not an array for Batch ${batchNumber}`);
                 console.error(`data type: ${typeof data.data}`);
@@ -83,10 +83,10 @@ async function _sendBatch(batchTexts, config, batchNumber) {
             if (data.data.length === 0) {
                 console.warn(`[Embedding] Warning: Batch ${batchNumber} returned empty embeddings array`);
             }
-            
+
             // 简单的 Log，证明并发正在跑
             // console.log(`[Embedding] ✅ Batch ${batchNumber} completed (${batchTexts.length} items).`);
-            
+
             return data.data.sort((a, b) => a.index - b.index).map(item => item.embedding);
 
         } catch (e) {
@@ -99,49 +99,79 @@ async function _sendBatch(batchTexts, config, batchNumber) {
 
 /**
  * 🚀 终极版：并发批量获取 Embeddings
+ * 🛡️ 核心保证：返回数组长度 === 输入 texts 长度，跳过/失败的位置填 null
  */
 async function getEmbeddingsBatch(texts, config) {
     if (!texts || texts.length === 0) return [];
 
     // 1. ⚡️ 第一步：纯 CPU 操作，先把所有文本切分成 Batches
-    const batches = [];
-    let currentBatch = [];
+    //    同时记录每个文本在原始数组中的索引，以便后续对齐
+    const batches = [];         // 每个元素: { texts: string[], originalIndices: number[] }
+    let currentBatchTexts = [];
+    let currentBatchIndices = [];
     let currentBatchTokens = 0;
+    const oversizeIndices = new Set(); // 记录被跳过的超长文本位置
 
-    for (const text of texts) {
+    for (let i = 0; i < texts.length; i++) {
+        const text = texts[i];
         const textTokens = encoding.encode(text).length;
-        if (textTokens > safeMaxTokens) continue; // Skip oversize
+        if (textTokens > safeMaxTokens) {
+            console.warn(`[Embedding] ⚠️ Text at index ${i} exceeds token limit (${textTokens} > ${safeMaxTokens}), skipping.`);
+            oversizeIndices.add(i);
+            continue; // Skip oversize，但记录位置
+        }
 
-        const isTokenFull = currentBatch.length > 0 && (currentBatchTokens + textTokens > safeMaxTokens);
-        const isItemFull = currentBatch.length >= MAX_BATCH_ITEMS;
+        const isTokenFull = currentBatchTexts.length > 0 && (currentBatchTokens + textTokens > safeMaxTokens);
+        const isItemFull = currentBatchTexts.length >= MAX_BATCH_ITEMS;
 
         if (isTokenFull || isItemFull) {
-            batches.push(currentBatch);
-            currentBatch = [text];
+            batches.push({ texts: currentBatchTexts, originalIndices: currentBatchIndices });
+            currentBatchTexts = [text];
+            currentBatchIndices = [i];
             currentBatchTokens = textTokens;
         } else {
-            currentBatch.push(text);
+            currentBatchTexts.push(text);
+            currentBatchIndices.push(i);
             currentBatchTokens += textTokens;
         }
     }
-    if (currentBatch.length > 0) batches.push(currentBatch);
+    if (currentBatchTexts.length > 0) {
+        batches.push({ texts: currentBatchTexts, originalIndices: currentBatchIndices });
+    }
 
-    console.log(`[Embedding] Prepared ${batches.length} batches. Executing with concurrency: ${DEFAULT_CONCURRENCY}...`);
+    if (oversizeIndices.size > 0) {
+        console.warn(`[Embedding] ⚠️ ${oversizeIndices.size} texts skipped due to token limit.`);
+    }
+    console.log(`[Embedding] Prepared ${batches.length} batches from ${texts.length} texts. Executing with concurrency: ${DEFAULT_CONCURRENCY}...`);
 
     // 2. 🌊 第二步：并发执行器
-    const results = new Array(batches.length); // 预分配结果数组，保证顺序
+    const batchResults = new Array(batches.length); // 预分配结果数组，保证顺序
     let cursor = 0; // 当前处理到的批次索引
 
     // 定义 Worker：只要队列里还有任务，就不断抢任务做
     const worker = async (workerId) => {
         while (true) {
             // 🔒 获取任务索引 (原子操作模拟)
-            const batchIndex = cursor++; 
+            const batchIndex = cursor++;
             if (batchIndex >= batches.length) break; // 没任务了，下班
 
-            const batchTexts = batches[batchIndex];
-            // 执行请求 (Batch ID 从 1 开始显示)
-            results[batchIndex] = await _sendBatch(batchTexts, config, batchIndex + 1);
+            const batch = batches[batchIndex];
+            try {
+                // 执行请求 (Batch ID 从 1 开始显示)
+                batchResults[batchIndex] = {
+                    vectors: await _sendBatch(batch.texts, config, batchIndex + 1),
+                    originalIndices: batch.originalIndices
+                };
+            } catch (e) {
+                // 🛡️ 不再让单个 batch 失败导致整个 Promise.all 崩溃
+                // 而是记录失败，对应位置将填 null
+                console.error(`[Embedding] ❌ Batch ${batchIndex + 1} failed permanently: ${e.message}`);
+                batchResults[batchIndex] = {
+                    vectors: null, // 标记为失败
+                    originalIndices: batch.originalIndices,
+                    error: e.message
+                };
+            }
         }
     };
 
@@ -154,9 +184,46 @@ async function getEmbeddingsBatch(texts, config) {
     // 等待所有 Worker 下班
     await Promise.all(workers);
 
-    // 3. 📦 第三步：展平结果
-    // results 数组里可能包含 undefined (如果某个 batch 最终失败)，filter 掉保平安
-    return results.filter(r => r).flat();
+    // 3. 📦 第三步：按原始索引回填结果，保证 output.length === input.length
+    const finalResults = new Array(texts.length).fill(null); // 默认全部为 null
+    let successCount = 0;
+    let failCount = 0;
+
+    for (const result of batchResults) {
+        if (!result || !result.vectors) {
+            // 整个 batch 失败，对应位置保持 null
+            if (result) failCount += result.originalIndices.length;
+            continue;
+        }
+        result.originalIndices.forEach((origIdx, vecIdx) => {
+            finalResults[origIdx] = result.vectors[vecIdx] || null;
+            if (result.vectors[vecIdx]) successCount++;
+            else failCount++;
+        });
+    }
+
+    failCount += oversizeIndices.size; // 超长文本也算失败
+
+    if (failCount > 0) {
+        console.warn(`[Embedding] ⚠️ Results: ${successCount} succeeded, ${failCount} failed/skipped out of ${texts.length} total.`);
+    }
+
+    return finalResults; // 🛡️ 长度严格等于 texts.length，失败位置为 null
 }
 
-module.exports = { getEmbeddingsBatch };
+/**
+ * 余弦相似度计算（公共版本）
+ * 供 toolExecutor / messageProcessor / 其他模块复用
+ */
+function cosineSimilarity(a, b) {
+    if (!a || !b || a.length !== b.length) return 0;
+    let dot = 0, normA = 0, normB = 0;
+    for (let i = 0; i < a.length; i++) {
+        dot += a[i] * b[i];
+        normA += a[i] * a[i];
+        normB += b[i] * b[i];
+    }
+    return dot / (Math.sqrt(normA) * Math.sqrt(normB) + 1e-8);
+}
+
+module.exports = { getEmbeddingsBatch, cosineSimilarity };

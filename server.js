@@ -70,10 +70,43 @@ async function ensureAgentDirectory() {
         }
     }
 }
-const TVS_DIR = path.join(__dirname, 'TVStxt'); // 新增：定义 TVStxt 目录
+
+// TVStxt 目录路径初始化
+let TVS_DIR;
+
+function resolveTvsDir() {
+    const configPath = process.env.TVSTXT_DIR_PATH;
+
+    if (!configPath || typeof configPath !== 'string' || configPath.trim() === '') {
+        return path.join(__dirname, 'TVStxt');
+    }
+
+    const normalizedPath = path.normalize(configPath.trim());
+    const absolutePath = path.isAbsolute(normalizedPath)
+        ? normalizedPath
+        : path.resolve(__dirname, normalizedPath);
+
+    return absolutePath;
+}
+
+TVS_DIR = resolveTvsDir();
+
+// 确保 TVStxt 目录存在
+async function ensureTvsDirectory() {
+    try {
+        await fs.mkdir(TVS_DIR, { recursive: true });
+        console.log(`[Server] TVStxt directory: ${TVS_DIR}`);
+    } catch (error) {
+        if (error.code !== 'EEXIST') {
+            console.error(`[Server] Failed to create TVStxt directory: ${TVS_DIR}`);
+        }
+    }
+}
+
 const crypto = require('crypto');
 const agentManager = require('./modules/agentManager.js'); // 新增：Agent管理器
 const tvsManager = require('./modules/tvsManager.js'); // 新增：TVS管理器
+const toolboxManager = require('./modules/toolboxManager.js');
 const messageProcessor = require('./modules/messageProcessor.js');
 const knowledgeBaseManager = require('./KnowledgeBaseManager.js'); // 新增：引入统一知识库管理器
 const pluginManager = require('./Plugin.js');
@@ -118,6 +151,7 @@ const ADMIN_USERNAME = process.env.AdminUsername;
 const ADMIN_PASSWORD = process.env.AdminPassword;
 
 const DEBUG_MODE = (process.env.DebugMode || "False").toLowerCase() === "true";
+const CHAT_LOG_ENABLED = (process.env.CHAT_LOG_ENABLED || "false").toLowerCase() === "true";
 const VCPToolCode = (process.env.VCPToolCode || "false").toLowerCase() === "true"; // 新增：读取VCP工具调用验证码开关
 const SHOW_VCP_OUTPUT = (process.env.ShowVCP || "False").toLowerCase() === "true"; // 读取 ShowVCP 环境变量
 const RAG_MEMO_REFRESH = (process.env.RAGMemoRefresh || "false").toLowerCase() === "true"; // 新增：RAG日记刷新开关
@@ -179,6 +213,29 @@ async function writeDebugLog(filenamePrefix, data) {
             console.error(`写入调试日志失败: ${filePath}`, error);
         }
     }
+}
+
+// ChatLog：在 DebugLog/chat/YYYY-MM-DD/ 下记录每次 chat 的请求体与响应（仅当 CHAT_LOG_ENABLED 时有效）
+let writeChatLog;
+if (CHAT_LOG_ENABLED) {
+    const crypto = require('crypto');
+    writeChatLog = function (requestBody, logs) {
+        const now = dayjs().tz(DEFAULT_TIMEZONE);
+        const dateStr = now.format('YYYY-MM-DD');
+        const timeStr = now.format('HHmmss_SSS');
+        const id = (requestBody && (requestBody.requestId || requestBody.messageId)) || 'no-id';
+        const safeId = String(id).replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 64);
+        const shortRandom = crypto.randomBytes(2).toString('hex');
+        const filename = `chat-${safeId}-${timeStr}-${shortRandom}.json`;
+        const chatDir = path.join(__dirname, 'DebugLog', 'chat', dateStr);
+        const filePath = path.join(chatDir, filename);
+        const payload = logs;
+        fs.mkdir(chatDir, { recursive: true })
+            .then(() => fs.writeFile(filePath, JSON.stringify(payload, null, 2)))
+            .catch(e => console.error('[ChatLog] 写入失败:', e));
+    };
+} else {
+    writeChatLog = undefined;
 }
 
 // 新增：加载IP黑名单
@@ -338,6 +395,17 @@ const adminAuth = (req, res, next) => {
         // 验证登录的端点也需要特殊处理（允许无凭据时返回401而不是重定向）
         const isVerifyEndpoint = req.path === '/admin_api/verify-login';
 
+        // ========== 新增：只读仪表板接口白名单（不计入登录失败次数）==========
+        const readOnlyDashboardPaths = [
+            '/admin_api/system-monitor',
+            '/admin_api/newapi-monitor',
+            '/admin_api/server-log',
+            '/admin_api/user-auth-code',
+            '/admin_api/weather'
+        ];
+        const isReadOnlyPath = readOnlyDashboardPaths.some(path => req.path.startsWith(path));
+        // ========== 新增结束 ==========
+
         if (publicPaths.includes(req.path)) {
             return next(); // 直接放行登录页面相关资源
         }
@@ -363,9 +431,9 @@ const adminAuth = (req, res, next) => {
             return; // 停止进一步处理
         }
 
-        // 2. 检查IP是否被临时封禁
+        // 2. 检查IP是否被临时封禁（仅对非只读接口生效）
         const blockInfo = tempBlocks.get(clientIp);
-        if (blockInfo && Date.now() < blockInfo.expires) {
+        if (blockInfo && Date.now() < blockInfo.expires && !isReadOnlyPath) {
             console.warn(`[AdminAuth] Blocked login attempt from IP: ${clientIp}. Block expires at ${new Date(blockInfo.expires).toLocaleString()}.`);
             const timeLeft = Math.ceil((blockInfo.expires - Date.now()) / 1000 / 60);
             res.setHeader('Retry-After', Math.ceil((blockInfo.expires - Date.now()) / 1000)); // In seconds
@@ -406,8 +474,8 @@ const adminAuth = (req, res, next) => {
 
         // 4. 验证凭据
         if (!credentials || credentials.name !== ADMIN_USERNAME || credentials.pass !== ADMIN_PASSWORD) {
-            // 认证失败，处理登录尝试计数
-            if (clientIp) {
+            // 认证失败，处理登录尝试计数（仅对非只读接口计数）
+            if (clientIp && !isReadOnlyPath) {
                 const now = Date.now();
                 let attemptInfo = loginAttempts.get(clientIp) || { count: 0, firstAttempt: now };
 
@@ -461,8 +529,16 @@ const adminAuth = (req, res, next) => {
 // This MUST come before serving static files to protect the panel itself.
 app.use(adminAuth);
 
-// Serve Admin Panel static files only after successful authentication.
-app.use('/AdminPanel', express.static(path.join(__dirname, 'AdminPanel')));
+// 🌟 AdminPanel 独立进程解耦：主进程不再直接提供 AdminPanel 页面
+// 访问主端口的 /AdminPanel 会被重定向到 PORT+1 的独立后台进程
+const ADMIN_PORT = parseInt(port) + 1;
+app.use('/AdminPanel', (req, res) => {
+    // 构建重定向 URL，保留原始路径和查询参数
+    const host = req.hostname;
+    const protocol = req.protocol;
+    const originalPath = req.originalUrl;
+    res.redirect(302, `${protocol}://${host}:${ADMIN_PORT}${originalPath}`);
+});
 
 
 // Image server logic is now handled by the ImageServer plugin.
@@ -759,6 +835,7 @@ const chatCompletionHandler = new ChatCompletionHandler({
     pluginManager,
     activeRequests,
     writeDebugLog,
+    writeChatLog,
     handleDiaryFromAIResponse,
     webSocketServer,
     DEBUG_MODE,
@@ -861,8 +938,12 @@ app.post('/v1/human/tool', async (req, res) => {
             console.log(`[Human Tool Exec] Received tool call for: ${requestedToolName}`, parsedToolArgs);
         }
 
-        // 直接调用插件管理器
-        const result = await pluginManager.processToolCall(requestedToolName, parsedToolArgs);
+        // 直接调用插件管理器，并传递 requestIp 以支持分布式文件拉取
+        let clientIp = req.ip;
+        if (clientIp && clientIp.substr(0, 7) === "::ffff:") {
+            clientIp = clientIp.substr(7);
+        }
+        const result = await pluginManager.processToolCall(requestedToolName, parsedToolArgs, clientIp);
 
         // processToolCall 的结果已经是正确的对象格式
         res.status(200).json(result);
@@ -1014,7 +1095,15 @@ const adminPanelRoutes = require('./routes/adminPanelRoutes')(
     logger.getServerLogPath, // Pass the getter function
     knowledgeBaseManager, // Pass the knowledgeBaseManager instance
     AGENT_DIR, // Pass the Agent directory path
-    cachedEmojiLists
+    cachedEmojiLists,
+    TVS_DIR, // Pass the TVStxt directory path
+    (code = 1) => {
+        console.log(`[Server] Restart triggered from admin API (exit code: ${code}).`);
+        gracefulShutdown(code).catch(err => {
+            console.error('[Server] Fatal error during graceful restart:', err);
+            process.exit(code);
+        });
+    }
 );
 
 // 新增：引入 VCP 论坛 API 路由
@@ -1187,6 +1276,8 @@ async function startServer() {
 
     // 确保 Agent 目录存在
     await ensureAgentDirectory();
+    // 确保 TVStxt 目录存在
+    await ensureTvsDirectory();
 
     // 新增：加载模型重定向配置
     console.log('正在加载模型重定向配置...');
@@ -1201,11 +1292,22 @@ async function startServer() {
     console.log('Agent管理器初始化完成。');
 
     console.log('正在初始化TVS管理器...');
+    tvsManager.setTvsDir(TVS_DIR);
     tvsManager.initialize(DEBUG_MODE);
     console.log('TVS管理器初始化完成。');
 
+    console.log('正在初始化Toolbox管理器...');
+    toolboxManager.setTvsDir(TVS_DIR);
+    await toolboxManager.initialize(DEBUG_MODE);
+    console.log('Toolbox管理器初始化完成。');
+
     // 🌟 关键修复：在监听端口前完成所有初始化
     await initialize(); // This loads plugins and initializes services
+
+    // 🌟 核心网络优化：100% 确保首请求的 node-fetch ESM 模块热启动，消除冷启动导致的延迟和上游挂断风险
+    console.log('[Server] 正在预热 node-fetch ESM 模块...');
+    await import('node-fetch');
+    console.log('[Server] node-fetch 模块预热完毕，准备处理请求。');
 
     server = app.listen(port, () => {
         console.log(`中间层服务器正在监听端口 ${port}`);
@@ -1232,7 +1334,7 @@ startServer().catch(err => {
 });
 
 
-async function gracefulShutdown() {
+async function gracefulShutdown(exitCode = 0) {
     console.log('Initiating graceful shutdown...');
 
     if (taskScheduler) {
@@ -1247,6 +1349,10 @@ async function gracefulShutdown() {
         await pluginManager.shutdownAllPlugins();
     }
 
+    if (knowledgeBaseManager) {
+        await knowledgeBaseManager.shutdown();
+    }
+
     const serverLogWriteStream = logger.getLogWriteStream();
     if (serverLogWriteStream) {
         logger.originalConsoleLog('[Server] Closing server log file stream...');
@@ -1259,8 +1365,8 @@ async function gracefulShutdown() {
         await logClosePromise;
     }
 
-    console.log('Graceful shutdown complete. Exiting.');
-    process.exit(0);
+    console.log(`Graceful shutdown complete. Exiting with code ${exitCode}.`);
+    process.exit(exitCode);
 }
 
 process.on('SIGINT', gracefulShutdown);

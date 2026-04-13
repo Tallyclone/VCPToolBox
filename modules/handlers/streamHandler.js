@@ -15,6 +15,7 @@ class StreamHandler {
       apiKey,
       pluginManager,
       writeDebugLog,
+      writeChatLog,
       handleDiaryFromAIResponse,
       webSocketServer,
       DEBUG_MODE,
@@ -46,8 +47,9 @@ class StreamHandler {
     const maxRecursion = maxVCPLoopStream || 5;
     let currentAIContentForLoop = '';
     let currentAIRawDataForDiary = '';
+    let chatLogs = [];
 
-    // 辅助函数：处理 AI 响应流 (优化版：直通转发 + 后台解析)
+    // 辅助函数：处理 AI 响应流 (优化版：直通转发 + 后台解析 + chunk 空闲超时保护)
     const processAIResponseStreamHelper = async (aiResponse, isInitialCall) => {
       return new Promise((resolve, reject) => {
         const decoder = new StringDecoder('utf8');
@@ -56,25 +58,70 @@ class StreamHandler {
         let sseLineBuffer = '';
         let streamAborted = false;
         let keepAliveTimer = null;
+        let chunkIdleTimer = null;
+        const CHUNK_IDLE_TIMEOUT = 90000; // 90 秒无新 chunk 则判定上游流冻结
+        let message = { content: '', reasoning_content: '' };
 
+        const appendDelta = (delta) => {
+          if (delta && delta.content) {
+            collectedContentThisTurn += delta.content;
+            message.content += delta.content;
+          }
+          if (delta && delta.reasoning_content) {
+            collectedContentThisTurn += delta.reasoning_content;
+            message.reasoning_content += delta.reasoning_content;
+          }
+        };
         // 🌟 核心修复：注入 SSE 幽灵心跳保活，防止上游卡顿时浏览器假死
         keepAliveTimer = setInterval(() => {
           if (!res.writableEnded && !res.destroyed) {
             try {
               res.write(': vcp-keepalive\n\n');
-              if (DEBUG_MODE) console.log('[Stream KeepAlive] Sent keepalive comment.');
             } catch (e) {
               // Ignore errors
             }
           }
         }, 5000); // 5秒发一次心跳
 
+        // 🌟 新增：chunk 级空闲超时保护
+        // 如果连续 CHUNK_IDLE_TIMEOUT 毫秒未收到任何上游 data chunk，
+        // 则判定上游流已冻结，主动中止并 resolve，防止无限挂起
+        const resetChunkIdleTimer = () => {
+          if (chunkIdleTimer) clearTimeout(chunkIdleTimer);
+          chunkIdleTimer = setTimeout(() => {
+            if (streamAborted) return;
+            console.warn(`[Stream IdleTimeout] No upstream chunk received for ${CHUNK_IDLE_TIMEOUT / 1000}s. Assuming stream stalled. Forcing end.`);
+            streamAborted = true;
+            // 通知前端这次流异常结束
+            if (!res.writableEnded && !res.destroyed) {
+              try {
+                const stallPayload = {
+                  id: `chatcmpl-VCP-stall-${Date.now()}`,
+                  object: 'chat.completion.chunk',
+                  created: Math.floor(Date.now() / 1000),
+                  model: originalBody.model || 'unknown',
+                  choices: [{ index: 0, delta: { content: '\n[上游响应超时，流已中断]' }, finish_reason: 'stop' }],
+                };
+                res.write(`data: ${JSON.stringify(stallPayload)}\n\n`);
+                res.write('data: [DONE]\n\n');
+              } catch (e) { /* ignore */ }
+            }
+            if (aiResponse.body && !aiResponse.body.destroyed) {
+              aiResponse.body.destroy();
+            }
+            if (keepAliveTimer) clearInterval(keepAliveTimer);
+            if (abortController?.signal) abortController.signal.removeEventListener('abort', abortHandler);
+            resolve({ content: collectedContentThisTurn, raw: rawResponseDataThisTurn, message: message });
+          }, CHUNK_IDLE_TIMEOUT);
+        };
+        resetChunkIdleTimer(); // 启动首次空闲计时
+
         const abortHandler = () => {
           streamAborted = true;
           if (DEBUG_MODE) console.log('[Stream Abort] Abort signal received, stopping stream processing.');
           if (abortController?.signal) abortController.signal.removeEventListener('abort', abortHandler);
           if (aiResponse.body && !aiResponse.body.destroyed) aiResponse.body.destroy();
-          resolve({ content: collectedContentThisTurn, raw: rawResponseDataThisTurn });
+          resolve({ content: collectedContentThisTurn, raw: rawResponseDataThisTurn, message: message });
         };
 
         if (abortController?.signal) {
@@ -83,6 +130,7 @@ class StreamHandler {
 
         aiResponse.body.on('data', chunk => {
           if (streamAborted) return;
+          resetChunkIdleTimer(); // 每收到一个 chunk 就重置空闲计时器
 
           const chunkString = decoder.write(chunk);
           rawResponseDataThisTurn += chunkString;
@@ -117,10 +165,7 @@ class StreamHandler {
                 try {
                   const parsedData = JSON.parse(jsonData);
                   const delta = parsedData.choices?.[0]?.delta;
-                  if (delta) {
-                    if (delta.content) collectedContentThisTurn += delta.content;
-                    if (delta.reasoning_content) collectedContentThisTurn += delta.reasoning_content;
-                  }
+                  appendDelta(delta);
                 } catch (e) { }
               }
             }
@@ -129,6 +174,7 @@ class StreamHandler {
 
         aiResponse.body.on('end', () => {
           if (keepAliveTimer) clearInterval(keepAliveTimer);
+          if (chunkIdleTimer) clearTimeout(chunkIdleTimer);
           const remainingString = decoder.end();
           if (remainingString) {
             rawResponseDataThisTurn += remainingString;
@@ -150,24 +196,22 @@ class StreamHandler {
                 try {
                   const parsedData = JSON.parse(jsonData);
                   const delta = parsedData.choices?.[0]?.delta;
-                  if (delta) {
-                    if (delta.content) collectedContentThisTurn += delta.content;
-                    if (delta.reasoning_content) collectedContentThisTurn += delta.reasoning_content;
-                  }
+                  appendDelta(delta);
                 } catch (e) { }
               }
             }
           }
 
           if (abortController?.signal) abortController.signal.removeEventListener('abort', abortHandler);
-          resolve({ content: collectedContentThisTurn, raw: rawResponseDataThisTurn });
+          resolve({ content: collectedContentThisTurn, raw: rawResponseDataThisTurn, message: message });
         });
 
         aiResponse.body.on('error', streamError => {
           if (keepAliveTimer) clearInterval(keepAliveTimer);
+          if (chunkIdleTimer) clearTimeout(chunkIdleTimer);
           if (abortController?.signal) abortController.signal.removeEventListener('abort', abortHandler);
           if (streamAborted || streamError.name === 'AbortError' || streamError.type === 'aborted') {
-            resolve({ content: collectedContentThisTurn, raw: rawResponseDataThisTurn });
+            resolve({ content: collectedContentThisTurn, raw: rawResponseDataThisTurn, message: message });
             return;
           }
           console.error('Error reading AI response stream:', streamError);
@@ -187,6 +231,7 @@ class StreamHandler {
     let initialAIResponseData = await processAIResponseStreamHelper(firstAiAPIResponse, true);
     currentAIContentForLoop = initialAIResponseData.content;
     currentAIRawDataForDiary = initialAIResponseData.raw;
+    if (writeChatLog) chatLogs.push({ request: originalBody, response: initialAIResponseData.message });
     handleDiaryFromAIResponse(currentAIRawDataForDiary).catch(e =>
       console.error('[VCP Stream Loop] Error in initial diary handling:', e),
     );
@@ -237,9 +282,9 @@ class StreamHandler {
       const archeryErrorContents = [];
 
       // 执行 Archery 调用
-      await Promise.all(archeryCalls.map(async toolCall => {
+      const archeryLogs = await Promise.all(archeryCalls.map(async toolCall => {
         try {
-          const result = await toolExecutor.execute(toolCall, clientIp);
+          const result = await toolExecutor.execute(toolCall, clientIp, currentMessagesForLoop);
           const isError = !result.success || (result.raw && this.context.isToolResultError(result.raw));
 
           if (isError) {
@@ -253,8 +298,10 @@ class StreamHandler {
           if ((shouldShowVCP || forceThisOne) && !res.writableEnded && (isError || forceThisOne)) {
             vcpInfoHandler.streamVcpInfo(res, originalBody.model, result.success ? 'success' : 'error', toolCall.name, result.raw || result.error, abortController);
           }
+          return { tool: toolCall, result: result.content };
         } catch (e) {
           console.error(`[VCP Stream Loop Archery Error] ${toolCall.name}:`, e);
+          return { tool: toolCall, result: [{ type: 'text', text: String(e.message) }] };
         }
       }));
 
@@ -293,6 +340,13 @@ class StreamHandler {
         if (nextAiAPIResponse.ok) {
           let nextAIResponseData = await processAIResponseStreamHelper(nextAiAPIResponse, false);
           currentAIContentForLoop = nextAIResponseData.content;
+          if (writeChatLog) {
+            chatLogs.push({
+              request: { messages: currentMessagesForLoop },
+              toolCalls: archeryLogs,
+              response: nextAIResponseData.message,
+            });
+          }
           recursionDepth++;
           continue;
         }
@@ -315,19 +369,52 @@ class StreamHandler {
       }
 
       // 执行普通调用
-      const toolResults = await toolExecutor.executeAll(normalCalls, clientIp);
+      const toolResults = await toolExecutor.executeAll(normalCalls, clientIp, currentMessagesForLoop);
       const combinedToolResultsForAI = toolResults.map(r => r.content).flat();
       if (archeryErrorContents.length > 0) combinedToolResultsForAI.push(...archeryErrorContents);
 
-      // VCP 信息展示
+      const normalCallLogs = (() => {
+        let logs = [];
+        if (writeChatLog) {
+          for (let i = 0; i < normalCalls.length; i++) {
+            logs.push({ tool: normalCalls[i], result: toolResults[i]?.content });
+          }
+        }
+        return logs;
+      })();
+
+      // VCP 信息展示 - 批量包裹为单个 USER 角色
+      let hasStartedUserBlock = false;
       for (let i = 0; i < normalCalls.length; i++) {
         const toolCall = normalCalls[i];
         const result = toolResults[i];
         const forceThisOne = !shouldShowVCP && toolCall.markHistory;
 
         if ((shouldShowVCP || forceThisOne) && !res.writableEnded && !res.destroyed) {
+          if (!hasStartedUserBlock && enableRoleDivider) {
+             try {
+                // start the user block
+                res.write(`data: ${JSON.stringify({
+                  id: `chatcmpl-vcp-start-${Date.now()}`,
+                  object: "chat.completion.chunk",
+                  choices: [{ index: 0, delta: { content: "\n<<<[ROLE_DIVIDE_USER]>>>\n" }, finish_reason: null }]
+                })}\n\n`);
+                hasStartedUserBlock = true;
+             } catch (e) {}
+          }
           vcpInfoHandler.streamVcpInfo(res, originalBody.model, toolCall.name, result.success ? 'success' : 'error', result.raw || result.error, abortController);
         }
+      }
+      
+      if (hasStartedUserBlock && !res.writableEnded && !res.destroyed && enableRoleDivider) {
+         try {
+            // close the user block
+            res.write(`data: ${JSON.stringify({
+              id: `chatcmpl-vcp-end-${Date.now()}`,
+              object: "chat.completion.chunk",
+              choices: [{ index: 0, delta: { content: "\n<<<[END_ROLE_DIVIDE_USER]>>>\n" }, finish_reason: null }]
+            })}\n\n`);
+         } catch(e) {}
       }
 
       // RAG 刷新
@@ -378,6 +465,13 @@ class StreamHandler {
 
       let nextAIResponseData = await processAIResponseStreamHelper(nextAiAPIResponse, false);
       currentAIContentForLoop = nextAIResponseData.content;
+      if (writeChatLog) {
+        chatLogs.push({
+          request: { messages: currentMessagesForLoop },
+          toolCalls: [ ...archeryLogs, ...normalCallLogs ],
+          response: nextAIResponseData.message,
+        });
+      }
 
       // 记录日志
       handleDiaryFromAIResponse(nextAIResponseData.raw).catch(e =>
@@ -385,7 +479,9 @@ class StreamHandler {
       );
 
       recursionDepth++;
-    }
+    } // toolcall loop end
+
+    if (writeChatLog) writeChatLog(originalBody, chatLogs);
 
     if (recursionDepth >= maxRecursion && !res.writableEnded && !res.destroyed) {
       try {

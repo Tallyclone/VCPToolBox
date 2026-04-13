@@ -3,12 +3,16 @@ const fs = require('fs').promises;
 const path = require('path');
 const chokidar = require('chokidar');
 
-const TVS_DIR = path.join(__dirname, '..', 'TVStxt');
+let TVS_DIR = path.join(__dirname, '..', 'TVStxt');
 
 class TvsManager {
     constructor() {
         this.contentCache = new Map();
         this.debugMode = false;
+    }
+
+    setTvsDir(dirPath) {
+        TVS_DIR = dirPath;
     }
 
     initialize(debugMode = false) {
@@ -20,7 +24,14 @@ class TvsManager {
     watchFiles() {
         try {
             const watcher = chokidar.watch(TVS_DIR, {
-                ignored: /(^|[\/\\])\../, // ignore dotfiles
+                ignored: [
+                    '**/node_modules/**',
+                    '**/.git/**',
+                    '**/dist/**',
+                    '**/target/**',
+                    '**/image/**',
+                    '**/.*'
+                ],
                 persistent: true,
                 ignoreInitial: true, // Don't trigger 'add' events on startup
             });
