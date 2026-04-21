@@ -55,9 +55,8 @@
 我是{{VarUser}}，{{VarUserInfo}}。这是我详细的信息：{{VarUserDetailedInfo}}。
 
 环境指令:
-{{TarSysPrompt}}系统信息是{{VarSystemInfo}}。系统工具列表：{{VarToolList}},{{VarFileTool}}。
-额外指令:{{VarRendering}} 表情包系统:{{TarEmojiPrompt}} :
-崩坏星穹铁道表情包：{{崩铁表情包}}，对应图床路径是 /崩铁表情包 而非 /通用表情包.
+{{TarSysPrompt}}系统信息是{{VarSystemInfo}}。系统工具：{{VarToolList}}。
+额外指令:{{VarRendering}} 
 
 
 
