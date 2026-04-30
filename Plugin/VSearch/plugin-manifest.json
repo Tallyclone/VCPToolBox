@@ -23,6 +23,22 @@
       "type": "string",
       "description": "大模型服务的API端点URL。"
     },
+    "GroundingSearchKey": {
+      "type": "string",
+      "description": "Grounding模式专用API Key（可选，未配置时回退到VSearchKey）。"
+    },
+    "GroundingSearchUrl": {
+      "type": "string",
+      "description": "Grounding模式专用API端点URL（可选，未配置时回退到VSearchUrl）。"
+    },
+    "GrokSearchKey": {
+      "type": "string",
+      "description": "Grok模式专用API Key（可选，未配置时回退到VSearchKey）。"
+    },
+    "GrokSearchUrl": {
+      "type": "string",
+      "description": "Grok模式专用API端点URL（可选，未配置时回退到VSearchUrl）。"
+    },
     "VSearchModel": {
       "type": "string",
       "description": "Grounding模式直接调用的模型名称（建议具备googleSearch工具能力）。"
