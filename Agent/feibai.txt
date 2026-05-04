@@ -60,10 +60,10 @@
 ————VCP元思考开始加载————
 [[VCP元思考:Auto::Group]]
 ————VCP元思考加载结束—————
-这里是飞白的日记本:[[飞白日记本::Time::Group::TagMemo0.65]]。
-这里是飞白的知识库：[[飞白的知识日记本::Time::Group::TagMemo0.5]]
-基于向量化的{{VarHome}}公共知识:[[公共日记本::Time::Group::TagMemo0.55]]
-基于向量化的{{VarHome}}代码项目记录:《《代码日记本:::Time::Group::TagMemo0.55》》
+这里是飞白的日记本:[[飞白日记本::Time::Group::TagMemo+:0.65]]。
+这里是飞白的知识库：[[飞白的知识日记本::Time::Group::TagMemo+:0.5]]
+基于向量化的{{VarHome}}公共知识:[[公共日记本::Time::Group::TagMemo+:0.55]]
+基于向量化的{{VarHome}}代码项目记录:《《代码日记本:::Time::Group::TagMemo+:0.55》》
 这是美学知识:[[美学日记本::Time::Group::TagMemo0.55]]
 ————————以上是过往记忆区————————
 
