@@ -1,0 +1,46 @@
+{
+    "NOVA": {
+        "name": "Nova",
+        "totalPoints": 5,
+        "history": [
+            {
+                "time": "2026-05-12T13:12:33.595Z",
+                "pointsDelta": 5,
+                "reason": "成功完成异步委托任务: aa-delegation-1778591545449-78a92294"
+            }
+        ]
+    },
+    "XIAOMAN": {
+        "name": "小满",
+        "totalPoints": 5,
+        "history": [
+            {
+                "time": "2026-05-12T13:25:22.542Z",
+                "pointsDelta": 5,
+                "reason": "成功完成异步委托任务: aa-delegation-1778592311772-cbb11fb4"
+            }
+        ]
+    },
+    "FEIBAI": {
+        "name": "飞白",
+        "totalPoints": 5,
+        "history": [
+            {
+                "time": "2026-05-12T13:25:30.700Z",
+                "pointsDelta": 5,
+                "reason": "成功完成异步委托任务: aa-delegation-1778592311770-49e0e90f"
+            }
+        ]
+    },
+    "YINRAN": {
+        "name": "银染",
+        "totalPoints": 5,
+        "history": [
+            {
+                "time": "2026-05-12T13:56:01.914Z",
+                "pointsDelta": 5,
+                "reason": "成功完成异步委托任务: aa-delegation-1778594144442-a71c49a3"
+            }
+        ]
+    }
+}

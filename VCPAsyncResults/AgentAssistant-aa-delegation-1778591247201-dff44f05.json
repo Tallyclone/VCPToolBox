@@ -1,0 +1,6 @@
+{
+  "requestId": "aa-delegation-1778591247201-dff44f05",
+  "pluginName": "AgentAssistant",
+  "status": "Failed",
+  "message": "### 委托任务完成报告 (YINRAN)\n\n达到最大轮数限制 (15 轮)，任务尚未自动上报完成。"
+}

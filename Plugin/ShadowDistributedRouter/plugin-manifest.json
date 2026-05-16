@@ -1,0 +1,17 @@
+{
+  "name": "ShadowDistributedRouter",
+  "displayName": "Shadow Distributed Router",
+  "version": "0.1.0",
+  "description": "Routes distributed tools to the VChat device that initiated the request, using a shadow registry and session-affinity routing.",
+  "pluginType": "hybridservice",
+  "entryPoint": {
+    "script": "ShadowDistributedRouter.js"
+  },
+  "communication": {
+    "protocol": "direct"
+  },
+  "capabilities": {
+    "invocationCommands": []
+  },
+  "enabled": true
+}

@@ -1,0 +1,51 @@
+{
+  "manifestVersion": "1.0.0",
+  "name": "VChatSyncCenter",
+  "version": "0.1.0",
+  "displayName": "VChat 同步中心",
+  "description": "VChat 多端同步中心服务：提供中心数据库、基础鉴权、设备注册、Operation 写入口和 ChangeLog 增量读取 API。",
+  "author": "VCPChat Sync Team",
+  "pluginType": "service",
+  "hasApiRoutes": true,
+  "entryPoint": {
+    "script": "index.js"
+  },
+  "communication": {
+    "protocol": "direct"
+  },
+  "configSchema": {
+    "VCHAT_SYNC_ENABLED": { "type": "boolean", "default": false },
+    "VCHAT_SYNC_HOST": { "type": "string", "default": "127.0.0.1" },
+    "VCHAT_SYNC_KEY": { "type": "string", "default": "change-me" },
+    "VCHAT_SYNC_REQUIRE_DEVICE_BINDING": { "type": "boolean", "default": true },
+    "VCHAT_SYNC_WS_ENABLED": { "type": "boolean", "default": false },
+    "VCHAT_DB_PATH": {
+      "type": "string",
+      "default": "./Plugin/VChatSyncCenter/data/vchat_data.db"
+    },
+    "VCHAT_ATTACHMENT_DIR": {
+      "type": "string",
+      "default": "./Plugin/VChatSyncCenter/data/vchat_attachments"
+    },
+    "VCHAT_BACKUP_DIR": {
+      "type": "string",
+      "default": "./Plugin/VChatSyncCenter/data/backups"
+    },
+    "VCHAT_BACKUP_INTERVAL": { "type": "string", "default": "6h" },
+    "VCHAT_BACKUP_RETENTION_DAYS": { "type": "integer", "default": 30 },
+    "VCHAT_RELEASE_MODE": { "type": "string", "default": "mvp-local-only" },
+    "VCHAT_SYNC_MAX_LIMIT": { "type": "integer", "default": 5000 },
+    "VCHAT_SYNC_MAX_JSON_BODY_MB": { "type": "integer", "default": 20 },
+    "VCHAT_SYNC_MAX_ATTACHMENT_MB": { "type": "integer", "default": 512 },
+    "DebugMode": { "type": "boolean", "default": false }
+  },
+  "capabilities": {
+    "services": [
+      {
+        "serviceName": "VChatSyncCenterApi",
+        "description": "VChat 同步中心 API：GET /status，POST /devices/register，POST /operations，GET /changes，GET /conflicts，POST /backup/create，GET /backup/list，POST /backup/verify。"
+      }
+    ],
+    "invocationCommands": []
+  }
+}
