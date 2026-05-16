@@ -3,7 +3,8 @@ const fs = require('fs');
 const path = require('path');
 const dotenv = require('dotenv');
 const axios = require('axios');
-const { v4: uuidv4 } = require('uuid');
+const { randomUUID } = require('crypto');
+const uuidv4 = randomUUID;
 
 // --- State and Config Variables ---
 let VCP_SERVER_PORT;

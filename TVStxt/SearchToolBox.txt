@@ -42,6 +42,59 @@ action:「始」get_up_videos「末」,
 mid:「始」用户 ID「末」,
 pn:「始」1「末」
 
+
+## 4.调查github仓库源码和使用方法
+### 1. 获取文档目录结构
+
+查看某个 GitHub 仓库在 DeepWiki 上的文档组织方式：
+tool_name: DeepWikiVCP
+command: wiki_structure
+url: lioensky/VCPToolBox   //这是VCP仓库源码地址哦
+
+### 2. 阅读完整文档
+
+获取仓库的完整 AI 生成文档（内容较长时自动截断）：
+tool_name: DeepWikiVCP
+command: wiki_content
+url: facebook/react
+
+>⚠️ **注意**: `wiki_content` 返回整个仓库文档，数据量可能非常大（数万字符）。
+> 大量内容可能导致上下文 token 溢出或流式渲染不稳定。
+> **建议优先使用 `wiki_ask` 针对具体主题提问。**
+
+### 3. 智能问答
+
+向 DeepWiki AI 提问关于仓库的具体问题：
+
+tool_name: DeepWikiVCP
+command: wiki_ask
+url: lioensky/VCPToolBox
+question: 插件系统是如何工作的？
+
+### 4. 深度研究模式
+
+AI 进行多轮迭代检索（最多5轮），从核心逻辑、依赖关系、交互流等多维度深入分析：
+tool_name: DeepWikiVCP
+command: wiki_ask
+url: lioensky/VCPToolBox
+question: 详细分析 RAG 记忆系统的完整架构
+deep_research: true
+
+### 5. 多仓库联合查询
+
+同时查询多个仓库（最多10个），AI 综合多个代码库的上下文回答。适合分析前后端协作、微服务架构等跨仓库场景。超过10个显示被截断的个数：
+tool_name: DeepWikiVCP
+command: wiki_ask
+url: lioensky/VCPToolBox, lioensky/VCPChat     //这是VCP仓库源码地址哦，vcptoolbox和vcpchat一个是后端服务器，一个是前端客户端哦
+question: 前后端是如何通过 WebSocket 通信的？
+
+### 6. 深度研究 + 多仓库（组合使用）
+tool_name: DeepWikiVCP
+command: wiki_ask
+url: owner1/repo1, owner2/repo2
+question: 详细分析这两个项目的完整通信架构
+deep_research: true
+
 [===vcp_fold:0.5===]
 
 ## 4. 全能联网搜索 (TavilySearch)

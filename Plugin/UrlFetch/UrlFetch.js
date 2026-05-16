@@ -6,7 +6,7 @@ const StealthPlugin = require('puppeteer-extra-plugin-stealth');
 const AnonymizeUAPlugin = require('puppeteer-extra-plugin-anonymize-ua');
 const stdin = require('process').stdin;
 const fs = require('fs/promises');
-const { v4: uuidv4 } = require('uuid');
+const { randomUUID: uuidv4 } = require('crypto');
 const { Readability } = require('@mozilla/readability');
 const { JSDOM } = require('jsdom');
 
