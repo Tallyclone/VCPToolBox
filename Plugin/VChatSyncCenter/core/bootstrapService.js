@@ -325,7 +325,7 @@ function exportBaseline(runtime, options = {}) {
   const configRows = loadConfigs
     ? db
         .prepare(
-          `SELECT * FROM config_entities WHERE deleted = 0 ORDER BY schema, entity_id LIMIT ? OFFSET ?`
+          `SELECT * FROM config_entities WHERE deleted = 0 AND COALESCE(profile, 'bootstrap') = 'bootstrap' ORDER BY schema, entity_id LIMIT ? OFFSET ?`
         )
         .all(pageLimit, cursor)
     : [];
@@ -334,6 +334,8 @@ function exportBaseline(runtime, options = {}) {
     entity_id: row.entity_id,
     dto_version: row.dto_version,
     safe_projection_json: parseJson(row.safe_projection_json, {}),
+    profile: row.profile || "bootstrap",
+    projection_fields: parseJson(row.projection_fields_json, []),
     checksum: row.checksum,
     version: row.version,
   }));
@@ -342,6 +344,7 @@ function exportBaseline(runtime, options = {}) {
         .prepare(`SELECT * FROM attachments ORDER BY hash LIMIT ? OFFSET ?`)
         .all(pageLimit, cursor)
     : [];
+
   const attachments = takePage(attachmentRows, limit).map((row) => ({
     hash: row.hash,
     algorithm: row.algorithm,

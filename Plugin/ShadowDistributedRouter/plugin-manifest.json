@@ -11,6 +11,13 @@
     "protocol": "direct"
   },
   "capabilities": {
+    "systemPromptPlaceholders": [
+      {
+        "placeholder": "{{VCPShadowDistributedRouter}}",
+        "description": "动态提供当前在线分布式设备、设备别名与 tool_name#设备别名 路由规则。",
+        "isDynamic": true
+      }
+    ],
     "invocationCommands": []
   },
   "enabled": true

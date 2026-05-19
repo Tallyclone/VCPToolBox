@@ -3,11 +3,8 @@
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
+const chokidar = require("chokidar");
 const { AsyncLocalStorage } = require("async_hooks");
-const {
-  getEmbeddingsBatch,
-  cosineSimilarity,
-} = require("../../EmbeddingUtils");
 
 let requestContext = new AsyncLocalStorage();
 const shadowRegistry = new Map(); // toolName -> Map<serverId, record>
@@ -19,15 +16,7 @@ const ORIGINAL_FN = Symbol.for("ShadowDistributedRouter.original");
 const INTERNAL_TOOLS = new Set(["internal_request_file"]);
 const LOCALHOST_ADDRESSES = new Set(["127.0.0.1", "::1", "localhost"]);
 const DEVICE_ALIASES_PATH = path.join(__dirname, "device-aliases.json");
-const DEFAULT_VECTOR_ROUTE_CONFIG = Object.freeze({
-  enabled: true,
-  threshold: 0.72,
-  ambiguousMargin: 0.08,
-  maxUserTextLength: 1000,
-  preferRagCache: true,
-  fallbackToEmbeddingUtils: true,
-  debug: true,
-});
+const SHADOW_PLACEHOLDER = "{{VCPShadowDistributedRouter}}";
 
 let installed = false;
 
@@ -37,9 +26,7 @@ class ShadowDistributedRouter {
     this.patchRecords = [];
     this.pluginManager = null;
     this.deviceAliases = createDefaultDeviceAliases();
-    this.vectorRouteConfig = { ...DEFAULT_VECTOR_ROUTE_CONFIG };
-    this.aliasVectorIndex = [];
-    this.aliasIndexBuildPromise = null;
+    this.aliasWatcher = null;
   }
 
   async initialize(config = {}, dependencies = {}) {
@@ -52,12 +39,14 @@ class ShadowDistributedRouter {
     const pluginManager = require("../../Plugin");
     this.pluginManager = dependencies.pluginManager || pluginManager;
     this.loadDeviceAliases();
-    await this.syncDeviceAliasesAndRebuildIndex();
+    this.syncDeviceAliasesAndRefreshPlaceholder();
+    this.watchDeviceAliasesWithChokidar();
 
     const patchedHandle = this.patchHandleDistributedServerMessage(wss);
     const patchedProcess = this.patchProcessToolCall(this.pluginManager);
     const patchedDistributedExecute = this.patchExecuteDistributedTool(wss);
     const patchedToolExecutor = this.patchToolExecutorExecute();
+    this.patchUnregisterDistributedTools(this.pluginManager);
 
     if (
       !patchedHandle ||
@@ -73,7 +62,7 @@ class ShadowDistributedRouter {
 
     installed = true;
     console.log(
-      "[ShadowDistributedRouter] initialized. Session-affinity + vector intent routing active."
+      "[ShadowDistributedRouter] initialized. Session-affinity + explicit #device routing active."
     );
   }
 
@@ -86,9 +75,17 @@ class ShadowDistributedRouter {
     }
 
     this.patchRecords = [];
+    if (this.aliasWatcher) {
+      this.aliasWatcher.close().catch(() => {});
+      this.aliasWatcher = null;
+    }
+    if (this.pluginManager?.staticPlaceholderValues) {
+      this.pluginManager.staticPlaceholderValues.delete(SHADOW_PLACEHOLDER);
+      this.pluginManager.staticPlaceholderValues.delete(
+        "{{ShadowDistributedRouter}}"
+      );
+    }
     this.pluginManager = null;
-    this.aliasVectorIndex = [];
-    this.aliasIndexBuildPromise = null;
     installed = false;
     requestContext.disable();
     requestContext = new AsyncLocalStorage();
@@ -197,6 +194,77 @@ class ShadowDistributedRouter {
     return true;
   }
 
+  patchUnregisterDistributedTools(pluginManager) {
+    if (
+      !pluginManager ||
+      typeof pluginManager.unregisterAllDistributedTools !== "function"
+    ) {
+      console.warn(
+        "[ShadowDistributedRouter] unregisterAllDistributedTools not found, offline cleanup patch skipped."
+      );
+      return false;
+    }
+
+    if (pluginManager.unregisterAllDistributedTools[PATCH_FLAG]) {
+      this.adoptExistingPatch(pluginManager, "unregisterAllDistributedTools");
+      console.log(
+        "[ShadowDistributedRouter] unregisterAllDistributedTools already patched, adopted."
+      );
+      return true;
+    }
+
+    const original = pluginManager.unregisterAllDistributedTools;
+    const self = this;
+    const patched = function patchedUnregisterAllDistributedTools(
+      serverId,
+      ...rest
+    ) {
+      try {
+        self.handleDistributedServerOffline(serverId);
+      } catch (err) {
+        console.warn(
+          "[ShadowDistributedRouter] offline cleanup before unregister failed:",
+          err.message
+        );
+      }
+      return original.call(this, serverId, ...rest);
+    };
+
+    markPatched(patched, original);
+    pluginManager.unregisterAllDistributedTools = patched;
+    this.patchRecords.push({
+      target: pluginManager,
+      method: "unregisterAllDistributedTools",
+      original,
+      patched,
+    });
+    console.log(
+      "[ShadowDistributedRouter] patched unregisterAllDistributedTools"
+    );
+    return true;
+  }
+
+  handleDistributedServerOffline(serverId) {
+    if (!serverId) return;
+
+    let removedToolInstances = 0;
+    for (const [toolName, instances] of Array.from(shadowRegistry.entries())) {
+      if (instances.delete(serverId)) removedToolInstances++;
+      if (instances.size === 0) shadowRegistry.delete(toolName);
+    }
+
+    serverInfoRegistry.delete(serverId);
+    serverAliases.delete(serverId);
+    for (const [alias, canonical] of Array.from(serverAliases.entries())) {
+      if (canonical === serverId) serverAliases.delete(alias);
+    }
+
+    this.refreshShadowDistributedRouterPlaceholder();
+    console.log(
+      `[ShadowDistributedRouter] distributed server offline cleanup: ${serverId}; removedToolInstances=${removedToolInstances}`
+    );
+  }
+
   patchExecuteDistributedTool(wss) {
     if (!wss || typeof wss.executeDistributedTool !== "function") {
       console.warn(
@@ -245,6 +313,10 @@ class ShadowDistributedRouter {
           );
         }
       } catch (err) {
+        const store = requestContext.getStore();
+        if (store?.routeContext?.explicitAlias) {
+          throw err;
+        }
         console.warn(
           "[ShadowDistributedRouter] route error, fallback:",
           err.message
@@ -298,51 +370,28 @@ class ShadowDistributedRouter {
 
     const original = ToolExecutor.prototype.execute;
     const self = this;
-
     const patched = async function patchedExecute(
       toolCall,
       clientIp,
       contextMessages = [],
       ...rest
     ) {
-      let routeContext = null;
-
-      try {
-        const userText = getLastRealUserText(contextMessages);
-        if (userText) {
-          const maxLength = getSafeMaxUserTextLength(
-            self.vectorRouteConfig.maxUserTextLength
-          );
-          const clippedUserText = userText.slice(0, maxLength);
-          routeContext = {
-            userText: clippedUserText,
-            userVector: null,
+      const parsed = parseToolNameWithAlias(toolCall?.name || "");
+      const normalizedToolCall = parsed.deviceAlias
+        ? { ...toolCall, name: parsed.rawToolName }
+        : toolCall;
+      const routeContext = parsed.deviceAlias
+        ? {
+            explicitAlias: parsed.deviceAlias,
+            rawToolName: parsed.rawToolName,
+            originalToolName: toolCall?.name || "",
             createdAt: Date.now(),
-          };
-
-          try {
-            const vectors = await self.embedTexts(
-              [clippedUserText],
-              this.pluginManager
-            );
-            routeContext.userVector = vectors?.[0] || null;
-          } catch (err) {
-            console.warn(
-              "[ShadowDistributedRouter] build user vector failed:",
-              err.message
-            );
           }
+        : null;
 
-          if (self.vectorRouteConfig.debug) {
-            console.log(
-              `[ShadowVectorRoute] userText: ${clippedUserText.slice(0, 120)}`
-            );
-          }
-        }
-      } catch (err) {
-        console.warn(
-          "[ShadowDistributedRouter] build routeContext failed:",
-          err.message
+      if (parsed.deviceAlias && !self.isDistributedTool(parsed.rawToolName)) {
+        console.log(
+          `[ShadowDistributedRouter] Ignored device alias "${parsed.deviceAlias}" for local tool "${parsed.rawToolName}".`
         );
       }
 
@@ -355,7 +404,13 @@ class ShadowDistributedRouter {
           routeContext,
         },
         async () =>
-          original.call(this, toolCall, clientIp, contextMessages, ...rest)
+          original.call(
+            this,
+            normalizedToolCall,
+            clientIp,
+            contextMessages,
+            ...rest
+          )
       );
     };
 
@@ -394,12 +449,13 @@ class ShadowDistributedRouter {
     const instances = shadowRegistry.get(toolName);
     if (!instances || instances.size === 0) return originalServerId;
 
-    const vectorTarget = this.resolveVectorRouteTarget(
-      toolName,
-      store?.routeContext
-    );
-    if (vectorTarget) {
-      return vectorTarget;
+    const explicitAlias = store?.routeContext?.explicitAlias;
+    if (explicitAlias) {
+      const explicitTarget = this.routeWithExplicitAlias(
+        toolName,
+        explicitAlias
+      );
+      if (explicitTarget) return explicitTarget;
     }
 
     const requestIp = store?.requestIp;
@@ -459,122 +515,75 @@ class ShadowDistributedRouter {
     return originalServerId;
   }
 
-  resolveVectorRouteTarget(toolName, routeContext) {
-    const config = this.vectorRouteConfig;
-    if (!config.enabled) return null;
-    if (!routeContext?.userText) return null;
-
-    const instances = shadowRegistry.get(toolName);
-    if (!instances || instances.size === 0) return null;
-
-    const exact = this.resolveExactAliasTarget(toolName, routeContext.userText);
-    if (exact) return exact;
-
-    if (!routeContext.userVector) {
-      this.debugVectorRoute("rejected: no user vector");
-      return null;
-    }
-
-    if (
-      !Array.isArray(this.aliasVectorIndex) ||
-      this.aliasVectorIndex.length === 0
-    ) {
-      this.debugVectorRoute("rejected: alias vector index empty");
-      return null;
-    }
-
-    const scored = this.aliasVectorIndex
-      .filter((item) => item.vector && instances.has(item.serverId))
-      .map((item) => ({
-        ...item,
-        score: cosineSimilarity(routeContext.userVector, item.vector),
-      }))
-      .sort((a, b) => b.score - a.score);
-
-    const top1 = scored[0];
-    const top2 = scored[1];
-    if (!top1) return null;
-
-    this.debugVectorRoute(
-      `vector top1: ${top1.serverId} score=${top1.score.toFixed(
-        3
-      )} aliasText=${top1.aliasText.slice(0, 80)}`
-    );
-
-    if (top1.score < config.threshold) {
-      this.debugVectorRoute(
-        `rejected: score below threshold ${top1.score.toFixed(3)} < ${
-          config.threshold
-        }`
-      );
-      return null;
-    }
-
-    if (top2 && top1.score - top2.score < config.ambiguousMargin) {
-      this.debugVectorRoute(
-        `rejected: ambiguous top1=${top1.score.toFixed(
-          3
-        )} top2=${top2.score.toFixed(3)} margin=${config.ambiguousMargin}`
-      );
-      return null;
-    }
-
-    if (!instances.has(top1.serverId)) {
-      this.debugVectorRoute(
-        `rejected: target device ${top1.serverId} has no tool ${toolName}`
-      );
-      return null;
-    }
-
-    this.debugVectorRoute(
-      `vector route hit: ${top1.serverId} score=${top1.score.toFixed(3)}`
-    );
-    return top1.serverId;
+  isDistributedTool(rawToolName) {
+    const instances = shadowRegistry.get(rawToolName);
+    return Boolean(instances && instances.size > 0);
   }
 
-  resolveExactAliasTarget(toolName, userText) {
-    const instances = shadowRegistry.get(toolName);
-    if (!instances) return null;
+  routeWithExplicitAlias(rawToolName, deviceAlias) {
+    const instances = shadowRegistry.get(rawToolName);
+    if (!instances || instances.size === 0) return null;
 
-    const normalizedUserText = normalizeText(userText);
-    const matches = [];
+    const match = this.resolveDeviceByFriendlyName(deviceAlias);
+    if (!match) {
+      throw new Error(
+        `设备别名“${deviceAlias}”不存在或当前无可匹配在线设备。当前在线设备：${listOnlineDeviceAliases(
+          this.deviceAliases.devices
+        )}`
+      );
+    }
+    if (match.ambiguous) {
+      throw new Error(
+        `设备别名“${deviceAlias}”存在歧义，候选设备：${match.candidates
+          .map(formatDeviceCandidate)
+          .join("；")}`
+      );
+    }
 
+    const targetServerId = getOnlineDeviceServerId(match.device);
+    if (!targetServerId || !instances.has(targetServerId)) {
+      const candidates = Array.from(instances.keys())
+        .map((serverId) =>
+          findDeviceByServerId(this.deviceAliases.devices, serverId)
+        )
+        .filter(Boolean)
+        .map(getPrimaryDeviceAlias)
+        .filter(Boolean);
+      throw new Error(
+        `设备“${deviceAlias}”在线，但未注册工具“${rawToolName}”。支持该工具的在线设备：${
+          candidates.join("、") || "无"
+        }`
+      );
+    }
+
+    console.log(
+      `[ShadowDistributedRouter] explicit route ${rawToolName}#${deviceAlias} -> ${targetServerId}`
+    );
+    return targetServerId;
+  }
+
+  resolveDeviceByFriendlyName(deviceAlias) {
+    const normalizedAlias = normalizeAliasForExactMatch(deviceAlias);
+    if (!normalizedAlias) return null;
+
+    const candidates = [];
     for (const device of this.deviceAliases.devices || []) {
-      if (!device.enabled) continue;
-      if (!instances.has(device.serverId)) continue;
-
-      for (const alias of device.friendlyNames || []) {
-        const normalizedAlias = normalizeText(alias);
-        if (normalizedAlias && normalizedUserText.includes(normalizedAlias)) {
-          matches.push({
-            serverId: device.serverId,
-            alias,
-            normalizedAlias,
-            length: normalizedAlias.length,
-          });
-        }
+      if (!device.enabled || !getOnlineDeviceServerId(device)) continue;
+      const friendlyNames = Array.isArray(device.friendlyNames)
+        ? device.friendlyNames
+        : [];
+      if (
+        friendlyNames.some(
+          (alias) => normalizeAliasForExactMatch(alias) === normalizedAlias
+        )
+      ) {
+        candidates.push(device);
       }
     }
 
-    if (matches.length === 0) return null;
-
-    matches.sort((a, b) => b.length - a.length);
-    const bestLength = matches[0].length;
-    const bestMatches = matches.filter((match) => match.length === bestLength);
-    const bestServerIds = new Set(bestMatches.map((match) => match.serverId));
-
-    if (bestServerIds.size > 1) {
-      this.debugVectorRoute(
-        `rejected: exact alias ambiguous aliases=${bestMatches
-          .map((match) => `${match.alias}->${match.serverId}`)
-          .join(",")}`
-      );
-      return null;
-    }
-
-    const best = bestMatches[0];
-    this.debugVectorRoute(`exact alias hit: ${best.alias} -> ${best.serverId}`);
-    return best.serverId;
+    if (candidates.length === 0) return null;
+    if (candidates.length > 1) return { ambiguous: true, candidates };
+    return { ambiguous: false, device: candidates[0] };
   }
 
   captureDistributedServerMessage(serverId, message) {
@@ -586,23 +595,13 @@ class ShadowDistributedRouter {
       const serverName = message.data?.serverName;
       if (serverName) registerServerAlias(serverName, serverId);
       captureRegisterTools(serverId, message);
-      this.syncDeviceAliasesAndRebuildIndex().catch((err) => {
-        console.warn(
-          "[ShadowDistributedRouter] device alias sync failed:",
-          err.message
-        );
-      });
+      this.syncDeviceAliasesAndRefreshPlaceholder();
       return;
     }
 
     if (message.type === "report_ip") {
       captureReportIp(serverId, message);
-      this.syncDeviceAliasesAndRebuildIndex().catch((err) => {
-        console.warn(
-          "[ShadowDistributedRouter] device alias sync failed:",
-          err.message
-        );
-      });
+      this.syncDeviceAliasesAndRefreshPlaceholder();
     }
   }
 
@@ -616,17 +615,12 @@ class ShadowDistributedRouter {
 
       const parsed = JSON.parse(fs.readFileSync(DEVICE_ALIASES_PATH, "utf8"));
       this.deviceAliases = normalizeDeviceAliases(parsed);
-      this.vectorRouteConfig = {
-        ...DEFAULT_VECTOR_ROUTE_CONFIG,
-        ...(this.deviceAliases.vectorRoute || {}),
-      };
     } catch (err) {
       console.warn(
         "[ShadowDistributedRouter] failed to load device-aliases.json, using defaults:",
         err.message
       );
       this.deviceAliases = createDefaultDeviceAliases();
-      this.vectorRouteConfig = { ...DEFAULT_VECTOR_ROUTE_CONFIG };
     }
   }
 
@@ -636,11 +630,6 @@ class ShadowDistributedRouter {
       normalizeDeviceAliases(this.deviceAliases),
       latestOnDisk
     );
-    this.deviceAliases.vectorRoute = {
-      ...DEFAULT_VECTOR_ROUTE_CONFIG,
-      ...(latestOnDisk.vectorRoute || {}),
-      ...(this.deviceAliases.vectorRoute || {}),
-    };
     fs.writeFileSync(
       DEVICE_ALIASES_PATH,
       `${JSON.stringify(this.deviceAliases, null, 2)}\n`,
@@ -648,17 +637,13 @@ class ShadowDistributedRouter {
     );
   }
 
-  async syncDeviceAliasesAndRebuildIndex() {
+  syncDeviceAliasesAndRefreshPlaceholder() {
     this.syncDeviceAliasesFromRegistries();
-    await this.buildAliasVectorIndex();
+    this.refreshShadowDistributedRouterPlaceholder();
   }
 
   syncDeviceAliasesFromRegistries() {
     this.deviceAliases = normalizeDeviceAliases(this.deviceAliases);
-    this.vectorRouteConfig = {
-      ...DEFAULT_VECTOR_ROUTE_CONFIG,
-      ...(this.deviceAliases.vectorRoute || {}),
-    };
 
     const knownServerIds = collectKnownServerIds();
     let changed = false;
@@ -706,7 +691,7 @@ class ShadowDistributedRouter {
         hostName: systemFields.hostName,
         serverName: systemFields.serverName,
         lastKnownIPs: nextLastKnownIPs,
-        autoGenerated: true,
+        autoGenerated: existing.autoGenerated === true,
       };
 
       let deviceChanged = false;
@@ -744,108 +729,93 @@ class ShadowDistributedRouter {
     }
   }
 
-  async buildAliasVectorIndex() {
-    if (!this.vectorRouteConfig.enabled) {
-      this.aliasVectorIndex = [];
-      return [];
-    }
+  watchDeviceAliasesWithChokidar() {
+    if (this.aliasWatcher) return;
 
-    if (this.aliasIndexBuildPromise) {
-      return this.aliasIndexBuildPromise;
-    }
+    this.aliasWatcher = chokidar.watch(DEVICE_ALIASES_PATH, {
+      ignoreInitial: true,
+      awaitWriteFinish: { stabilityThreshold: 200, pollInterval: 50 },
+    });
 
-    this.aliasIndexBuildPromise = (async () => {
-      const devices = (this.deviceAliases.devices || []).filter(
-        (device) => device.enabled
-      );
-      const items = devices
-        .map((device) => ({
-          device,
-          serverId: device.serverId,
-          aliasText: buildDeviceAliasText(device),
-        }))
-        .filter((item) => item.serverId && item.aliasText);
-
-      if (items.length === 0) {
-        this.aliasVectorIndex = [];
-        return [];
-      }
-
+    const reloadAliases = () => {
       try {
-        const vectors = await this.embedTexts(
-          items.map((item) => item.aliasText),
-          this.pluginManager
-        );
-        this.aliasVectorIndex = items.map((item, index) => ({
-          ...item,
-          vector: vectors?.[index] || null,
-        }));
-        this.debugVectorRoute(
-          `alias vector index built: ${
-            this.aliasVectorIndex.filter((item) => item.vector).length
-          }/${items.length}`
-        );
+        this.loadDeviceAliases();
+        this.refreshShadowDistributedRouterPlaceholder();
+        console.log("[ShadowDistributedRouter] device-aliases.json reloaded.");
       } catch (err) {
-        this.aliasVectorIndex = [];
         console.warn(
-          "[ShadowDistributedRouter] build alias vector index failed, fallback to old routing:",
+          "[ShadowDistributedRouter] failed to reload device-aliases.json:",
           err.message
         );
       }
-
-      return this.aliasVectorIndex;
-    })();
-
-    try {
-      return await this.aliasIndexBuildPromise;
-    } finally {
-      this.aliasIndexBuildPromise = null;
-    }
-  }
-
-  async embedTexts(texts, pluginManager) {
-    const maxLength =
-      Number(this.vectorRouteConfig.maxUserTextLength) ||
-      DEFAULT_VECTOR_ROUTE_CONFIG.maxUserTextLength;
-    const cleanTexts = texts.map((text) =>
-      String(text || "").slice(0, maxLength)
-    );
-    if (cleanTexts.length === 0) return [];
-
-    const ragPlugin =
-      pluginManager?.messagePreprocessors?.get?.("RAGDiaryPlugin");
-    if (
-      this.vectorRouteConfig.preferRagCache &&
-      ragPlugin &&
-      typeof ragPlugin.getBatchEmbeddingsCached === "function"
-    ) {
-      try {
-        return await ragPlugin.getBatchEmbeddingsCached(cleanTexts);
-      } catch (err) {
-        console.warn(
-          "[ShadowDistributedRouter] RAG embedding cache failed:",
-          err.message
-        );
-      }
-    }
-
-    if (!this.vectorRouteConfig.fallbackToEmbeddingUtils) {
-      return new Array(cleanTexts.length).fill(null);
-    }
-
-    const embeddingConfig = {
-      apiKey: process.env.API_KEY,
-      apiUrl: process.env.API_URL,
-      model:
-        process.env.WhitelistEmbeddingModel || "google/gemini-embedding-001",
     };
-    return getEmbeddingsBatch(cleanTexts, embeddingConfig);
+
+    this.aliasWatcher.on("change", reloadAliases);
+    this.aliasWatcher.on("add", reloadAliases);
+    this.aliasWatcher.on("error", (err) => {
+      console.warn(
+        "[ShadowDistributedRouter] alias watcher error:",
+        err.message
+      );
+    });
   }
 
-  debugVectorRoute(message) {
-    if (this.vectorRouteConfig.debug) {
-      console.log(`[ShadowVectorRoute] ${message}`);
+  refreshShadowDistributedRouterPlaceholder() {
+    if (!this.pluginManager?.staticPlaceholderValues) return;
+    const usageText = this.generateDynamicUsageText();
+    const value = { value: usageText, serverId: "local" };
+    this.pluginManager.staticPlaceholderValues.set(SHADOW_PLACEHOLDER, value);
+    this.pluginManager.staticPlaceholderValues.delete(
+      "{{ShadowDistributedRouter}}"
+    );
+  }
+
+  generateDynamicUsageText() {
+    const lines = [
+      "【ShadowDistributedRouter：分布式设备寻址规则】",
+      "",
+      "你可以在 tool_name 后追加 #设备别名，指定某台在线设备执行分布式插件。",
+      "",
+      "格式：",
+      "tool_name:「始」插件名#设备别名「末」",
+      "",
+      "示例：",
+      "tool_name:「始」FileOperator#盛世国际电脑「末」",
+      "tool_name:「始」PowerShellExecutor#家里主机「末」",
+      "",
+      "规则：",
+      "1. # 后必须使用下方在线设备列表中的“设备别名”。",
+      "2. 如果目标工具是分布式插件，系统会路由到对应设备。",
+      "3. 如果目标工具是服务器本地插件，系统会忽略 #设备别名，并正常执行本地工具。",
+      "4. 如果不需要指定设备，直接使用原工具名。",
+      "5. 不要使用 clientId、serverId、连接 ID 等内部字段作为设备名。",
+      "",
+      "当前在线设备：",
+    ];
+
+    const onlineDevices = (this.deviceAliases.devices || []).filter(
+      (device) => device.enabled && getOnlineDeviceServerId(device)
+    );
+
+    if (onlineDevices.length === 0) {
+      lines.push("- 暂无在线分布式设备");
+      return lines.join("\n");
     }
+
+    const displayNames = buildDisplayNames(onlineDevices);
+    for (const device of onlineDevices) {
+      const displayName =
+        displayNames.get(device) || getPrimaryDeviceAlias(device);
+      lines.push(`- ${displayName}`);
+      lines.push(`  系统：${getDeviceOsSummary(device)}`);
+      lines.push(`  主机名：${device.hostName || device.serverName || "未知"}`);
+      lines.push(`  IP：${formatDeviceIps(device.lastKnownIPs)}`);
+      if (device.note) lines.push(`  说明：${device.note}`);
+      lines.push("  状态：在线");
+      lines.push(`  更新时间：${formatTimestamp(device.updatedAt)}`);
+    }
+
+    return lines.join("\n");
   }
 }
 
@@ -925,7 +895,6 @@ function findServerIdByReportedIp(ip) {
 
 function createDefaultDeviceAliases() {
   return {
-    vectorRoute: { ...DEFAULT_VECTOR_ROUTE_CONFIG },
     devices: [],
   };
 }
@@ -955,7 +924,11 @@ function mergeUserOwnedDeviceFields(current, latestOnDisk) {
     const latest = findMatchingDeviceForSystemFields(
       latestDevices,
       device.serverId,
-      { lastKnownIPs: device.lastKnownIPs || [] }
+      {
+        hostName: device.hostName,
+        serverName: device.serverName,
+        lastKnownIPs: device.lastKnownIPs || [],
+      }
     );
     if (!latest || latest === false) continue;
 
@@ -981,32 +954,45 @@ function mergeUserOwnedDeviceFields(current, latestOnDisk) {
 
 function normalizeDeviceAliases(value) {
   const normalized =
-    value && typeof value === "object" ? value : createDefaultDeviceAliases();
-  normalized.vectorRoute = {
-    ...DEFAULT_VECTOR_ROUTE_CONFIG,
-    ...(normalized.vectorRoute || {}),
-  };
+    value && typeof value === "object"
+      ? { ...value }
+      : createDefaultDeviceAliases();
+  delete normalized.vectorRoute;
   normalized.devices = Array.isArray(normalized.devices)
     ? normalized.devices
     : [];
   normalized.devices = normalized.devices
-    .filter((device) => device && typeof device === "object" && device.serverId)
+    .filter((device) => device && typeof device === "object")
     .map((device) => {
       const userFields = getUserOwnedDeviceFields(device);
+      const serverId = device.serverId ? String(device.serverId) : "";
+      const hostName = device.hostName
+        ? String(device.hostName)
+        : serverId || "";
+      const serverName = device.serverName
+        ? String(device.serverName)
+        : serverId || hostName || "";
       return {
-        serverId: String(device.serverId),
+        ...(serverId ? { serverId } : {}),
         ...userFields,
-        hostName: device.hostName
-          ? String(device.hostName)
-          : String(device.serverId),
-        serverName: device.serverName
-          ? String(device.serverName)
-          : String(device.serverId),
+        hostName,
+        serverName,
         lastKnownIPs: normalizeIpList(device.lastKnownIPs || []),
-        autoGenerated: device.autoGenerated !== false,
+        autoGenerated: device.autoGenerated === true,
         updatedAt: device.updatedAt || new Date().toISOString(),
       };
-    });
+    })
+    .filter((device) =>
+      Boolean(
+        device.serverId ||
+          device.hostName ||
+          device.serverName ||
+          device.lastKnownIPs.length > 0 ||
+          device.friendlyNames.length > 0 ||
+          device.note ||
+          device.username
+      )
+    );
   return normalized;
 }
 
@@ -1089,7 +1075,7 @@ function findMatchingDeviceForSystemFields(devices, serverId, systemFields) {
         `[ShadowDistributedRouter] lastKnownIPs device match ambiguous for serverId=${serverId}; matched=${lastKnownIpCandidates
           .map(
             (device) =>
-              `${device.serverId}:${normalizeIpList(
+              `${device.serverId || "<no-serverId>"}:${normalizeIpList(
                 device.lastKnownIPs || []
               ).join("|")}`
           )
@@ -1101,12 +1087,44 @@ function findMatchingDeviceForSystemFields(devices, serverId, systemFields) {
     }
   }
 
-  const exact = devices.find((device) => device.serverId === serverId);
+  const exact = devices.find(
+    (device) => device.serverId && device.serverId === serverId
+  );
   if (exact) return exact;
+
+  const hostNameCandidates = findHostNameCandidates(devices, systemFields);
+  if (hostNameCandidates.length === 1) return hostNameCandidates[0];
+  if (hostNameCandidates.length > 1) {
+    console.warn(
+      `[ShadowDistributedRouter] hostName device match ambiguous for serverId=${serverId}; matched=${hostNameCandidates
+        .map((device) => device.hostName || device.serverName || "<unknown>")
+        .join(
+          ","
+        )}. Skipping alias sync for this serverId to avoid merging devices.`
+    );
+    return false;
+  }
 
   return null;
 }
+function findHostNameCandidates(devices, systemFields) {
+  const systemNames = new Set(
+    normalizeStringList([systemFields?.hostName, systemFields?.serverName]).map(
+      normalizeAliasForExactMatch
+    )
+  );
+  systemNames.delete("");
+  if (systemNames.size === 0) return [];
 
+  return devices.filter((device) => {
+    if (!device || device.serverId) return false;
+    const deviceNames = normalizeStringList([
+      device.hostName,
+      device.serverName,
+    ]).map(normalizeAliasForExactMatch);
+    return deviceNames.some((name) => systemNames.has(name));
+  });
+}
 function shouldBootstrapDeviceAliases(devices) {
   return !Array.isArray(devices) || devices.length === 0;
 }
@@ -1198,53 +1216,95 @@ function isBlankAutoGeneratedDevice(device) {
   );
 }
 
-function buildDeviceAliasText(device) {
-  const lines = [];
-  const friendlyNames = Array.isArray(device.friendlyNames)
+function hasOnlineServer(serverId) {
+  if (!serverId) return false;
+  if (serverInfoRegistry.has(serverId)) return true;
+  for (const [, instances] of shadowRegistry) {
+    if (instances.has(serverId)) return true;
+  }
+  return false;
+}
+
+function getOnlineDeviceServerId(device) {
+  if (!device || device.enabled === false) return null;
+  if (device.serverId && hasOnlineServer(device.serverId))
+    return device.serverId;
+
+  const match = findMatchingDeviceForSystemFields(
+    onlineRuntimeDevices(),
+    null,
+    {
+      hostName: device.hostName,
+      serverName: device.serverName,
+      lastKnownIPs: device.lastKnownIPs || [],
+    }
+  );
+  if (!match || match === false || !match.serverId) return null;
+  return match.serverId;
+}
+
+function onlineRuntimeDevices() {
+  return collectKnownServerIds().map((serverId) =>
+    createAutoGeneratedDevice(getSystemDeviceFields(serverId))
+  );
+}
+
+function findDeviceByServerId(devices, serverId) {
+  return (devices || []).find((device) => device.serverId === serverId) || null;
+}
+
+function getPrimaryDeviceAlias(device) {
+  const friendlyNames = Array.isArray(device?.friendlyNames)
     ? device.friendlyNames.filter(Boolean)
     : [];
-  if (friendlyNames.length > 0)
-    lines.push(`设备别名：${friendlyNames.join("、")}。`);
-  if (device.hostName) lines.push(`主机名：${device.hostName}。`);
-  if (device.serverName) lines.push(`服务器名：${device.serverName}。`);
-  if (Array.isArray(device.lastKnownIPs) && device.lastKnownIPs.length > 0)
-    lines.push(`IP：${device.lastKnownIPs.join("、")}。`);
-  if (device.username) lines.push(`用户名：${device.username}。`);
-  if (device.note) lines.push(`说明：${device.note}。`);
-  return lines.join("\n").trim();
+  return (
+    friendlyNames[0] || device?.hostName || device?.serverName || "未知设备"
+  );
 }
 
-function getMessageTextContent(msg) {
-  if (!msg) return "";
-  if (typeof msg.content === "string") return msg.content;
-
-  if (Array.isArray(msg.content)) {
-    return msg.content
-      .filter((part) => part?.type === "text")
-      .map((part) => part.text)
-      .join("\n");
-  }
-
-  return "";
+function listOnlineDeviceAliases(devices) {
+  const names = (devices || [])
+    .filter((device) => device.enabled && getOnlineDeviceServerId(device))
+    .map(getPrimaryDeviceAlias)
+    .filter(Boolean);
+  return names.length > 0 ? names.join("、") : "无";
 }
 
-function getLastRealUserText(contextMessages = []) {
-  if (!Array.isArray(contextMessages)) return "";
+function formatDeviceCandidate(device) {
+  return `${getPrimaryDeviceAlias(device)}（主机名：${
+    device.hostName || "未知"
+  }，IP：${formatDeviceIps(device.lastKnownIPs)}）`;
+}
 
-  for (let i = contextMessages.length - 1; i >= 0; i--) {
-    const msg = contextMessages[i];
-    if (msg?.role !== "user") continue;
-
-    const content = getMessageTextContent(msg).trim();
-    if (!content) continue;
-    if (content.startsWith("<!-- VCP_TOOL_PAYLOAD -->")) continue;
-    if (content.startsWith("[系统提示:]")) continue;
-    if (content.startsWith("[系统邀请指令:]")) continue;
-
-    return content;
+function buildDisplayNames(devices) {
+  const counts = new Map();
+  const displayNames = new Map();
+  for (const device of devices) {
+    const base = getPrimaryDeviceAlias(device);
+    const count = (counts.get(base) || 0) + 1;
+    counts.set(base, count);
+    displayNames.set(device, count === 1 ? base : `${base}（${count}）`);
   }
+  return displayNames;
+}
 
-  return "";
+function formatDeviceIps(ips) {
+  const list = normalizeIpList(ips || []);
+  return list.length > 0 ? list.join(" / ") : "未知";
+}
+
+function getDeviceOsSummary(device) {
+  return device.os || device.platform || device.system || "未知";
+}
+
+function formatTimestamp(value) {
+  if (!value) return "未知";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return String(value);
+  const pad = (num) => String(num).padStart(2, "0");
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(
+    date.getDate()
+  )} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
 }
 
 function resolveLocalhostTargetServerId(
@@ -1349,14 +1409,19 @@ function normalizeIp(ip) {
   return normalized || null;
 }
 
-function getSafeMaxUserTextLength(value) {
-  const parsed = Number(value);
-  return Number.isFinite(parsed) && parsed > 0
-    ? Math.floor(parsed)
-    : DEFAULT_VECTOR_ROUTE_CONFIG.maxUserTextLength;
+function parseToolNameWithAlias(toolName) {
+  const text = String(toolName || "");
+  const idx = text.lastIndexOf("#");
+  if (idx === -1) {
+    return { rawToolName: text.trim(), deviceAlias: null };
+  }
+  return {
+    rawToolName: text.slice(0, idx).trim(),
+    deviceAlias: text.slice(idx + 1).trim() || null,
+  };
 }
 
-function normalizeText(text) {
+function normalizeAliasForExactMatch(text) {
   return String(text || "")
     .trim()
     .toLowerCase()

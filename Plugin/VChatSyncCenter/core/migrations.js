@@ -243,6 +243,70 @@ CREATE INDEX IF NOT EXISTS idx_messages_topic_order ON messages(item_type, item_
 CREATE INDEX IF NOT EXISTS idx_bootstrap_sessions_mode_status ON bootstrap_sessions(mode, status);
 `,
   },
+  {
+    version: 5,
+    name: "add_config_profile_projection_metadata",
+    sql: `
+ALTER TABLE config_entities ADD COLUMN profile TEXT NOT NULL DEFAULT 'bootstrap';
+ALTER TABLE config_entities ADD COLUMN projection_fields_json TEXT;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_config_entities_schema_entity_profile ON config_entities(schema, entity_id, profile);
+CREATE INDEX IF NOT EXISTS idx_config_entities_profile ON config_entities(profile, updated_at);
+`,
+  },
+  {
+    version: 6,
+    name: "rebuild_config_entities_profile_primary_key",
+    sql: `
+CREATE TABLE IF NOT EXISTS config_entities_v6 (
+  schema TEXT NOT NULL,
+  entity_id TEXT NOT NULL,
+  profile TEXT NOT NULL DEFAULT 'bootstrap',
+  projection_fields_json TEXT,
+  dto_version INTEGER NOT NULL DEFAULT 1,
+  safe_projection_json TEXT NOT NULL,
+  checksum TEXT NOT NULL,
+  operation_id TEXT,
+  device_id TEXT,
+  version INTEGER NOT NULL DEFAULT 1,
+  deleted INTEGER NOT NULL DEFAULT 0,
+  updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  PRIMARY KEY (schema, entity_id, profile)
+);
+INSERT OR REPLACE INTO config_entities_v6(
+  schema, entity_id, profile, projection_fields_json, dto_version,
+  safe_projection_json, checksum, operation_id, device_id, version, deleted, updated_at
+)
+SELECT
+  schema,
+  CASE
+    WHEN entity_id LIKE 'runtime:%' THEN substr(entity_id, length('runtime') + 2)
+    WHEN entity_id LIKE 'manual:%' THEN substr(entity_id, length('manual') + 2)
+    WHEN COALESCE(profile, 'bootstrap') != 'bootstrap'
+      AND entity_id LIKE COALESCE(profile, 'bootstrap') || ':%'
+      THEN substr(entity_id, length(COALESCE(profile, 'bootstrap')) + 2)
+    ELSE entity_id
+  END AS entity_id,
+  CASE
+    WHEN entity_id LIKE 'runtime:%' THEN 'runtime'
+    WHEN entity_id LIKE 'manual:%' THEN 'manual'
+    ELSE COALESCE(profile, 'bootstrap')
+  END AS profile,
+  projection_fields_json,
+  dto_version,
+  safe_projection_json,
+  checksum,
+  operation_id,
+  device_id,
+  version,
+  deleted,
+  updated_at
+FROM config_entities;
+DROP TABLE config_entities;
+ALTER TABLE config_entities_v6 RENAME TO config_entities;
+CREATE INDEX IF NOT EXISTS idx_config_entities_updated ON config_entities(updated_at);
+CREATE INDEX IF NOT EXISTS idx_config_entities_profile ON config_entities(profile, updated_at);
+`,
+  },
 ];
 
 function ensureSchemaMigrationsTable(db) {
@@ -306,6 +370,22 @@ function getMigrationState(db) {
   };
 }
 
+function executeMigrationSql(db, sql) {
+  const statements = String(sql || "")
+    .split(";")
+    .map((statement) => statement.trim())
+    .filter(Boolean);
+  for (const statement of statements) {
+    try {
+      db.exec(`${statement};`);
+    } catch (error) {
+      const message = String(error && error.message ? error.message : error);
+      if (/duplicate column name/i.test(message)) continue;
+      throw error;
+    }
+  }
+}
+
 function runMigrations(db, logger) {
   ensureSchemaMigrationsTable(db);
   const migrations = prepareMigrations();
@@ -331,7 +411,7 @@ function runMigrations(db, logger) {
 
     const startedAt = Date.now();
     const transaction = db.transaction(() => {
-      db.exec(migration.sql);
+      executeMigrationSql(db, migration.sql);
       db.prepare(
         `
 INSERT INTO schema_migrations(version, name, checksum, applied_at, duration_ms, success, error_message)
