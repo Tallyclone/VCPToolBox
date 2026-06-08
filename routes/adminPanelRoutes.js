@@ -10,12 +10,17 @@ module.exports = function (
   DEBUG_MODE,
   dailyNoteRootPath,
   pluginManager,
+  knowledgeRootPath,
   getCurrentServerLogPath,
   vectorDBManager,
   agentDirPath,
   cachedEmojiLists,
   tvsDirPath,
-  triggerRestart
+  triggerRestart,
+  semanticModelRouter,
+  modelRedirectHandler,
+  apiUrl,
+  apiKey
 ) {
   if (!agentDirPath || typeof agentDirPath !== "string") {
     throw new Error(
@@ -38,12 +43,17 @@ module.exports = function (
     DEBUG_MODE,
     dailyNoteRootPath,
     pluginManager,
+    knowledgeRootPath,
     getCurrentServerLogPath,
     vectorDBManager,
     agentDirPath,
     cachedEmojiLists,
     tvsDirPath,
     triggerRestart,
+    semanticModelRouter,
+    modelRedirectHandler,
+    apiUrl,
+    apiKey,
   };
 
   /**
@@ -72,6 +82,7 @@ module.exports = function (
 
   mount("/", "system"); // Handles /system-monitor/*, /user-auth-code, /weather
   mount("/", "logs"); // Handles /logs/*
+  mount("/", "finalContext"); // Handles /final-context
   mount("/", "config"); // Handles /tool-approval-config, /config/main
   mount("/", "plugins"); // Handles /plugins/*, /preprocessors/*
   mount("/", "server"); // Handles /verify-login, /logout, /check-auth, /server/restart
@@ -85,7 +96,8 @@ module.exports = function (
   mount("/", "agentAssistant"); // Handles /agent-assistant/*
   mount("/", "taskAssistant"); // Handles /task-assistant/*
   mount("/", "toolListEditor"); // Handles /tool-list/*
-    mount("/", "dynamicTools"); // Handles /dynamic-tools/*
+  mount("/", "dynamicTools"); // Handles /dynamic-tools/*
+  mount("/", "semanticRouter"); // Handles /semantic-router/*
   mount("/", "dream"); // Handles /dream-logs/*, /dream-operation/*
   mount("/", "dailyNotes"); // Wrapper for existing dailyNotesRoutes (Handles /dailynotes/*)
   mount("/", "newapiMonitor"); // Handles /newapi-monitor/*

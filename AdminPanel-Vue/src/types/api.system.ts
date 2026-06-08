@@ -84,6 +84,80 @@ export interface ServerLogQuery {
   offset?: number;
 }
 
+export interface FinalContextAttachmentSummary {
+  type: string;
+  mediaType: string;
+  filename?: string;
+  tokenCount?: number;
+  tokenMethod?: string;
+  byteLength?: number;
+}
+
+export interface FinalContextBlockSummary {
+  index: number;
+  role: string;
+  contentType: string;
+  text: string;
+  textLength: number;
+  textTokenCount?: number;
+  attachmentTokenCount?: number;
+  tokenCount: number;
+  tokenMethod?: string;
+  attachments: FinalContextAttachmentSummary[];
+  attachmentCounts?: Record<string, number>;
+  parts?: Array<Record<string, unknown>>;
+}
+
+export interface FinalContextSnapshot {
+  capturedAt: string;
+  metadata: Record<string, unknown>;
+  body: Record<string, unknown> & {
+    model?: string;
+    stream?: boolean;
+    messages?: unknown[];
+  };
+  summary: {
+    model: string | null;
+    stream: boolean;
+    messageCount: number;
+    totalTextLength: number;
+    totalTextTokenCount?: number;
+    totalAttachmentTokenCount?: number;
+    totalTokenCount: number;
+    tokenMethod?: string;
+    roleCounts: Record<string, number>;
+    blocks: FinalContextBlockSummary[];
+  };
+}
+
+export interface FinalContextResponse {
+  available: boolean;
+  message?: string;
+  snapshot?: FinalContextSnapshot;
+}
+
+export interface OneRingConfig {
+  enabled: boolean;
+  tailTagPlacement: 'inline' | 'system_user_block';
+  maxContextBlocks: number;
+  timeInsert: boolean;
+}
+
+export interface OneRingConfigResponse {
+  success?: boolean;
+  config: OneRingConfig;
+  raw?: Record<string, unknown>;
+  path?: string;
+  message?: string;
+}
+
+export interface OneRingConfigSaveResponse {
+  success?: boolean;
+  config: OneRingConfig;
+  path?: string;
+  message?: string;
+}
+
 export interface SystemMonitorResponse {
   system: SystemResources;
   pm2?: PM2Process[];

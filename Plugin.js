@@ -15,6 +15,13 @@ const { hasFoldMarkers, buildDynamicFoldObject } = require('./modules/foldProtoc
 const PLUGIN_DIR = path.join(__dirname, 'Plugin');
 const manifestFileName = 'plugin-manifest.json';
 const PREPROCESSOR_ORDER_FILE = path.join(__dirname, 'preprocessor_order.json');
+const SSH_MANAGER_ENV_PLUGIN_ALLOWLIST = new Set([
+    'LinuxShellExecutor',
+    'LinuxLogMonitor'
+]);
+const LOG_MONITOR_ENV_PLUGIN_ALLOWLIST = new Set([
+    'LinuxLogMonitor'
+]);
 
 class PluginManager extends EventEmitter {
     constructor() {
@@ -32,6 +39,7 @@ class PluginManager extends EventEmitter {
         this.isReloading = false;
         this.reloadTimeout = null;
         this.vectorDBManager = null; // 修复：不再自己创建，等待注入
+        this.tdbKnowledgeManager = null; // 冷知识库管理器，等待 server.js 注入
         this.toolApprovalManager = new ToolApprovalManager(path.join(__dirname, 'toolApprovalConfig.json'));
         this.pendingApprovals = new Map(); // requestId -> { resolve, reject, timeoutId }
     }
@@ -44,6 +52,11 @@ class PluginManager extends EventEmitter {
     setVectorDBManager(vdbManager) {
         this.vectorDBManager = vdbManager;
         if (this.debugMode) console.log('[PluginManager] VectorDBManager instance has been set.');
+    }
+
+    setTdbKnowledgeManager(tdbManager) {
+        this.tdbKnowledgeManager = tdbManager;
+        if (this.debugMode) console.log('[PluginManager] TDBKnowledgeManager instance has been set.');
     }
 
     async _getDecryptedAuthCode() {
@@ -119,6 +132,88 @@ class PluginManager extends EventEmitter {
         return effectiveConfig ? effectiveConfig[configKey] : undefined;
     }
 
+    _shouldInjectSSHManagerEnv(pluginName) {
+        return SSH_MANAGER_ENV_PLUGIN_ALLOWLIST.has(pluginName);
+    }
+
+    _shouldInjectLogMonitorEnv(pluginName) {
+        return LOG_MONITOR_ENV_PLUGIN_ALLOWLIST.has(pluginName);
+    }
+
+    _isLinuxShellExecutorLocalUserCommand(plugin, inputData) {
+        if (!plugin || !inputData) return false;
+
+        let args;
+        try {
+            args = typeof inputData === 'string' ? JSON.parse(inputData) : inputData;
+        } catch (e) {
+            return false;
+        }
+
+        if (!args || typeof args !== 'object' || !args.command) {
+            return false;
+        }
+
+        const hostId = args.hostId;
+        if (!hostId) {
+            return true;
+        }
+
+        try {
+            const hostsPath = path.join(plugin.basePath, 'hosts.json');
+            delete require.cache[require.resolve(hostsPath)];
+            const hostsConfig = require(hostsPath);
+            const hostConfig = hostsConfig.hosts?.[hostId];
+            return hostConfig ? hostConfig.type !== 'ssh' : hostId === 'local';
+        } catch (e) {
+            return hostId === 'local';
+        }
+    }
+
+    _shouldInjectSSHManagerEnvForExecution(pluginName, plugin, inputData) {
+        if (!this._shouldInjectSSHManagerEnv(pluginName)) {
+            return false;
+        }
+        if (
+            pluginName === 'LinuxShellExecutor' &&
+            this._isLinuxShellExecutorLocalUserCommand(plugin, inputData)
+        ) {
+            return false;
+        }
+        return true;
+    }
+
+    /**
+     * 跨平台进程树终止方法。
+     * Windows 上 shell:true 会创建 cmd.exe 包装进程，直接 kill 只杀 cmd 不杀子进程，
+     * 导致孤儿进程。此方法使用 taskkill /T /F 递归杀死整个进程树。
+     * Linux/macOS 上使用负 PID 发送信号给进程组，或回退到普通 SIGKILL。
+     */
+    _killProcessTree(pid, pluginName) {
+        if (!pid) return;
+        try {
+            if (process.platform === 'win32') {
+                // Windows: taskkill /T (tree kill) /F (force) /PID
+                spawn('taskkill', ['/T', '/F', '/PID', pid.toString()], {
+                    windowsHide: true,
+                    stdio: 'ignore'
+                });
+                if (this.debugMode) console.log(`[PluginManager] Sent taskkill /T /F /PID ${pid} for plugin "${pluginName}"`);
+            } else {
+                // Unix: 尝试杀死进程组（负 PID）
+                try {
+                    process.kill(-pid, 'SIGKILL');
+                } catch (e) {
+                    // 如果进程组不存在，回退到杀单个进程
+                    try { process.kill(pid, 'SIGKILL'); } catch (e2) { /* 进程可能已退出 */ }
+                }
+                if (this.debugMode) console.log(`[PluginManager] Sent SIGKILL to process group -${pid} for plugin "${pluginName}"`);
+            }
+        } catch (err) {
+            console.warn(`[PluginManager] Failed to kill process tree for plugin "${pluginName}" (PID: ${pid}): ${err.message}`);
+        }
+    }
+
     async _executeStaticPluginCommand(plugin) {
         if (!plugin || plugin.pluginType !== 'static' || !plugin.entryPoint || !plugin.entryPoint.command) {
             console.error(`[PluginManager] Invalid static plugin or command for execution: ${plugin ? plugin.name : 'Unknown'}`);
@@ -148,7 +243,7 @@ class PluginManager extends EventEmitter {
             const timeoutId = setTimeout(() => {
                 if (!processExited) {
                     console.log(`[PluginManager] Static plugin "${plugin.name}" has completed its work cycle (${timeoutDuration}ms), terminating background process.`);
-                    pluginProcess.kill('SIGKILL');
+                    this._killProcessTree(pluginProcess.pid, plugin.name);
                     // 超时不作为错误 - static 插件完成工作周期后返回已收集的输出
                     resolve(output.trim());
                 }
@@ -167,8 +262,12 @@ class PluginManager extends EventEmitter {
             pluginProcess.on('exit', (code, signal) => {
                 processExited = true;
                 clearTimeout(timeoutId);
-                if (signal === 'SIGKILL') {
-                    // 被 SIGKILL 终止（超时），已经在 timeout 回调中 resolve 了，这里直接返回
+                if (signal === 'SIGKILL' || signal === 'SIGTERM') {
+                    // 被强制终止（超时），已经在 timeout 回调中 resolve 了，这里直接返回
+                    return;
+                }
+                if (code === 1 && !output.trim() && !errorOutput.trim()) {
+                    // Windows taskkill 导致的退出码 1，且无有效输出，视为超时终止
                     return;
                 }
                 if (code !== 0) {
@@ -363,7 +462,7 @@ class PluginManager extends EventEmitter {
         return `[Invalid value format for placeholder ${placeholder}]`;
     }
 
-    async executeMessagePreprocessor(pluginName, messages) {
+    async executeMessagePreprocessor(pluginName, messages, requestConfig = {}) {
         const processorModule = this.messagePreprocessors.get(pluginName);
         const pluginManifest = this.plugins.get(pluginName);
         if (!processorModule || !pluginManifest) {
@@ -377,7 +476,7 @@ class PluginManager extends EventEmitter {
         try {
             if (this.debugMode) console.log(`[PluginManager] Executing message preprocessor: ${pluginName}`);
             const pluginSpecificConfig = this._getPluginConfig(pluginManifest);
-            const processedMessages = await processorModule.processMessages(messages, pluginSpecificConfig);
+            const processedMessages = await processorModule.processMessages(messages, { ...pluginSpecificConfig, ...requestConfig });
             if (this.debugMode) console.log(`[PluginManager] Message preprocessor ${pluginName} finished.`);
             return processedMessages;
         } catch (error) {
@@ -451,7 +550,7 @@ class PluginManager extends EventEmitter {
         for (const module of localModulesToShutdown) {
             if (typeof module.shutdown === 'function') {
                 try {
-                    module.shutdown();
+                    await module.shutdown();
                 } catch (e) {
                     console.error(`[PluginManager] Error during hot-reload shutdown of a plugin:`, e.message);
                 }
@@ -576,6 +675,11 @@ class PluginManager extends EventEmitter {
                     // --- 注入 VectorDBManager ---
                     if (manifest.name === 'RAGDiaryPlugin') {
                         dependencies.vectorDBManager = this.vectorDBManager;
+                        // 🧊 注入冷知识库管理器，供 [[xx知识库]] / 《《xx知识库》》 占位符使用
+                        if (this.tdbKnowledgeManager) {
+                            dependencies.tdbKnowledgeManager = this.tdbKnowledgeManager;
+                            if (this.debugMode) console.log(`[PluginManager] 🧊 Injected TDBKnowledgeManager into RAGDiaryPlugin.`);
+                        }
                     }
 
                     // --- 🌟 ContextBridge 通用依赖注入 ---
@@ -603,6 +707,11 @@ class PluginManager extends EventEmitter {
                             if (this.debugMode) console.log(`[PluginManager] Injected VectorDBManager, getSingleEmbedding and ContextBridge into LightMemo.`);
                         } else {
                             console.error(`[PluginManager] Critical dependency failure: RAGDiaryPlugin or its components not available for LightMemo injection.`);
+                        }
+                        // 注入冷知识库管理器（TDBKnowledge），供 LightMemo 检索企业级知识库
+                        if (this.tdbKnowledgeManager) {
+                            dependencies.tdbKnowledgeManager = this.tdbKnowledgeManager;
+                            if (this.debugMode) console.log(`[PluginManager] Injected TDBKnowledgeManager into LightMemo.`);
                         }
                     }
                     // --- 注入结束 ---
@@ -681,6 +790,52 @@ class PluginManager extends EventEmitter {
 
     getServiceModule(name) {
         return this.serviceModules.get(name)?.module;
+    }
+
+    _executeDirectToolCallWithTimeout(plugin, toolName, serviceModule, pluginSpecificArgs, directContext) {
+        const timeoutDuration = plugin.communication?.timeout || 60000;
+        const abortController = typeof AbortController === 'function'
+            ? new AbortController()
+            : null;
+        if (abortController) {
+            directContext.signal = abortController.signal;
+        }
+        const directCallPromise = Promise.resolve().then(() => (
+            serviceModule.processToolCall(pluginSpecificArgs, directContext)
+        ));
+
+        return new Promise((resolve, reject) => {
+            let settled = false;
+            const timeoutId = setTimeout(() => {
+                if (settled) return;
+                settled = true;
+                const timeoutError = new Error(`Plugin "${toolName}" direct tool call timed out after ${timeoutDuration}ms.`);
+                timeoutError.code = 'DIRECT_TOOL_TIMEOUT';
+                if (abortController) {
+                    try {
+                        abortController.abort(timeoutError);
+                    } catch (_) {
+                        abortController.abort();
+                    }
+                }
+                reject(timeoutError);
+            }, timeoutDuration);
+
+            directCallPromise.then(
+                result => {
+                    if (settled) return;
+                    settled = true;
+                    clearTimeout(timeoutId);
+                    resolve(result);
+                },
+                error => {
+                    if (settled) return;
+                    settled = true;
+                    clearTimeout(timeoutId);
+                    reject(error);
+                }
+            );
+        });
     }
 
     // 新增：获取 VCPLog 插件的推送函数，供其他插件依赖注入
@@ -879,7 +1034,28 @@ class PluginManager extends EventEmitter {
                 if (typeof serviceModule.processToolCall !== 'function') {
                     throw new Error(`[PluginManager] Hybrid service plugin "${toolName}" does not have a processToolCall function.`);
                 }
-                resultFromPlugin = await serviceModule.processToolCall(pluginSpecificArgs);
+                const directContext = {
+                    requestIp,
+                    sourceNode,
+                    pluginName: toolName
+                };
+                if (plugin.requiresAdmin) {
+                    const decryptedCode = await this._getDecryptedAuthCode();
+                    if (decryptedCode) {
+                        directContext.decryptedAuthCode = decryptedCode;
+                        if (this.debugMode) console.log(`[PluginManager] Provided decrypted auth context for admin-required hybrid plugin: ${toolName}`);
+                    } else {
+                        console.error(`[PluginManager] Failed to obtain auth code for admin-required hybrid plugin: ${toolName}. Execution denied.`);
+                        throw new Error(JSON.stringify({ plugin_error: `Plugin "${toolName}" requires admin authentication, but auth code could not be obtained. Execution denied.` }));
+                    }
+                }
+                resultFromPlugin = await this._executeDirectToolCallWithTimeout(
+                    plugin,
+                    toolName,
+                    serviceModule,
+                    pluginSpecificArgs,
+                    directContext
+                );
             } else {
                 // --- 本地插件调用逻辑 (现有逻辑) ---
                 if (!((plugin.pluginType === 'synchronous' || plugin.pluginType === 'asynchronous') && plugin.communication?.protocol === 'stdio')) {
@@ -989,7 +1165,8 @@ class PluginManager extends EventEmitter {
                 additionalEnv.DECRYPTED_AUTH_CODE = decryptedCode;
                 if (this.debugMode) console.log(`[PluginManager] Injected DECRYPTED_AUTH_CODE for admin-required plugin: ${pluginName}`);
             } else {
-                if (this.debugMode) console.warn(`[PluginManager] Could not get decrypted auth code for admin-required plugin: ${pluginName}. Execution will proceed without it.`);
+                console.error(`[PluginManager] Failed to obtain auth code for admin-required plugin: ${pluginName}. Execution denied.`);
+                throw new Error(JSON.stringify({ plugin_error: `Plugin "${pluginName}" requires admin authentication, but auth code could not be obtained. Execution denied.` }));
             }
         }
         // 将 requestIp 添加到环境变量
@@ -1006,6 +1183,30 @@ class PluginManager extends EventEmitter {
         const fileServerKey = this.getResolvedPluginConfigValue('ImageServer', 'File_Key');
         if (fileServerKey) {
             additionalEnv.IMAGESERVER_FILE_KEY = fileServerKey;
+        }
+
+        // 新增：注入 SSHManagerService 的 UDS 路径（如果服务已启动）
+        const sshManagerSock = global.__vcp_ssh_manager_sock;
+        if (sshManagerSock && this._shouldInjectSSHManagerEnvForExecution(pluginName, plugin, inputData)) {
+            additionalEnv.SSH_MANAGER_SOCK = sshManagerSock;
+            if (global.__vcp_ssh_manager_token) {
+                additionalEnv.SSH_MANAGER_TOKEN = global.__vcp_ssh_manager_token;
+            }
+            if (this.debugMode) console.log(`[PluginManager] 注入 SSH_MANAGER_SOCK=${sshManagerSock} 到插件 ${pluginName}`);
+        } else if (sshManagerSock && this.debugMode) {
+            console.log(`[PluginManager] 跳过向非白名单插件 ${pluginName} 注入 SSH_MANAGER_SOCK`);
+        }
+
+        // 注入 LinuxLogMonitorServer 的 UDS 路径和 token（仅限白名单插件）
+        const logMonitorSock = global.__vcp_log_monitor_sock;
+        if (logMonitorSock && this._shouldInjectLogMonitorEnv(pluginName, plugin)) {
+            additionalEnv.LOG_MONITOR_SOCK = logMonitorSock;
+            if (global.__vcp_log_monitor_token) {
+                additionalEnv.LOG_MONITOR_TOKEN = global.__vcp_log_monitor_token;
+            }
+            if (this.debugMode) console.log(`[PluginManager] 注入 LOG_MONITOR_SOCK=${logMonitorSock} 到插件 ${pluginName}`);
+        } else if (logMonitorSock && this.debugMode) {
+            console.log(`[PluginManager] 跳过向非白名单插件 ${pluginName} 注入 LOG_MONITOR_SOCK`);
         }
 
         // Pass CALLBACK_BASE_URL and PLUGIN_NAME to asynchronous plugins
@@ -1047,12 +1248,12 @@ class PluginManager extends EventEmitter {
                 if (!processExited && !initialResponseSent && isAsyncPlugin) {
                     // For async, if initial response not sent by timeout, it's an error for that phase
                     console.error(`[PluginManager executePlugin Internal] Async plugin "${pluginName}" initial response timed out after ${timeoutDuration}ms.`);
-                    pluginProcess.kill('SIGKILL'); // Kill if no initial response
+                    this._killProcessTree(pluginProcess.pid, pluginName);
                     reject(new Error(`Plugin "${pluginName}" initial response timed out.`));
                 } else if (!processExited && !isAsyncPlugin) {
                     // For sync plugins, or if async initial response was sent but process hangs
                     console.error(`[PluginManager executePlugin Internal] Plugin "${pluginName}" execution timed out after ${timeoutDuration}ms.`);
-                    pluginProcess.kill('SIGKILL');
+                    this._killProcessTree(pluginProcess.pid, pluginName);
                     reject(new Error(`Plugin "${pluginName}" execution timed out.`));
                 } else if (!processExited && isAsyncPlugin && initialResponseSent) {
                     // Async plugin's initial response was sent, but the process is still running (e.g. for background tasks)
@@ -1132,7 +1333,7 @@ class PluginManager extends EventEmitter {
 
                 // If we are here, it's either a sync plugin, or an async plugin whose initial response was NOT sent before exit.
 
-                if (signal === 'SIGKILL') { // Typically means timeout killed it
+                if (signal === 'SIGKILL' || signal === 'SIGTERM') { // Typically means timeout killed it
                     if (!initialResponseSent) reject(new Error(`Plugin "${pluginName}" execution timed out or was killed.`));
                     return;
                 }

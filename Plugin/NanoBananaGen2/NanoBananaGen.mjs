@@ -1,5 +1,4 @@
 #!/usr/bin/env node
-
 import axios from 'axios';
 import https from 'https';
 import { HttpsProxyAgent } from 'https-proxy-agent';
@@ -8,7 +7,6 @@ import path from 'path';
 import { v4 as uuidv4 } from 'uuid';
 
 // --- 1. 配置加载与初始化 ---
-
 const {
     CHANNELS,
     PROXY_AGENT,
@@ -16,7 +14,8 @@ const {
     PROJECT_BASE_PATH,
     SERVER_PORT,
     IMAGESERVER_IMAGE_KEY,
-    VAR_HTTP_URL
+    VAR_HTTP_URL,
+    USE_PUBLIC_URL
 } = (() => {
     // ─── 渠道解析 ───
     let channels = [];
@@ -60,6 +59,9 @@ const {
     // ─── 分布式图床 ───
     const distServers = (process.env.DIST_IMAGE_SERVERS || '').split(',').map(s => s.trim()).filter(Boolean);
 
+    // ─── 解析 USE_PUBLIC_URL 环境变量 ───
+    const usePublicUrl = (process.env.USE_PUBLIC_URL || 'true').toLowerCase() === 'true';
+
     return {
         CHANNELS: channels,
         PROXY_AGENT: agent,
@@ -67,7 +69,8 @@ const {
         PROJECT_BASE_PATH: process.env.PROJECT_BASE_PATH,
         SERVER_PORT: process.env.SERVER_PORT,
         IMAGESERVER_IMAGE_KEY: process.env.IMAGESERVER_IMAGE_KEY || process.env.Image_Key || process.env.IMAGE_KEY || process.env.ImageServerKey || '',
-        VAR_HTTP_URL: process.env.VarHttpUrl
+        VAR_HTTP_URL: process.env.VarHttpUrl,
+        USE_PUBLIC_URL: usePublicUrl
     };
 })();
 
@@ -167,7 +170,7 @@ async function callApi(payload) {
  * @param {object} originalArgs - 原始的工具调用参数
  * @returns {Promise<object>} - 格式化后的成功结果对象
  */
-async function processApiResponseAndSaveImage(message, originalArgs) {
+async function processApiResponseAndSaveImage(message, originalArgs, showBase64) {
     let textContent = message.content || '';
     let imageUrl = null;
 
@@ -211,10 +214,9 @@ async function processApiResponseAndSaveImage(message, originalArgs) {
     if (!imageUrl) {
         throw new Error(
             `API 未返回图片。可能原因：提示词触发安全审核、渠道不支持图像生成、` +
-            `或响应格式不在已知解析范围内。\n模型返回内容: ${
-                typeof message.content === 'string'
-                    ? message.content.substring(0, 500)
-                    : JSON.stringify(message.content)?.substring(0, 500)
+            `或响应格式不在已知解析范围内。\n模型返回内容: ${typeof message.content === 'string'
+                ? message.content.substring(0, 500)
+                : JSON.stringify(message.content)?.substring(0, 500)
             }`
         );
     }
@@ -246,32 +248,48 @@ async function processApiResponseAndSaveImage(message, originalArgs) {
     await fs.writeFile(localImagePath, imageBuffer);
 
     const relativePathForUrl = path.join('nanobananagen', generatedFileName).replace(/\\/g, '/');
-    const accessibleImageUrl = `${VAR_HTTP_URL}:${SERVER_PORT}/pw=${IMAGESERVER_IMAGE_KEY}/images/${relativePathForUrl}`;
+
+    // ─── 动态决定输出的 URL 格式 ───
+    let accessibleImageUrl;
+    if (USE_PUBLIC_URL) {
+        // 当 USE_PUBLIC_URL 为 true 时，不输出端口，保持 "//" 拼接
+        accessibleImageUrl = `${VAR_HTTP_URL}//pw=${IMAGESERVER_IMAGE_KEY}/images/${relativePathForUrl}`;
+    } else {
+        // 当 USE_PUBLIC_URL 为 false 时，输出带有端口的完整路径
+        accessibleImageUrl = `${VAR_HTTP_URL}:${SERVER_PORT}/pw=${IMAGESERVER_IMAGE_KEY}/images/${relativePathForUrl}`;
+    }
 
     const modelResponseText = cleanTextContent || "图片已成功处理！";
     const finalResponseText = `${modelResponseText}\n\n**图片详情:**\n- 提示词: ${originalArgs.prompt}\n- 可访问URL: ${accessibleImageUrl}\n\n请利用可访问url将图片转发给用户`;
 
     const base64Image = imageBuffer.toString('base64');
 
-    return {
-        content: [
-            {
-                type: 'text',
-                text: finalResponseText
-            },
-            {
-                type: 'image_url',
-                image_url: {
-                    url: `data:${mimeType};base64,${base64Image}`
-                }
+    const content = [
+        {
+            type: 'text',
+            text: finalResponseText
+        }
+    ];
+
+    // 只有当 showbase64 为 true 时才添加 base64 图片数据
+    if (showBase64) {
+        content.push({
+            type: 'image_url',
+            image_url: {
+                url: `data:${mimeType};base64,${base64Image}`
             }
-        ],
+        });
+    }
+
+    return {
+        content: content,
         details: {
             serverPath: `image/nanobananagen/${generatedFileName}`,
             fileName: generatedFileName,
             ...originalArgs,
             imageUrl: accessibleImageUrl,
-            modelResponseText: cleanTextContent || null
+            modelResponseText: cleanTextContent || null,
+            showBase64: showBase64
         }
     };
 }
@@ -390,7 +408,7 @@ function buildCommonPayloadFields(args) {
     return fields;
 }
 
-async function generateImage(args) {
+async function generateImage(args, showBase64) {
     if (!args.prompt || typeof args.prompt !== 'string') {
         throw new Error("参数错误: 'prompt' 是必需的字符串。");
     }
@@ -412,17 +430,17 @@ async function generateImage(args) {
     };
 
     const message = await callApi(payload);
-    return await processApiResponseAndSaveImage(message, args);
+    return await processApiResponseAndSaveImage(message, args, showBase64);
 }
 
-async function editImage(args) {
+async function editImage(args, showBase64) {
     if (!args.prompt || typeof args.prompt !== 'string') {
         throw new Error("参数错误: 'prompt' 是必需的字符串。");
     }
 
     const imageInputs = collectImageInputs(args);
     if (imageInputs.length > 1) {
-        return await composeImage(args);
+        return await composeImage(args, showBase64);
     }
 
     let imageUrlInput = args.image_base64 || args.image_url || args.image || args.Image || args.source_image || imageInputs[0];
@@ -460,10 +478,10 @@ async function editImage(args) {
     };
 
     const message = await callApi(payload);
-    return await processApiResponseAndSaveImage(message, args);
+    return await processApiResponseAndSaveImage(message, args, showBase64);
 }
 
-async function composeImage(args) {
+async function composeImage(args, showBase64) {
     if (!args.prompt || typeof args.prompt !== 'string') {
         throw new Error("参数错误: 'prompt' 是必需的字符串。");
     }
@@ -520,7 +538,7 @@ async function composeImage(args) {
     };
 
     const message = await callApi(payload);
-    return await processApiResponseAndSaveImage(message, args);
+    return await processApiResponseAndSaveImage(message, args, showBase64);
 }
 
 // --- 4. 主入口函数 ---
@@ -537,16 +555,19 @@ async function main() {
         }
         const parsedArgs = normalizeNanoBananaArgs(JSON.parse(inputData));
 
+        // 解析 showbase64 参数，默认为 false
+        const showBase64 = parsedArgs.showbase64 === 'true' || parsedArgs.showbase64 === true;
+
         let resultObject;
         switch (parsedArgs.command) {
             case 'generate':
-                resultObject = await generateImage(parsedArgs);
+                resultObject = await generateImage(parsedArgs, showBase64);
                 break;
             case 'edit':
-                resultObject = await editImage(parsedArgs);
+                resultObject = await editImage(parsedArgs, showBase64);
                 break;
             case 'compose':
-                resultObject = await composeImage(parsedArgs);
+                resultObject = await composeImage(parsedArgs, showBase64);
                 break;
             default:
                 throw new Error(`未知的命令: '${parsedArgs.command}'。请使用 'generate'、'edit' 或 'compose'。`);

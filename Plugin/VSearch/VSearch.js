@@ -274,8 +274,24 @@ ${showURL ? '5. 严格溯源：每一条重要信息必须附带来源 URL。如
 
         return content;
     } catch (error) {
-        log(`关键词 "${keyword}" 搜索失败: ${error.message}`);
-        return `[搜索失败] 关键词: ${keyword}。错误原因: ${error.message}`;
+        const statusCode = error.response?.status || 'N/A';
+        let errorDetail = error.message;
+        if (error.response?.data) {
+            // 兼容流式/对象/字符串等多种响应格式，尽量把 API 返回的真实错误体打出来
+            try {
+                if (typeof error.response.data === 'string') {
+                    errorDetail = error.response.data.substring(0, 1000);
+                } else if (Buffer.isBuffer(error.response.data)) {
+                    errorDetail = error.response.data.toString('utf8').substring(0, 1000);
+                } else {
+                    errorDetail = JSON.stringify(error.response.data).substring(0, 1000);
+                }
+            } catch (e) {
+                errorDetail = `${error.message} (响应体序列化失败: ${e.message})`;
+            }
+        }
+        log(`关键词 "${keyword}" 搜索失败 (HTTP ${statusCode}): ${errorDetail}`);
+        return `[搜索失败] 关键词: ${keyword}。错误原因: HTTP ${statusCode} - ${errorDetail}`;
     }
 };
 
@@ -656,7 +672,7 @@ async function main(request) {
     const showURL = ShowURL === true || ShowURL === 'true';
 
     if (!SearchTopic || !Keywords) {
-        return sendResponse({ status: "error", error: "缺少必需参数: SearchTopic 或 Keywords。" });
+        return sendResponse({ status: "error", error: "缺少必需参数: SearchTopic 和 Keywords。" });
     }
 
     const keywordList = Keywords.split(/[,\n，]/).map(k => k.trim()).filter(k => k.length > 0);

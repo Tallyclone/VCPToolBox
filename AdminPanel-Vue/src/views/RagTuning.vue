@@ -86,6 +86,8 @@
                 {
                   'param-row--changed': entry.changedLeaves > 0,
                   'param-row--wormhole': isWormholeEntry(section.name, entry),
+                  'param-row--ordered': isOrderedCooccurrenceEntry(section.name, entry),
+                  'param-row--geodesic': isGeodesicEntry(section.name, entry),
                 },
               ]"
             >
@@ -144,6 +146,177 @@
                       </button>
                     </div>
                   </div>
+                </div>
+              </template>
+
+              <template v-else-if="isOrderedCooccurrenceEntry(section.name, entry)">
+                <div class="wormhole-launchpad ordered-launchpad">
+                  <div class="wormhole-launchpad__copy">
+                    <div class="param-row__heading">
+                      <div class="param-row__title-block">
+                        <h4>{{ entry.meta.label }}</h4>
+                        <p class="param-row__key">{{ entry.key }}</p>
+                      </div>
+
+                      <div class="param-row__pills">
+                        <span class="mini-pill mini-pill--critical">
+                          {{ getToneLabel(entry.meta.tone) }}
+                        </span>
+                        <span
+                          v-if="entry.changedLeaves > 0"
+                          class="mini-pill mini-pill--changed"
+                        >
+                          已修改 {{ entry.changedLeaves }}
+                        </span>
+                      </div>
+                    </div>
+
+                    <p class="param-row__summary">{{ entry.meta.summary }}</p>
+
+                    <p v-if="entry.meta.range" class="param-row__range">
+                      <span class="material-symbols-outlined">account_tree</span>
+                      {{ entry.meta.range }}
+                    </p>
+
+                    <details v-if="entry.meta.logic" class="param-row__details">
+                      <summary>展开 V8.2 调优逻辑</summary>
+                      <div class="param-row__details-body">
+                        <p>{{ entry.meta.logic }}</p>
+                      </div>
+                    </details>
+                  </div>
+
+                  <div class="wormhole-launchpad__control ordered-launchpad__control">
+                    <div class="ordered-launchpad__axis">
+                      <article
+                        v-for="axis in ORDERED_COOCCURRENCE_PANELS.slice(0, 3)"
+                        :key="axis.id"
+                        class="ordered-launchpad__axis-card"
+                      >
+                        <span>{{ axis.title }}</span>
+                        <strong>{{ axis.axis }}</strong>
+                      </article>
+                    </div>
+
+                    <div class="wormhole-launchpad__stats">
+                      <article
+                        v-for="subKey in ORDERED_COOCCURRENCE_PRIMARY_KEYS"
+                        :key="subKey"
+                        class="wormhole-launchpad__stat"
+                      >
+                        <span>{{ getOrderedQuickLabel(subKey) }}</span>
+                        <strong>{{ getOrderedQuickValue(entry, subKey) }}</strong>
+                      </article>
+                    </div>
+
+                    <div class="wormhole-launchpad__footer">
+                      <button type="button" class="btn-primary" @click="openOrderedCooccurrenceModal">
+                        打开 V8.2 流形舱
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              </template>
+
+              <template v-else-if="isGeodesicEntry(section.name, entry)">
+                <div class="geodesic-launchpad__copy">
+                  <div class="param-row__heading">
+                    <div class="param-row__title-block">
+                      <h4>{{ entry.meta.label }}</h4>
+                      <p class="param-row__key">{{ entry.key }}</p>
+                    </div>
+
+                    <div class="param-row__pills">
+                      <span class="mini-pill mini-pill--sensitive">
+                        {{ getToneLabel(entry.meta.tone) }}
+                      </span>
+                      <span
+                        v-if="entry.changedLeaves > 0"
+                        class="mini-pill mini-pill--changed"
+                      >
+                        已修改 {{ entry.changedLeaves }}
+                      </span>
+                    </div>
+                  </div>
+
+                  <p class="param-row__summary">{{ entry.meta.summary }}</p>
+
+                  <p v-if="entry.meta.range" class="param-row__range">
+                    <span class="material-symbols-outlined">route</span>
+                    {{ entry.meta.range }}
+                  </p>
+
+                  <details v-if="entry.meta.logic" class="param-row__details">
+                    <summary>展开测地线融合逻辑</summary>
+                    <div class="param-row__details-body">
+                      <p>{{ entry.meta.logic }}</p>
+                    </div>
+                  </details>
+                </div>
+
+                <div class="geodesic-launchpad__control">
+                  <div class="geodesic-meter">
+                    <div class="geodesic-meter__label-row">
+                      <span>KNN 置信度</span>
+                      <strong>{{ formatNumber(1 - getGeodesicAlpha(entry)) }}</strong>
+                    </div>
+                    <div class="geodesic-meter__bar">
+                      <span
+                        class="geodesic-meter__fill"
+                        :style="{ width: `${getGeodesicAlpha(entry) * 100}%` }"
+                      ></span>
+                    </div>
+                    <div class="geodesic-meter__label-row">
+                      <span>测地线置信度 α</span>
+                      <strong>{{ formatNumber(getGeodesicAlpha(entry)) }}</strong>
+                    </div>
+                  </div>
+
+                  <div
+                    v-for="subKey in Object.keys(entry.value)"
+                    :key="`${entry.key}-${subKey}`"
+                    class="geodesic-field"
+                  >
+                    <div class="geodesic-field__copy">
+                      <h5>{{ getNestedMeta(section.name, entry.key, subKey).label }}</h5>
+                      <p>{{ getNestedMeta(section.name, entry.key, subKey).summary }}</p>
+                      <span v-if="getNestedMeta(section.name, entry.key, subKey).range">
+                        {{ getNestedMeta(section.name, entry.key, subKey).range }}
+                      </span>
+                    </div>
+
+                    <div class="geodesic-field__control">
+                      <input
+                        v-model.number="
+                          (section.raw[entry.key] as Record<string, number>)[subKey]
+                        "
+                        type="range"
+                        :aria-label="`${getNestedMeta(section.name, entry.key, subKey).label} 滑杆`"
+                        :min="getSubParamRange(`${entry.key}.${subKey}`, (section.raw[entry.key] as Record<string, number>)[subKey]).min"
+                        :max="getSubParamRange(`${entry.key}.${subKey}`, (section.raw[entry.key] as Record<string, number>)[subKey]).max"
+                        :step="getSubParamRange(`${entry.key}.${subKey}`, (section.raw[entry.key] as Record<string, number>)[subKey]).step"
+                      />
+                      <input
+                        v-model.number="
+                          (section.raw[entry.key] as Record<string, number>)[subKey]
+                        "
+                        type="number"
+                        :aria-label="`${getNestedMeta(section.name, entry.key, subKey).label} 数值输入`"
+                        :min="getSubParamRange(`${entry.key}.${subKey}`, (section.raw[entry.key] as Record<string, number>)[subKey]).min"
+                        :max="getSubParamRange(`${entry.key}.${subKey}`, (section.raw[entry.key] as Record<string, number>)[subKey]).max"
+                        :step="getSubParamRange(`${entry.key}.${subKey}`, (section.raw[entry.key] as Record<string, number>)[subKey]).step"
+                      />
+                    </div>
+                  </div>
+
+                  <button
+                    type="button"
+                    class="btn-secondary"
+                    :disabled="entry.changedLeaves === 0"
+                    @click="resetGeodesicParams"
+                  >
+                    恢复测地线参数
+                  </button>
                 </div>
               </template>
 
@@ -273,9 +446,9 @@
                             class="nested-item__slider"
                             type="range"
                             :aria-label="`${getNestedMeta(section.name, entry.key, subKey).label} 滑杆`"
-                            :min="getSubParamRange(subKey).min"
-                            :max="getSubParamRange(subKey).max"
-                            :step="getSubParamRange(subKey).step"
+                            :min="getSubParamRange(`${entry.key}.${subKey}`, (section.raw[entry.key] as Record<string, number>)[subKey]).min"
+                            :max="getSubParamRange(`${entry.key}.${subKey}`, (section.raw[entry.key] as Record<string, number>)[subKey]).max"
+                            :step="getSubParamRange(`${entry.key}.${subKey}`, (section.raw[entry.key] as Record<string, number>)[subKey]).step"
                           />
                           <input
                             v-model.number="
@@ -284,9 +457,9 @@
                             class="nested-item__number"
                             type="number"
                             :aria-label="`${getNestedMeta(section.name, entry.key, subKey).label} 数值输入`"
-                            :min="getSubParamRange(subKey).min"
-                            :max="getSubParamRange(subKey).max"
-                            :step="getSubParamRange(subKey).step"
+                            :min="getSubParamRange(`${entry.key}.${subKey}`, (section.raw[entry.key] as Record<string, number>)[subKey]).min"
+                            :max="getSubParamRange(`${entry.key}.${subKey}`, (section.raw[entry.key] as Record<string, number>)[subKey]).max"
+                            :step="getSubParamRange(`${entry.key}.${subKey}`, (section.raw[entry.key] as Record<string, number>)[subKey]).step"
                           />
                         </div>
                       </div>
@@ -325,6 +498,15 @@
                 :disabled="isSaving || !hasParams || !isDirty"
               >
                 <span class="material-symbols-outlined">save</span>
+              </button>
+              <button
+                type="button"
+                class="console-rail-icon console-rail-icon--simulation"
+                aria-label="打开浪潮语义沙盘"
+                title="打开浪潮语义沙盘"
+                @click="openSemanticSimulation"
+              >
+                <span class="material-symbols-outlined">travel_explore</span>
               </button>
               <button
                 v-for="section in groupSections.slice(0, 8)"
@@ -386,6 +568,22 @@
             {{ statusMessage }}
           </p>
 
+          <div class="rag-console__section rag-console__section--simulation">
+            <span class="rag-console__label">语义沙盘</span>
+            <div class="semantic-sim-card">
+              <div class="semantic-sim-card__orb">
+                <span class="material-symbols-outlined">travel_explore</span>
+              </div>
+              <div class="semantic-sim-card__copy">
+                <strong>浪潮语义地形模拟器</strong>
+                <p>在子模态窗中预览 KNN 击中、顺逆流、虫洞跃迁与测地线能量场。</p>
+              </div>
+              <button type="button" class="btn-primary" @click="openSemanticSimulation">
+                打开沙盘
+              </button>
+            </div>
+          </div>
+
           <div class="rag-console__section">
             <span class="rag-console__label">快速跳转</span>
             <div class="rag-console__jump-list">
@@ -434,16 +632,75 @@
       @restore="resetWormholeParams"
       @update-field="updateWormholeField"
     />
+
+    <OrderedCooccurrenceModal
+      v-if="orderedCooccurrenceEntry"
+      :model-value="orderedCooccurrenceModalOpen"
+      :group-name="ORDERED_COOCCURRENCE_GROUP_NAME"
+      :param-key="ORDERED_COOCCURRENCE_PARAM_KEY"
+      :values="orderedCooccurrenceCurrentValues"
+      :original-values="orderedCooccurrenceOriginalValues"
+      :changed-leaves="orderedCooccurrenceEntry.changedLeaves"
+      :total-leaves="orderedCooccurrenceEntry.totalLeaves"
+      :is-saving="isSaving"
+      :is-dirty="isDirty"
+      :form-id="formId"
+      @close="closeOrderedCooccurrenceModal"
+      @restore="resetOrderedCooccurrenceParams"
+      @update-field="updateOrderedCooccurrenceField"
+    />
+
+    <Teleport to="body">
+      <div
+        v-if="semanticSimulationOpen"
+        class="semantic-sim-modal"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="semantic-sim-modal-title"
+      >
+        <div class="semantic-sim-modal__backdrop" @click="closeSemanticSimulation"></div>
+        <section class="semantic-sim-modal__panel">
+          <header class="semantic-sim-modal__header">
+            <div>
+              <span class="semantic-sim-modal__eyebrow">TagMemo Terrain Sandbox</span>
+              <h3 id="semantic-sim-modal-title">浪潮语义地形沙盘</h3>
+              <p>
+                当前沙盘会接收此页面尚未保存的有序共现与虫洞脉冲参数，用于快速观察调参方向的视觉影响。
+              </p>
+            </div>
+            <div class="semantic-sim-modal__actions">
+              <button type="button" class="btn-secondary" @click="postSemanticSimulationParams">
+                同步当前参数
+              </button>
+              <button type="button" class="btn-secondary" @click="closeSemanticSimulation">
+                关闭沙盘
+              </button>
+            </div>
+          </header>
+          <iframe
+            ref="semanticSimulationFrame"
+            class="semantic-sim-modal__frame"
+            :src="semanticSimulationUrl"
+            title="浪潮语义地形沙盘"
+            @load="postSemanticSimulationParams"
+          ></iframe>
+        </section>
+      </div>
+    </Teleport>
   </section>
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, ref } from "vue";
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { ragApi, type ParamGroup, type ParamValue, type RagParams } from "@/api";
 import { useConsoleCollapse } from "@/composables/useConsoleCollapse";
+import { useAppStore } from "@/stores/app";
+import OrderedCooccurrenceModal from "@/features/rag-tuning/OrderedCooccurrenceModal.vue";
 import WormholeRoutingModal from "@/features/rag-tuning/WormholeRoutingModal.vue";
 import {
   GROUP_ORDER,
+  ORDERED_COOCCURRENCE_PANELS,
+  ORDERED_COOCCURRENCE_PRIMARY_KEYS,
   WORMHOLE_PRIMARY_KEYS,
   getGroupMeta,
   getParamMeta,
@@ -452,6 +709,7 @@ import {
   getTupleLabel,
   type GroupMeta,
   type ParamMeta,
+  type OrderedCooccurrencePrimaryKey,
   type WormholePrimaryKey,
 } from "@/features/rag-tuning/metadata";
 import { showMessage } from "@/utils";
@@ -498,10 +756,16 @@ interface GroupSection {
 
 const WORMHOLE_GROUP_NAME = "KnowledgeBaseManager";
 const WORMHOLE_PARAM_KEY = "spikeRouting";
+const GEODESIC_GROUP_NAME = "KnowledgeBaseManager";
+const GEODESIC_PARAM_KEY = "geodesicRerank";
+const ORDERED_COOCCURRENCE_GROUP_NAME = "KnowledgeBaseManager";
+const ORDERED_COOCCURRENCE_PARAM_KEY = "orderedCooccurrence";
 const formId = "rag-tuning-form";
 const CONTENT_CONTAINER_ID = "config-details-container";
 const GROUP_SCROLL_OFFSET = 16;
+const semanticSimulationUrl = `${import.meta.env.BASE_URL}tagmemo-simulation.html`;
 
+const appStore = useAppStore();
 const params = ref<RagParams>({});
 const originalParams = ref<RagParams>({});
 const isLoading = ref(true);
@@ -510,6 +774,9 @@ const loadError = ref("");
 const statusMessage = ref("");
 const statusType = ref<StatusType>("info");
 const wormholeModalOpen = ref(false);
+const orderedCooccurrenceModalOpen = ref(false);
+const semanticSimulationOpen = ref(false);
+const semanticSimulationFrame = ref<HTMLIFrameElement | null>(null);
 
 const { collapsed: asideCollapsed, toggle: toggleAside } = useConsoleCollapse(
   "rag-tuning-aside"
@@ -673,12 +940,49 @@ const wormholeOriginalValues = computed<NumericRecord>(() => {
   return isNumericRecord(raw) ? raw : {};
 });
 
+const orderedCooccurrenceEntry = computed<NestedParamEntry | null>(() => {
+  const section = groupSections.value.find((item) => item.name === ORDERED_COOCCURRENCE_GROUP_NAME);
+  const entry = section?.entries.find((item) => item.key === ORDERED_COOCCURRENCE_PARAM_KEY);
+  return entry && entry.kind === "nested" ? entry : null;
+});
+
+const orderedCooccurrenceCurrentValues = computed<NumericRecord>(() => {
+  const raw = params.value[ORDERED_COOCCURRENCE_GROUP_NAME]?.[ORDERED_COOCCURRENCE_PARAM_KEY];
+  return isNumericRecord(raw) ? raw : {};
+});
+
+const orderedCooccurrenceOriginalValues = computed<NumericRecord>(() => {
+  const raw = originalParams.value[ORDERED_COOCCURRENCE_GROUP_NAME]?.[ORDERED_COOCCURRENCE_PARAM_KEY];
+  return isNumericRecord(raw) ? raw : {};
+});
+
+const semanticSimulationParams = computed<NumericRecord>(() => ({
+  ...orderedCooccurrenceCurrentValues.value,
+  ...wormholeCurrentValues.value,
+}));
+
 function isWormholeNestedEntry(entry: ParamEntry): entry is NestedParamEntry {
   return entry.kind === "nested" && entry.key === WORMHOLE_PARAM_KEY;
 }
 
+function isGeodesicNestedEntry(entry: ParamEntry): entry is NestedParamEntry {
+  return entry.kind === "nested" && entry.key === GEODESIC_PARAM_KEY;
+}
+
 function isWormholeEntry(sectionName: string, entry: ParamEntry): boolean {
   return sectionName === WORMHOLE_GROUP_NAME && isWormholeNestedEntry(entry);
+}
+
+function isGeodesicEntry(sectionName: string, entry: ParamEntry): boolean {
+  return sectionName === GEODESIC_GROUP_NAME && isGeodesicNestedEntry(entry);
+}
+
+function isOrderedCooccurrenceNestedEntry(entry: ParamEntry): entry is NestedParamEntry {
+  return entry.kind === "nested" && entry.key === ORDERED_COOCCURRENCE_PARAM_KEY;
+}
+
+function isOrderedCooccurrenceEntry(sectionName: string, entry: ParamEntry): boolean {
+  return sectionName === ORDERED_COOCCURRENCE_GROUP_NAME && isOrderedCooccurrenceNestedEntry(entry);
 }
 
 function getKindLabel(kind: ParamEntryKind): string {
@@ -731,12 +1035,37 @@ function getNestedMeta(groupName: string, paramKey: string, subKey: string): Par
   return getParamMeta(groupName, `${paramKey}.${subKey}`);
 }
 
+function getGeodesicAlpha(entry: ParamEntry): number {
+  if (!isGeodesicNestedEntry(entry)) {
+    return 0;
+  }
+
+  const rawAlpha = Number(entry.value.alpha);
+  return Number.isFinite(rawAlpha) ? Math.max(0, Math.min(1, rawAlpha)) : 0;
+}
+
 function getWormholeQuickLabel(subKey: WormholePrimaryKey): string {
   return getNestedMeta(WORMHOLE_GROUP_NAME, WORMHOLE_PARAM_KEY, subKey).label;
 }
 
 function getWormholeQuickValue(entry: ParamEntry, subKey: WormholePrimaryKey): string {
   if (!isWormholeNestedEntry(entry)) {
+    return "--";
+  }
+
+  return formatNumber(entry.value[subKey]);
+}
+
+function getOrderedQuickLabel(subKey: OrderedCooccurrencePrimaryKey): string {
+  return getNestedMeta(
+    ORDERED_COOCCURRENCE_GROUP_NAME,
+    ORDERED_COOCCURRENCE_PARAM_KEY,
+    subKey
+  ).label;
+}
+
+function getOrderedQuickValue(entry: ParamEntry, subKey: OrderedCooccurrencePrimaryKey): string {
+  if (!isOrderedCooccurrenceNestedEntry(entry)) {
     return "--";
   }
 
@@ -791,6 +1120,17 @@ function closeWormholeModal(): void {
   wormholeModalOpen.value = false;
 }
 
+function updateSimulationField(subKey: string, value: number): void {
+  if (subKey in orderedCooccurrenceCurrentValues.value) {
+    updateOrderedCooccurrenceField(subKey, value);
+    return;
+  }
+
+  if (subKey in wormholeCurrentValues.value) {
+    updateWormholeField(subKey, value);
+  }
+}
+
 function updateWormholeField(subKey: string, value: number): void {
   const raw = params.value[WORMHOLE_GROUP_NAME]?.[WORMHOLE_PARAM_KEY];
 
@@ -809,6 +1149,105 @@ function resetWormholeParams(): void {
   params.value[WORMHOLE_GROUP_NAME][WORMHOLE_PARAM_KEY] = { ...original };
   statusMessage.value = "已恢复虫洞脉冲路由的未保存修改。";
   statusType.value = "info";
+}
+
+function resetGeodesicParams(): void {
+  const original = originalParams.value[GEODESIC_GROUP_NAME]?.[GEODESIC_PARAM_KEY];
+
+  if (!params.value[GEODESIC_GROUP_NAME] || !isNumericRecord(original)) {
+    return;
+  }
+
+  params.value[GEODESIC_GROUP_NAME][GEODESIC_PARAM_KEY] = { ...original };
+  statusMessage.value = "已恢复测地线重排的未保存修改。";
+  statusType.value = "info";
+}
+
+function openOrderedCooccurrenceModal(): void {
+  if (orderedCooccurrenceEntry.value) {
+    orderedCooccurrenceModalOpen.value = true;
+  }
+}
+
+function closeOrderedCooccurrenceModal(): void {
+  orderedCooccurrenceModalOpen.value = false;
+}
+
+function updateOrderedCooccurrenceField(subKey: string, value: number): void {
+  const raw = params.value[ORDERED_COOCCURRENCE_GROUP_NAME]?.[ORDERED_COOCCURRENCE_PARAM_KEY];
+
+  if (isNumericRecord(raw)) {
+    raw[subKey] = value;
+  }
+}
+
+function resetOrderedCooccurrenceParams(): void {
+  const original =
+    originalParams.value[ORDERED_COOCCURRENCE_GROUP_NAME]?.[ORDERED_COOCCURRENCE_PARAM_KEY];
+
+  if (!params.value[ORDERED_COOCCURRENCE_GROUP_NAME] || !isNumericRecord(original)) {
+    return;
+  }
+
+  params.value[ORDERED_COOCCURRENCE_GROUP_NAME][ORDERED_COOCCURRENCE_PARAM_KEY] = {
+    ...original,
+  };
+  statusMessage.value = "已恢复 V8.2 有序双向势能流形的未保存修改。";
+  statusType.value = "info";
+}
+
+function handleSemanticSimulationMessage(event: MessageEvent): void {
+  if (event.origin !== window.location.origin) {
+    return;
+  }
+
+  if (!event.data || event.data.type !== "tagmemo-simulation-params-changed") {
+    return;
+  }
+
+  const nextParams = event.data.params;
+
+  if (!nextParams || typeof nextParams !== "object") {
+    return;
+  }
+
+  Object.entries(nextParams as Record<string, unknown>).forEach(([subKey, rawValue]) => {
+    if (typeof rawValue !== "number" || Number.isNaN(rawValue)) {
+      return;
+    }
+
+    updateSimulationField(subKey, rawValue);
+  });
+
+  statusMessage.value = "已从浪潮语义沙盘同步未保存参数。";
+  statusType.value = "info";
+}
+
+function postSemanticSimulationParams(): void {
+  const frameWindow = semanticSimulationFrame.value?.contentWindow;
+
+  if (!frameWindow) {
+    return;
+  }
+
+  frameWindow.postMessage(
+    {
+      type: "tagmemo-simulation-params",
+      params: semanticSimulationParams.value,
+      theme: appStore.theme,
+    },
+    window.location.origin
+  );
+}
+
+async function openSemanticSimulation(): Promise<void> {
+  semanticSimulationOpen.value = true;
+  await nextTick();
+  postSemanticSimulationParams();
+}
+
+function closeSemanticSimulation(): void {
+  semanticSimulationOpen.value = false;
 }
 
 async function loadParams(): Promise<void> {
@@ -867,8 +1306,32 @@ function resetParams(): void {
   statusType.value = "info";
 }
 
+watch(
+  semanticSimulationParams,
+  () => {
+    if (semanticSimulationOpen.value) {
+      postSemanticSimulationParams();
+    }
+  },
+  { deep: true }
+);
+
+watch(
+  () => appStore.theme,
+  () => {
+    if (semanticSimulationOpen.value) {
+      postSemanticSimulationParams();
+    }
+  }
+);
+
 onMounted(() => {
+  window.addEventListener("message", handleSemanticSimulationMessage);
   void loadParams();
+});
+
+onBeforeUnmount(() => {
+  window.removeEventListener("message", handleSemanticSimulationMessage);
 });
 </script>
 
@@ -1397,6 +1860,147 @@ onMounted(() => {
   justify-content: center;
 }
 
+.ordered-launchpad__control {
+  border-color: color-mix(in srgb, var(--highlight-text) 20%, var(--border-color));
+  background:
+    radial-gradient(circle at 16% 0%, color-mix(in srgb, var(--highlight-text) 12%, transparent), transparent 42%),
+    var(--surface-overlay-soft);
+}
+
+.ordered-launchpad__axis {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: var(--space-3);
+}
+
+.ordered-launchpad__axis-card {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+  padding: var(--space-3) var(--space-4);
+  border-radius: var(--radius-lg);
+  background: var(--surface-overlay);
+}
+
+.ordered-launchpad__axis-card span {
+  color: var(--secondary-text);
+  font-size: var(--font-size-helper);
+}
+
+.ordered-launchpad__axis-card strong {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.geodesic-launchpad__copy {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+
+.geodesic-launchpad__control {
+  display: grid;
+  gap: var(--space-4);
+  width: 100%;
+  padding: var(--space-4);
+  border: 1px solid color-mix(in srgb, var(--highlight-text) 22%, var(--border-color));
+  border-radius: var(--radius-xl);
+  background:
+    radial-gradient(circle at 18% 0%, color-mix(in srgb, var(--highlight-text) 14%, transparent), transparent 42%),
+    var(--surface-overlay-soft);
+}
+
+.geodesic-meter {
+  display: grid;
+  gap: var(--space-2);
+  padding: var(--space-3) var(--space-4);
+  border-radius: var(--radius-lg);
+  background: var(--surface-overlay);
+}
+
+.geodesic-meter__label-row {
+  display: flex;
+  justify-content: space-between;
+  gap: var(--space-3);
+  color: var(--secondary-text);
+  font-size: var(--font-size-helper);
+}
+
+.geodesic-meter__label-row strong {
+  color: var(--primary-text);
+  font-family: "Consolas", "Monaco", monospace;
+}
+
+.geodesic-meter__bar {
+  position: relative;
+  height: 10px;
+  overflow: hidden;
+  border-radius: var(--radius-full);
+  background: color-mix(in srgb, var(--secondary-text) 20%, transparent);
+}
+
+.geodesic-meter__fill {
+  position: absolute;
+  inset: 0 auto 0 0;
+  border-radius: inherit;
+  background: linear-gradient(90deg, var(--highlight-text), color-mix(in srgb, var(--highlight-text) 62%, white));
+}
+
+.geodesic-field {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 170px;
+  gap: var(--space-4);
+  align-items: center;
+  padding: var(--space-3) var(--space-4);
+  border-radius: var(--radius-lg);
+  background: var(--surface-overlay);
+}
+
+.geodesic-field__copy {
+  display: grid;
+  gap: var(--space-2);
+}
+
+.geodesic-field__copy h5,
+.geodesic-field__copy p {
+  margin: 0;
+}
+
+.geodesic-field__copy p,
+.geodesic-field__copy span {
+  color: var(--secondary-text);
+  font-size: var(--font-size-body);
+  line-height: 1.6;
+}
+
+.geodesic-field__copy span {
+  font-size: var(--font-size-caption);
+}
+
+.geodesic-field__control {
+  display: grid;
+  gap: 10px;
+}
+
+.geodesic-field__control input[type="range"] {
+  width: 100%;
+  margin: 0;
+  accent-color: var(--highlight-text);
+}
+
+.geodesic-field__control input[type="number"] {
+  width: 100%;
+  padding: 10px 12px;
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-lg);
+  background: var(--input-bg);
+  color: var(--primary-text);
+  font-family: "Consolas", "Monaco", monospace;
+  text-align: right;
+}
+
 .rag-lab__aside {
   position: sticky;
   top: var(--space-4);
@@ -1539,6 +2143,167 @@ onMounted(() => {
   padding-left: var(--space-4);
 }
 
+.semantic-sim-card {
+  position: relative;
+  overflow: hidden;
+  display: grid;
+  gap: var(--space-3);
+  padding: var(--space-4);
+  border: 1px solid color-mix(in srgb, var(--highlight-text) 24%, var(--border-color));
+  border-radius: var(--radius-xl);
+  background:
+    radial-gradient(circle at 14% 0%, color-mix(in srgb, var(--highlight-text) 18%, transparent), transparent 42%),
+    linear-gradient(135deg, var(--surface-overlay-soft), var(--surface-overlay));
+}
+
+.semantic-sim-card::after {
+  content: "";
+  position: absolute;
+  right: -38px;
+  bottom: -42px;
+  width: 120px;
+  height: 120px;
+  border-radius: 50%;
+  background: color-mix(in srgb, var(--highlight-text) 10%, transparent);
+  filter: blur(2px);
+  pointer-events: none;
+}
+
+.semantic-sim-card__orb {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 44px;
+  height: 44px;
+  border-radius: 16px;
+  background: color-mix(in srgb, var(--highlight-text) 14%, transparent);
+  color: var(--highlight-text);
+  box-shadow: 0 0 28px color-mix(in srgb, var(--highlight-text) 20%, transparent);
+}
+
+.semantic-sim-card__copy {
+  position: relative;
+  z-index: 1;
+  display: grid;
+  gap: var(--space-2);
+}
+
+.semantic-sim-card__copy strong {
+  font-size: var(--font-size-emphasis);
+}
+
+.semantic-sim-card__copy p {
+  margin: 0;
+  color: var(--secondary-text);
+  line-height: 1.6;
+}
+
+.semantic-sim-card .btn-primary {
+  position: relative;
+  z-index: 1;
+  justify-content: center;
+  width: 100%;
+}
+
+.semantic-sim-modal {
+  position: fixed;
+  inset: 0;
+  z-index: var(--z-index-modal);
+  display: grid;
+  place-items: center;
+  padding: var(--space-4);
+}
+
+.semantic-sim-modal__backdrop {
+  position: absolute;
+  inset: 0;
+  background: var(--overlay-backdrop-strong);
+  backdrop-filter: var(--glass-blur);
+  -webkit-backdrop-filter: var(--glass-blur);
+}
+
+.semantic-sim-modal__panel {
+  position: relative;
+  z-index: 1;
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  width: min(1480px, calc(100vw - (var(--space-4) * 2)));
+  height: min(920px, calc(var(--app-viewport-height) - (var(--space-4) * 2)));
+  overflow: hidden;
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-xl);
+  background:
+    radial-gradient(circle at 20% 0%, color-mix(in srgb, var(--highlight-text) 14%, transparent), transparent 34%),
+    linear-gradient(0deg, var(--secondary-bg), var(--secondary-bg)),
+    var(--primary-bg);
+  box-shadow: var(--overlay-panel-shadow);
+}
+
+.semantic-sim-modal__header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--space-5);
+  padding: 20px 24px;
+  border-bottom: 1px solid var(--border-color);
+  background: linear-gradient(180deg, var(--surface-overlay-soft), transparent);
+}
+
+.semantic-sim-modal__header h3,
+.semantic-sim-modal__header p {
+  margin: 0;
+}
+
+.semantic-sim-modal__header h3 {
+  margin-top: 8px;
+  font-size: var(--font-size-section-title-strong);
+  line-height: 1.1;
+}
+
+.semantic-sim-modal__header p {
+  max-width: 82ch;
+  margin-top: 10px;
+  color: var(--secondary-text);
+  line-height: 1.7;
+}
+
+.semantic-sim-modal__eyebrow {
+  display: inline-flex;
+  width: fit-content;
+  padding: 6px 12px;
+  border-radius: var(--radius-full);
+  background: color-mix(in srgb, var(--highlight-text) 12%, transparent);
+  color: var(--highlight-text);
+  font-size: var(--font-size-caption);
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.semantic-sim-modal__actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 10px;
+}
+
+.semantic-sim-modal__frame {
+  width: 100%;
+  height: 100%;
+  border: 0;
+  background: var(--primary-bg);
+}
+
+@media (max-width: 860px) {
+  .semantic-sim-modal__header {
+    flex-direction: column;
+  }
+
+  .semantic-sim-modal__actions {
+    justify-content: flex-start;
+  }
+}
+
 @media (max-width: 1180px) {
   .rag-lab__hero {
     grid-template-columns: 1fr;
@@ -1562,7 +2327,8 @@ onMounted(() => {
   .group-panel__header,
   .param-row,
   .wormhole-launchpad,
-  .nested-item {
+  .nested-item,
+  .geodesic-field {
     grid-template-columns: 1fr;
   }
 
@@ -1608,7 +2374,8 @@ onMounted(() => {
   }
 
   .tuple-grid,
-  .wormhole-launchpad__stats {
+  .wormhole-launchpad__stats,
+  .ordered-launchpad__axis {
     grid-template-columns: 1fr;
   }
 }

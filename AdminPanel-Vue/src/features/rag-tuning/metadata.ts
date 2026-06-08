@@ -36,6 +36,17 @@ export interface WormholeRoutingPanel {
   keys: readonly string[];
 }
 
+export type OrderedCooccurrencePanelId = "topology" | "direction" | "semantic" | "guard";
+
+export interface OrderedCooccurrencePanel {
+  id: OrderedCooccurrencePanelId;
+  title: string;
+  axis: string;
+  summary: string;
+  icon: string;
+  keys: readonly string[];
+}
+
 export const WORMHOLE_ROUTING_PANELS: readonly WormholeRoutingPanel[] = [
   {
     id: "trigger",
@@ -57,6 +68,50 @@ export const WORMHOLE_ROUTING_PANELS: readonly WormholeRoutingPanel[] = [
     summary: "控制常规传播与虫洞传播的能量保留，决定探索能走多远也决定噪声会不会放大。",
     icon: "vital_signs",
     keys: ["baseDecay", "wormholeDecay"],
+  },
+] as const;
+
+export const ORDERED_COOCCURRENCE_PRIMARY_KEYS = [
+  "reverseGain",
+  "reverseAnchorBoost",
+  "semanticGainEnabled",
+  "reverseInversionGuard",
+] as const;
+
+export type OrderedCooccurrencePrimaryKey = (typeof ORDERED_COOCCURRENCE_PRIMARY_KEYS)[number];
+
+export const ORDERED_COOCCURRENCE_PANELS: readonly OrderedCooccurrencePanel[] = [
+  {
+    id: "topology",
+    title: "拓扑层：形",
+    axis: "双向共现",
+    summary: "决定标签是否互为邻接，以及序位距离如何压低远距离共现边。",
+    icon: "account_tree",
+    keys: ["forwardGain", "distanceDecay"],
+  },
+  {
+    id: "direction",
+    title: "方向层：色",
+    axis: "顺逆流阻尼",
+    summary: "控制叙事顺流与逆流回溯之间的能量差，避免 V7 的硬墙又保留方向偏置。",
+    icon: "swap_calls",
+    keys: ["reverseGain", "minReverseGain", "maxReverseGain", "reverseAnchorBoost", "reverseAnchorMax"],
+  },
+  {
+    id: "semantic",
+    title: "语义层：质",
+    axis: "向量距离调制",
+    summary: "用钟形语义增益放大概念邻接黄金区，同时压制噪声边与同义词回音壁。",
+    icon: "scatter_plot",
+    keys: ["semanticGainEnabled", "semanticGainPeak", "semanticGainSigma", "semanticGainLowSimFallback"],
+  },
+  {
+    id: "guard",
+    title: "工程守卫",
+    axis: "叙事方向公理",
+    summary: "确保逆流永远不会突破顺流上限，是 V8.2 灰度调参的最后保险。",
+    icon: "security",
+    keys: ["reverseInversionGuard"],
   },
 ] as const;
 
@@ -131,6 +186,48 @@ export const PARAM_METADATA: Record<string, Record<string, ParamMeta>> = {
       range: "建议区间: 0.02 ~ 0.15",
       tone: "sensitive",
     },
+    fuzzyEmbedding: {
+      label: "Embedding Fuzzy 复用",
+      summary: "折叠链路与动态工具折叠用于复用近似相同上下文向量的高阈值模糊缓存策略，避免 AI 输出因微小文本差异重复向量化。",
+      logic: "阈值越高越保守，只有几乎一致的长文本才复用；maxScan 越大越容易命中但会增加扫描成本。建议保持 0.985 附近。",
+      range: "共 5 个子参数：threshold、minLength、maxScan、maxLengthDiffRatio、maxLengthDiffAbs。",
+      tone: "sensitive",
+    },
+    "fuzzyEmbedding.threshold": {
+      label: "Fuzzy 命中阈值",
+      summary: "Dice bigram 文本相似度达到该阈值才复用已有 embedding。",
+      logic: "调低会提升复用率但增加误复用风险；调高更安全但可能仍重复向量化。0.985 是保守默认值。",
+      range: "建议 0.970 ~ 0.995",
+      tone: "sensitive",
+    },
+    "fuzzyEmbedding.minLength": {
+      label: "最小文本长度",
+      summary: "低于该长度的文本不参与 fuzzy 复用，避免短文本相似度虚高。",
+      logic: "短文本更容易偶然相似，因此应保留长度门槛；长对话建议 80 起步。",
+      range: "建议 40 ~ 200 字符",
+      tone: "stable",
+    },
+    "fuzzyEmbedding.maxScan": {
+      label: "最大扫描缓存数",
+      summary: "每次 fuzzy 查询最多扫描最近多少条 embedding 文本索引。",
+      logic: "调高会提升旧缓存命中概率，但每次动态折叠扫描成本也会增加。",
+      range: "建议 100 ~ 500",
+      tone: "stable",
+    },
+    "fuzzyEmbedding.maxLengthDiffRatio": {
+      label: "最大长度差比例",
+      summary: "候选缓存文本与当前文本允许的最大相对长度差。",
+      logic: "用于过滤长度明显不同的文本。调大更宽松，调小更严格。",
+      range: "建议 0.01 ~ 0.05",
+      tone: "sensitive",
+    },
+    "fuzzyEmbedding.maxLengthDiffAbs": {
+      label: "最大绝对长度差",
+      summary: "候选缓存文本与当前文本允许的最大绝对字符数差。",
+      logic: "与比例门槛取较大值，避免长文本少量系统尾巴差异导致无法复用。",
+      range: "建议 40 ~ 200 字符",
+      tone: "stable",
+    },
   },
   RAGDiaryPlugin: {
     noise_penalty: {
@@ -191,6 +288,20 @@ export const PARAM_METADATA: Record<string, Record<string, ParamMeta>> = {
       tone: "sensitive",
       tupleLabels: ["用户输入", "AI 意图"],
     },
+    shotgunDecayFactor: {
+      label: "霰弹历史衰减因子",
+      summary: "控制 Tagmemo V4 Shotgun Query 中历史语义分段召回结果的分数保留比例。",
+      logic: "值越高，历史主题段对最终候选的影响越强；值越低，检索越偏向当前输入。0.85 表示历史分段按距离进行温和指数衰减。",
+      range: "建议 0.60 ~ 0.95，默认 0.85",
+      tone: "sensitive",
+    },
+    shotgunHistorySegmentLimit: {
+      label: "霰弹历史分段数",
+      summary: "控制 Shotgun Query 最多取最近多少个历史语义分段参与并行检索。",
+      logic: "调高会扩大上下文覆盖，但并行搜索次数和历史噪音也会上升；调低更聚焦当前问题。0 表示只使用当前查询向量。",
+      range: "建议 0 ~ 5，默认 3",
+      tone: "sensitive",
+    },
     refreshWeights: {
       label: "流内刷新权重",
       summary: "控制工具刷新阶段里用户、AI 和工具结果三者的占比。",
@@ -220,7 +331,7 @@ export const PARAM_METADATA: Record<string, Record<string, ParamMeta>> = {
       label: "测地线混合权重 (α)",
       summary: "测地线分数在最终排序中的占比。0=纯KNN余弦距离，1=纯测地线Tag地形距离。",
       logic: "调高：更信任 Tag 拓扑关联，被语义山峰遮挡的记忆更容易浮出；调低：更保守，主要依赖原始向量相似度。",
-      range: "建议区间: 0.1 ~ 0.5 (默认 0.3)",
+      range: "建议区间: 0.1 ~ 0.6；当前默认由 rag_params.json 中的 KnowledgeBaseManager.geodesicRerank.alpha 决定",
       tone: "sensitive",
     },
     "geodesicRerank.minGeoSamples": {
@@ -482,91 +593,114 @@ export function getSubParamRange(subKey: string, subVal?: unknown): {
   step: number;
 } {
   const key = subKey.toLowerCase();
+  const leafKey = key.split(".").pop() ?? key;
 
   // Wormhole routing explicit ranges (must be checked before generic threshold rules).
-  if (key === "tensionthreshold") {
+  if (leafKey === "tensionthreshold") {
     return { min: 0.5, max: 3, step: 0.01 };
   }
 
-  if (key === "firingthreshold") {
+  if (leafKey === "firingthreshold") {
     return { min: 0, max: 1, step: 0.01 };
   }
 
-  if (key === "basemomentum") {
+  // Fuzzy embedding 需要更高精度，支持 0.001 级热调参观察。
+  // 注意：这里用完整路径判断，避免影响其它 threshold 类参数。
+  if (key === "fuzzyembedding.threshold") {
+    return { min: 0.97, max: 0.995, step: 0.001 };
+  }
+
+  if (leafKey === "basemomentum") {
     return { min: 1, max: 10, step: 0.1 };
   }
 
-  if (key === "basedecay" || key === "wormholedecay") {
+  if (leafKey === "basedecay" || leafKey === "wormholedecay") {
     return { min: 0, max: 1, step: 0.01 };
   }
 
-  if (key === "maxsafehops") {
+  if (leafKey === "maxsafehops") {
     return { min: 1, max: 20, step: 1 };
   }
 
-  if (key === "maxemergentnodes") {
+  if (leafKey === "maxemergentnodes") {
     return { min: 1, max: 200, step: 1 };
   }
 
-  if (key === "maxneighborspernode") {
+  if (leafKey === "maxneighborspernode") {
     return { min: 1, max: 20, step: 1 };
   }
 
   // 🆕 V8: 测地线混合权重
-  if (key === 'alpha') {
+  if (key === "geodesicrerank.alpha") {
     return { min: 0, max: 1, step: 0.01 };
   }
   
   // 🆕 V8: 最小采样密度门槛
-  if (key.includes('samples')) {
+  if (leafKey.includes('samples')) {
     return { min: 1, max: 20, step: 1 };
   }
 
   // 🆕 V8.2: 有序双向势能流形参数
-  if (key === 'forwardgain' || key === 'reversegain'
-      || key === 'minreversegain' || key === 'maxreversegain') {
+  if (leafKey === 'forwardgain' || leafKey === 'reversegain'
+      || leafKey === 'minreversegain' || leafKey === 'maxreversegain') {
     return { min: 0, max: 1.5, step: 0.01 };
   }
-  if (key === 'distancedecay') {
+  if (leafKey === 'distancedecay') {
     return { min: 0, max: 0.5, step: 0.01 };
   }
-  if (key === 'reverseanchorboost' || key === 'semanticgainenabled') {
+  if (leafKey === 'reverseanchorboost' || leafKey === 'semanticgainenabled') {
     return { min: 0, max: 1, step: 1 }; // toggle 用 0/1 表达
   }
-  if (key === 'reverseanchormax') {
+  if (leafKey === 'reverseanchormax') {
     return { min: 1, max: 3, step: 0.05 };
   }
-  if (key === 'semanticgainpeak') {
+  if (leafKey === 'semanticgainpeak') {
     return { min: 0, max: 1, step: 0.01 };
   }
-  if (key === 'semanticgainsigma') {
+  if (leafKey === 'semanticgainsigma') {
     return { min: 0.05, max: 0.6, step: 0.01 };
   }
-  if (key === 'semanticgainlowsimfallback') {
+  if (leafKey === 'semanticgainlowsimfallback') {
     return { min: 0, max: 0.5, step: 0.01 };
   }
-  if (key === 'reverseinversionguard') {
+  if (leafKey === 'reverseinversionguard') {
     return { min: 0.5, max: 1, step: 0.01 };
   }
 
-  if (key.includes("days")) {
-    return { min: 1, max: 365, step: 1 };
+  if (leafKey === "minlength" || leafKey === "maxscan" || leafKey === "maxlengthdiffabs") {
+    return { min: 1, max: leafKey === "maxscan" ? 1000 : 500, step: 1 };
   }
 
-  if (key.includes("threshold")) {
+  if (leafKey === "maxlengthdiffratio") {
+    return { min: 0, max: 0.2, step: 0.001 };
+  }
+
+  if (leafKey === "shotgundecayfactor") {
     return { min: 0, max: 1, step: 0.01 };
   }
 
-  if (key.includes("hops") || key.includes("nodes") || key.includes("neighbors")) {
-    return { min: 1, max: key.includes('nodes') ? 200 : 20, step: 1 };
+  if (leafKey === "shotgunhistorysegmentlimit") {
+    return { min: 0, max: 10, step: 1 };
   }
 
-  if (key.includes("momentum")) {
+  if (leafKey.includes("days")) {
+    return { min: 1, max: 365, step: 1 };
+  }
+
+  if (leafKey.includes("threshold")) {
+    return { min: 0, max: 1, step: 0.01 };
+  }
+
+  if (leafKey.includes("hops") || leafKey.includes("nodes") || leafKey.includes("neighbors")) {
+    return { min: 1, max: leafKey.includes('nodes') ? 200 : 20, step: 1 };
+  }
+
+  if (leafKey.includes("momentum")) {
     return { min: 1, max: 10, step: 0.1 };
   }
 
   // 🛠️ 修复：语言补偿器和时间衰减的浮点参数
-  if (key.includes("penalty") || key.includes("score") || key.includes("min")) {
+  if (leafKey.includes("penalty") || leafKey.includes("score") || leafKey.includes("min")) {
     return { min: 0, max: 1, step: 0.01 };
   }
 

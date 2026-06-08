@@ -8,11 +8,12 @@ const EPAModule = require('./EPAModule');
 const ResidualPyramid = require('./ResidualPyramid');
 
 class TagMemoEngine {
-    constructor(db, tagIndex, config, ragParams) {
+    constructor(db, tagIndex, config, ragParams, knowledgeBaseManager = null) {
         this.db = db;
         this.tagIndex = tagIndex;
         this.config = config;
         this.ragParams = ragParams;
+        this.knowledgeBaseManager = knowledgeBaseManager;
 
         this.epa = null;
         this.residualPyramid = null;
@@ -22,8 +23,9 @@ class TagMemoEngine {
         // 🌟 TagMemo V7.1: 矩阵计算防抖系统
         this._accumulatedTagChanges = 0;
         this._matrixRebuildTimer = null;
+        this._matrixRebuildScheduleLogged = false;
         this._isMatrixRebuilding = false;
-        // 🌟 V8: 距离场缓存（供测地线重排使用）
+        // 🌟 V8: 最近一次距离场缓存（仅保留兼容/诊断用途；搜索链路必须使用查询级 energyField，避免 await 并发污染）
         this.lastEnergyField = null;
 
         // 🌟 V8.2-γ: 持久化的 Tag 对语义距离 (内存 Map: "a:b" → cosineSim)
@@ -33,6 +35,49 @@ class TagMemoEngine {
         this.modelSig = this._computeModelSig();
         // 是否在本进程内已经触发过冷启动 sim 预计算
         this._pairSimColdStartDone = false;
+        this._postStartupDerivedRefreshTimer = null;
+        this._derivedTaskQueue = [];
+        this._derivedTaskRunning = false;
+        this._derivedTaskTimer = null;
+        this._derivedTaskSeq = 0;
+    }
+
+    _envFlag(name, defaultValue = false) {
+        const raw = process.env[name];
+        if (raw === undefined || raw === null || raw === '') return defaultValue;
+        const normalized = String(raw).trim().toLowerCase();
+        return normalized === 'true' || normalized === '1' || normalized === 'yes' || normalized === 'on';
+    }
+
+    _isEpaBackgroundRecomputeEnabled() {
+        return this._envFlag('KNOWLEDGEBASE_EPA_BACKGROUND_RECOMPUTE', false);
+    }
+
+    _isIntrinsicResidualRecomputeEnabled() {
+        return this._envFlag('TAGMEMO_INTRINSIC_RESIDUAL_FORCE_RECOMPUTE', false);
+    }
+
+    _hasWarmDerivedCaches() {
+        const epaReady = !!(this.epa && this.epa.initialized && this.epa.orthoBasis && this.epa.orthoBasis.length > 0);
+        const pairwiseReady = this.tagPairSimilarities instanceof Map && this.tagPairSimilarities.size > 0;
+        const intrinsicReady = this.tagIntrinsicResiduals instanceof Map && this.tagIntrinsicResiduals.size > 0;
+        const matrixReady = this.tagCooccurrenceMatrix instanceof Map && this.tagCooccurrenceMatrix.size > 0;
+        return { epaReady, pairwiseReady, intrinsicReady, matrixReady };
+    }
+
+    _shouldSkipPostStartupDerivedRefresh() {
+        const epaHotOff = !this._isEpaBackgroundRecomputeEnabled();
+        const irHotOff = !this._isIntrinsicResidualRecomputeEnabled();
+        const caches = this._hasWarmDerivedCaches();
+        const noTagChanges = this._accumulatedTagChanges <= 0;
+
+        return {
+            skip: epaHotOff && irHotOff && noTagChanges && caches.epaReady && caches.pairwiseReady && caches.intrinsicReady && caches.matrixReady,
+            epaHotOff,
+            irHotOff,
+            noTagChanges,
+            ...caches
+        };
     }
 
     /**
@@ -40,12 +85,49 @@ class TagMemoEngine {
      * 防止 VECTORDB_DIMENSION 切换后读到维度错位的 BLOB）
      */
     _computeModelSig() {
-        const modelName = this.config?.model || 'unknown-model';
+        // EmbeddingModelSig 表示“向量语义空间签名”，与实际请求渠道解耦。
+        // 未配置时回退到主 embedding 模型名，保持旧版本行为。
+        const modelName = this.config?.modelSig || this.config?.model || 'unknown-model';
         const dim = this.config?.dimension || 0;
         return crypto.createHash('sha256')
             .update(`${modelName}:${dim}`)
             .digest('hex')
             .slice(0, 16);
+    }
+
+    _decodeVectorBlob(blob, dim, label = 'vector') {
+        if (blob instanceof Float32Array) {
+            return blob.length === dim ? blob : null;
+        }
+        if (!blob || typeof blob.length !== 'number') {
+            return null;
+        }
+
+        const expectedBytes = dim * Float32Array.BYTES_PER_ELEMENT;
+        if (blob.length !== expectedBytes) {
+            console.warn(`[TagMemoEngine] ⚠️ Invalid ${label} blob length: expected ${expectedBytes}, got ${blob.length}`);
+            return null;
+        }
+
+        if (blob.byteOffset % Float32Array.BYTES_PER_ELEMENT === 0) {
+            return new Float32Array(blob.buffer, blob.byteOffset, dim);
+        }
+
+        const copied = Buffer.from(blob);
+        return new Float32Array(copied.buffer, copied.byteOffset, dim);
+    }
+
+    _queryByChunks(sqlPrefix, values, sqlSuffix = '', chunkSize = 500) {
+        if (!Array.isArray(values) || values.length === 0) return [];
+        const rows = [];
+
+        for (let i = 0; i < values.length; i += chunkSize) {
+            const batch = values.slice(i, i + chunkSize);
+            const placeholders = batch.map(() => '?').join(',');
+            rows.push(...this.db.prepare(`${sqlPrefix} IN (${placeholders})${sqlSuffix}`).all(...batch));
+        }
+
+        return rows;
     }
 
     async initialize() {
@@ -54,6 +136,8 @@ class TagMemoEngine {
             dimension: this.config.dimension,
             vexusIndex: this.tagIndex,
             nodeResidual: this.ragParams.KnowledgeBaseManager?.nodeResidualGain || 0.05,
+            withRustWriteLease: (owner, fn, options = {}) => this._withRustWriteLease(owner, fn, options),
+            deferRustRecompute: true,
         });
         await this.epa.initialize();
 
@@ -61,19 +145,16 @@ class TagMemoEngine {
             dimension: this.config.dimension
         });
 
-        // 🌟 V8.2-γ: 冷启动钩子
-        // 若 tag_pair_similarity 表为空（首次启动 / 模型签名变化），
-        // 必须 await 阻塞预计算，否则 buildDirectedCooccurrenceMatrix 拿到的 getSim() 全是 fallback，
-        // semanticGain 会均匀压平整张矩阵，当天召回质量异常。
+        // 🌟 V8.2-γ: 冷启动只做检测，不在 initialize() 内阻塞派生计算。
+        // 大库下 pairwise/EPA 派生写会延后到 System Ready + startup cooldown 后由后台刷新触发，
+        // 以避免和启动 full scan / 小巴士主写产生 WAL/checkpoint 竞态。
         try {
             const cnt = this.db.prepare(
                 'SELECT COUNT(*) as c FROM tag_pair_similarity WHERE model_sig = ?'
             ).get(this.modelSig)?.c || 0;
 
             if (cnt === 0) {
-                console.log(`[TagMemoEngine] 🧊 V8.2 cold start: pairwise similarity cache empty for model_sig=${this.modelSig}, computing now...`);
-                await this.recomputePairwiseSimilarities({ blocking: true });
-                this._pairSimColdStartDone = true;
+                console.log(`[TagMemoEngine] 🧊 V8.2 cold start: pairwise similarity cache empty for model_sig=${this.modelSig}; will refresh after startup cooldown.`);
             } else {
                 console.log(`[TagMemoEngine] 🌡️ V8.2 warm start: ${cnt} cached pairwise similarities for model_sig=${this.modelSig}`);
             }
@@ -81,13 +162,12 @@ class TagMemoEngine {
             console.warn('[TagMemoEngine] ⚠️ V8.2 cold start check failed (table may not exist yet):', e.message);
         }
 
-        // 加载内存 sim 表
+        // 加载矩阵依赖的持久化底座：边相似度 + 节点内生残差
         this.loadPairwiseSimilarities();
-
-        // 启动时构建共现矩阵
-        this.buildDirectedCooccurrenceMatrix();
-        // 加载内生残差
         this.loadIntrinsicResiduals();
+
+        // 启动时构建共现矩阵：确保 reverseAnchorBoost 能吃到已加载残差
+        this.buildDirectedCooccurrenceMatrix();
     }
 
     /**
@@ -102,6 +182,9 @@ class TagMemoEngine {
 
     /**
      * 🌟 TagMemo 浪潮 + EPA + Residual Pyramid + Worldview Gating + LIF Spike Propagation (V6)
+     *
+     * 返回值中的 energyField 是查询级距离场。不要依赖 lastEnergyField 参与搜索重排：
+     * lastEnergyField 只是兼容/诊断缓存，在全局搜索 await 间隙会被其他并发查询覆盖。
      */
     applyTagBoost(vector, baseTagBoost, coreTags = [], coreBoostFactor = 1.33) {
         const debug = false;
@@ -416,13 +499,11 @@ class TagMemoEngine {
             injectGhosts(hardGhostObjects, true);
             injectGhosts(softGhostObjects, false);
 
-            if (allTags.length === 0) return { vector: originalFloat32, info: null };
+            if (allTags.length === 0) return { vector: originalFloat32, info: null, energyField: this.lastEnergyField };
 
-            // [5] 批量获取向量与名称 (性能优化：1次查询替代 N次循环查询)
+            // [5] 批量获取向量与名称（chunked IN，避免 SQLite 参数数量上限）
             const dbTagIds = allTags.filter(t => t.id > 0).map(t => t.id);
-            const tagRows = dbTagIds.length > 0
-                ? this.db.prepare(`SELECT id, name, vector FROM tags WHERE id IN (${dbTagIds.map(() => '?').join(',')})`).all(...dbTagIds)
-                : [];
+            const tagRows = this._queryByChunks('SELECT id, name, vector FROM tags WHERE id', dbTagIds);
             const tagDataMap = new Map(tagRows.map(r => [r.id, r]));
 
             // 🌟 终极闭环：把幽灵向量混入正规军的 Map 里！
@@ -437,14 +518,15 @@ class TagMemoEngine {
 
             for (const tag of sortedTags) {
                 const data = tagDataMap.get(tag.id);
-                if (!data || !data.vector) continue;
+                const vec = data ? this._decodeVectorBlob(data.vector, dim, `tag:${tag.id}`) : null;
+                if (!vec) continue;
 
-                const vec = new Float32Array(data.vector.buffer, data.vector.byteOffset, dim);
                 let isRedundant = false;
 
                 for (const existing of deduplicatedTags) {
                     const existingData = tagDataMap.get(existing.id);
-                    const existingVec = new Float32Array(existingData.vector.buffer, existingData.vector.byteOffset, dim);
+                    const existingVec = existingData ? this._decodeVectorBlob(existingData.vector, dim, `tag:${existing.id}`) : null;
+                    if (!existingVec) continue;
 
                     // 计算余弦相似度
                     let dot = 0, normA = 0, normB = 0;
@@ -477,8 +559,8 @@ class TagMemoEngine {
 
             for (const t of deduplicatedTags) {
                 const data = tagDataMap.get(t.id);
-                if (data && data.vector) {
-                    const v = new Float32Array(data.vector.buffer, data.vector.byteOffset, dim);
+                const v = data ? this._decodeVectorBlob(data.vector, dim, `tag:${t.id}`) : null;
+                if (v) {
                     for (let d = 0; d < dim; d++) contextVec[d] += v[d] * t.adjustedWeight;
                     totalWeight += t.adjustedWeight;
                 }
@@ -494,7 +576,7 @@ class TagMemoEngine {
                 mag = Math.sqrt(mag);
                 if (mag > 1e-9) for (let d = 0; d < dim; d++) contextVec[d] /= mag;
             } else {
-                return { vector: originalFloat32, info: null };
+                return { vector: originalFloat32, info: null, energyField: this.lastEnergyField };
             }
 
             // [6] 最终融合 (clamp 防止外推：boost > 1 时原向量会被反向叠加)
@@ -511,6 +593,7 @@ class TagMemoEngine {
 
             return {
                 vector: fused,
+                energyField: this.lastEnergyField,
                 info: {
                     // 🌟 标记核心 Tag 召回情况 (安全映射)
                     coreTagsMatched: deduplicatedTags.filter(t => t.isCore && t.name).map(t => t.name),
@@ -541,7 +624,7 @@ class TagMemoEngine {
 
         } catch (e) {
             console.error('[TagMemoEngine] TagMemo V6 CRITICAL FAIL:', e);
-            return { vector: originalFloat32, info: null };
+            return { vector: originalFloat32, info: null, energyField: null };
         }
     }
 
@@ -575,29 +658,37 @@ class TagMemoEngine {
      *
      * @param {Array<{id: BigInt|Number, score: Number}>} candidates - 原始 KNN 搜索结果
      * @param {object} options - 配置项
-     * @param {number} [options.alpha=0.3] - 测地线分数混合权重 (0=纯KNN, 1=纯测地线)
-     * @param {number} [options.minGeoSamples=4] - 最小采样密度门槛
+     * @param {number} [options.alpha] - 测地线分数混合权重 (0=纯KNN, 1=纯测地线)，默认读取 rag_params.json: KnowledgeBaseManager.geodesicRerank.alpha
+     * @param {number} [options.minGeoSamples] - 最小采样密度门槛，默认读取 rag_params.json: KnowledgeBaseManager.geodesicRerank.minGeoSamples
      * @returns {Array} 重排后的完整数组（不截断）
      */
     geodesicRerank(candidates, options = {}) {
+        const energyField = options.energyField || this.lastEnergyField;
+
         // L0: 距离场为空 → 整体退化
-        if (!this.lastEnergyField || this.lastEnergyField.size === 0) {
+        if (!energyField || energyField.size === 0) {
             return candidates;
         }
         if (!candidates || candidates.length === 0) {
             return candidates;
         }
 
-        const alpha = Math.max(0, Math.min(1, options.alpha ?? 0.3));
-        const minGeoSamples = options.minGeoSamples ?? 4;
+        const geoConfig = this.ragParams?.KnowledgeBaseManager?.geodesicRerank || {};
+        const rawAlpha = options.alpha ?? geoConfig.alpha;
+        const rawMinGeoSamples = options.minGeoSamples ?? geoConfig.minGeoSamples;
+
+        if (!Number.isFinite(Number(rawAlpha)) || !Number.isFinite(Number(rawMinGeoSamples))) {
+            console.warn('[TagMemoEngine] geodesicRerank missing valid alpha/minGeoSamples config; falling back to original order.');
+            return candidates;
+        }
+
+        const alpha = Math.max(0, Math.min(1, Number(rawAlpha)));
+        const minGeoSamples = Math.max(1, Math.floor(Number(rawMinGeoSamples)));
 
         try {
-            // Step 1: 批量查询 chunk_id → file_id 映射（方案 A：自查映射）
-            const chunkIds = candidates.map(c => Number(c.id));
-            const chunkPlaceholders = chunkIds.map(() => '?').join(',');
-            const chunkFileRows = this.db.prepare(
-                `SELECT id, file_id FROM chunks WHERE id IN (${chunkPlaceholders})`
-            ).all(...chunkIds);
+            // Step 1: 批量查询 chunk_id → file_id 映射（chunked IN，避免 SQLite 参数数量上限）
+            const chunkIds = candidates.map(c => Number(c.id)).filter(Number.isFinite);
+            const chunkFileRows = this._queryByChunks('SELECT id, file_id FROM chunks WHERE id', chunkIds);
             const chunkFileMap = new Map(chunkFileRows.map(r => [r.id, r.file_id]));
 
             // Step 2: 收集所有需要查询的 file_ids，批量查询 file_id → tag_id[] 映射
@@ -605,10 +696,10 @@ class TagMemoEngine {
             const fileTagsMap = new Map(); // file_id → [tag_id, ...]
 
             if (uniqueFileIds.length > 0) {
-                const filePlaceholders = uniqueFileIds.map(() => '?').join(',');
-                const fileTagRows = this.db.prepare(
-                    `SELECT file_id, tag_id FROM file_tags WHERE file_id IN (${filePlaceholders})`
-                ).all(...uniqueFileIds);
+                const fileTagRows = this._queryByChunks(
+                    'SELECT file_id, tag_id FROM file_tags WHERE file_id',
+                    uniqueFileIds
+                );
 
                 for (const row of fileTagRows) {
                     if (!fileTagsMap.has(row.file_id)) {
@@ -619,7 +710,6 @@ class TagMemoEngine {
             }
 
             // Step 3: 对每个候选计算 geoScore
-            const energyField = this.lastEnergyField;
             let maxGeo = 0;
             const geoData = candidates.map(c => {
                 const chunkId = Number(c.id);
@@ -700,6 +790,7 @@ class TagMemoEngine {
     //   7) tags.vector 重写时 DELETE 涉及该 tag 的 sim 行 (在 KnowledgeBaseManager 中处理)
     // ============================================================
     buildDirectedCooccurrenceMatrix() {
+        const matrixBuildStartedAt = Date.now();
         console.log('[TagMemoEngine] 🧠 V8.2 Building ORDERED-BIDIRECTIONAL tag co-occurrence matrix (γ)...');
         try {
             // 势能参数
@@ -782,6 +873,11 @@ class TagMemoEngine {
             let anchorBoostedEdges = 0;
             let invertedClampedEdges = 0;
 
+            const progressIntervalFiles = parseInt(process.env.TAGMEMO_MATRIX_PROGRESS_INTERVAL_FILES, 10) || 5000;
+            let processedOrderedFiles = 0;
+            let skippedOrderedFiles = 0;
+            let orderedPairOps = 0;
+
             const addEdge = (from, to, weight) => {
                 if (!Number.isFinite(weight) || weight <= 0) return false;
                 if (!matrix.has(from)) matrix.set(from, new Map());
@@ -791,8 +887,22 @@ class TagMemoEngine {
             };
 
             const processFileGroup = (tags, fid) => {
+                processedOrderedFiles++;
                 const n = tags.length;
-                if (n < 2 || n > 100) return; // 性能保护
+                if (n < 2) return;
+                if (n > 100) {
+                    skippedOrderedFiles++;
+                    return;
+                } // 性能保护
+
+                orderedPairOps += (n * (n - 1)) / 2;
+                if (processedOrderedFiles % progressIntervalFiles === 0) {
+                    console.log(
+                        `[TagMemoEngine] 🧭 Matrix ordered progress: files=${processedOrderedFiles}, ` +
+                        `skipped=${skippedOrderedFiles}, pairOps≈${Math.round(orderedPairOps)}, ` +
+                        `sources=${matrix.size}, elapsed=${Date.now() - matrixBuildStartedAt}ms`
+                    );
+                }
 
                 for (let i = 0; i < n; i++) {
                     for (let j = i + 1; j < n; j++) {
@@ -868,26 +978,69 @@ class TagMemoEngine {
             if (fileTags.length > 0) processFileGroup(fileTags, currentFileId);
 
             // ---------- Step 2: 旧数据 (position=0) 回退为无向等权重 ----------
+            // 🛡️ CPU loop/卡死修复：
+            // 旧实现使用 file_tags 自连接 + GROUP BY，在旧库或 position=0 数据较多时会产生巨大的 O(N²)
+            // 同步 SQLite 执行计划；Node 主线程卡在 better-sqlite3 内部时不会输出任何新日志，看起来像“无日志高占用”。
+            // 改为与 Rust/V8.2 主路径一致的逐文件流式聚合，并保留单文件 Tag 数 ≤100 的守恒保护。
             const legacyStmt = this.db.prepare(`
-                SELECT ft1.tag_id as tag1, ft2.tag_id as tag2, COUNT(ft1.file_id) as cnt
-                FROM file_tags ft1
-                JOIN file_tags ft2
-                    ON ft1.file_id = ft2.file_id
-                    AND ft1.tag_id < ft2.tag_id
-                WHERE ft1.position = 0 OR ft2.position = 0
-                GROUP BY ft1.tag_id, ft2.tag_id
+                SELECT file_id, tag_id
+                FROM file_tags
+                WHERE position = 0
+                ORDER BY file_id
             `);
 
             const LEGACY_PHI = 0.7;
-            for (const row of legacyStmt.iterate()) {
-                // legacy 数据天然无方向，仍走 sim 调制保持语义一致性
-                const sim = getSimSafe(row.tag1, row.tag2);
-                const semGain = semanticGain(sim);
-                const weight = row.cnt * LEGACY_PHI * LEGACY_PHI * semGain;
+            let legacyFileId = -1;
+            let legacyTags = [];
+            let legacyProcessedFiles = 0;
+            let legacySkippedFiles = 0;
+            let legacyPairOps = 0;
 
-                if (addEdge(row.tag1, row.tag2, weight)) forwardEdges++;
-                if (addEdge(row.tag2, row.tag1, weight)) backwardEdges++;
+            const processLegacyFileGroup = (tags) => {
+                legacyProcessedFiles++;
+                const n = tags.length;
+                if (n < 2) return;
+                if (n > 100) {
+                    legacySkippedFiles++;
+                    return;
+                }
+
+                legacyPairOps += (n * (n - 1)) / 2;
+                if (legacyProcessedFiles % progressIntervalFiles === 0) {
+                    console.log(
+                        `[TagMemoEngine] 🧭 Matrix legacy progress: files=${legacyProcessedFiles}, ` +
+                        `skipped=${legacySkippedFiles}, pairOps≈${Math.round(legacyPairOps)}, ` +
+                        `sources=${matrix.size}, elapsed=${Date.now() - matrixBuildStartedAt}ms`
+                    );
+                }
+
+                const weightBase = LEGACY_PHI * LEGACY_PHI;
+                for (let i = 0; i < n; i++) {
+                    for (let j = i + 1; j < n; j++) {
+                        const tag1 = tags[i];
+                        const tag2 = tags[j];
+                        if (tag1 === tag2) continue;
+
+                        // legacy 数据天然无方向，仍走 sim 调制保持语义一致性
+                        const sim = getSimSafe(tag1, tag2);
+                        const semGain = semanticGain(sim);
+                        const weight = weightBase * semGain;
+
+                        if (addEdge(tag1, tag2, weight)) forwardEdges++;
+                        if (addEdge(tag2, tag1, weight)) backwardEdges++;
+                    }
+                }
+            };
+
+            for (const row of legacyStmt.iterate()) {
+                if (row.file_id !== legacyFileId) {
+                    if (legacyTags.length > 0) processLegacyFileGroup(legacyTags);
+                    legacyFileId = row.file_id;
+                    legacyTags = [];
+                }
+                legacyTags.push(row.tag_id);
             }
+            if (legacyTags.length > 0) processLegacyFileGroup(legacyTags);
 
             this.tagCooccurrenceMatrix = matrix;
 
@@ -898,7 +1051,9 @@ class TagMemoEngine {
                 `reverseGain=${reverseGain.toFixed(3)}, distanceDecay=${DISTANCE_DECAY}, ` +
                 `semGain=${SEM_GAIN_ENABLED ? `bell(peak=${SEM_PEAK}, σ=${SEM_SIGMA})` : 'disabled'}, ` +
                 `anchorBoost=${REVERSE_ANCHOR_BOOST ? `≤${REVERSE_ANCHOR_MAX}x` : 'disabled'}, ` +
-                `simCacheSize=${this.tagPairSimilarities.size}`
+                `orderedFiles=${processedOrderedFiles}, orderedSkippedFiles=${skippedOrderedFiles}, orderedPairOps≈${Math.round(orderedPairOps)}, ` +
+                `legacyFiles=${legacyProcessedFiles}, legacySkippedFiles=${legacySkippedFiles}, legacyPairOps≈${Math.round(legacyPairOps)}, ` +
+                `simCacheSize=${this.tagPairSimilarities.size}, elapsed=${Date.now() - matrixBuildStartedAt}ms`
             );
         } catch (e) {
             console.error('[TagMemoEngine] ❌ Failed to build V8.2 ordered-bidirectional matrix:', e);
@@ -908,8 +1063,10 @@ class TagMemoEngine {
 
     // 🌟 V8.2-γ: 加载持久化的 Tag 对语义相似度到内存 Map
     // 矩阵构建是热路径，不能每对 pair 查 SQLite。
-    loadPairwiseSimilarities() {
-        try {
+    loadPairwiseSimilarities(options = {}) {
+        const { failOnCorruption = false } = options;
+
+        const doLoad = () => {
             const rows = this.db.prepare(
                 'SELECT tag_a, tag_b, similarity FROM tag_pair_similarity WHERE model_sig = ?'
             ).all(this.modelSig);
@@ -918,10 +1075,39 @@ class TagMemoEngine {
             for (const row of rows) {
                 this.tagPairSimilarities.set(`${row.tag_a}:${row.tag_b}`, row.similarity);
             }
-            console.log(`[TagMemoEngine] ✅ V8.2 Loaded ${this.tagPairSimilarities.size} pairwise similarities (model_sig=${this.modelSig})`);
+            return this.tagPairSimilarities.size;
+        };
+
+        try {
+            const count = doLoad();
+            console.log(`[TagMemoEngine] ✅ V8.2 Loaded ${count} pairwise similarities (model_sig=${this.modelSig})`);
+            return true;
         } catch (e) {
-            console.warn('[TagMemoEngine] ⚠️ V8.2 pairwise similarity table not yet available:', e.message);
             this.tagPairSimilarities = new Map();
+            const isCorruption = this.knowledgeBaseManager?._isSqliteCorruptionError?.(e);
+
+            if (failOnCorruption && isCorruption) {
+                // 🛡️ P0: 单次 malformed 多为跨连接 WAL/SHM 瞬态视图问题。
+                // 先走二阶段健康检查 (suspect → 重开连接 → 复检)；复检通过 (连接已重绑定到健康连接)
+                // 则用健康连接重试一次加载，避免把可恢复的瞬态故障误判为派生任务失败。
+                const recovered = this.knowledgeBaseManager.checkpointAndAssertDatabaseHealthy('loading pairwise similarities');
+                if (recovered) {
+                    try {
+                        const count = doLoad();
+                        console.warn(`[TagMemoEngine] ♻️ V8.2 Reloaded ${count} pairwise similarities after suspect recovery (model_sig=${this.modelSig}).`);
+                        return true;
+                    } catch (retryErr) {
+                        console.error('[TagMemoEngine] ❌ V8.2 pairwise similarity reload still failed after suspect recovery:', retryErr.message || retryErr);
+                        this.tagPairSimilarities = new Map();
+                        throw retryErr;
+                    }
+                }
+                // 二阶段复检仍失败 → 视为真正损坏，向上抛出以中止派生链。
+                throw e;
+            }
+
+            console.warn('[TagMemoEngine] ⚠️ V8.2 pairwise similarity table not yet available:', e.message);
+            return false;
         }
     }
 
@@ -937,101 +1123,190 @@ class TagMemoEngine {
     }
 
     /**
+     * 🛡️ SQLite 写后验收统一入口。
+     * 不在 TagMemoEngine 内直接 checkpoint，避免 EPA / matrix rebuild 路径出现
+     * TagMemoEngine 与 KnowledgeBaseManager 双重 TRUNCATE checkpoint。
+     */
+    _checkpointAfterRustWrite(tag) {
+        return this._assertHealthyAfterRustWrite(tag);
+    }
+
+    _assertHealthyAfterRustWrite(tag) {
+        const reason = `Rust write "${tag}"`;
+        if (this.knowledgeBaseManager && typeof this.knowledgeBaseManager.checkpointAndAssertDatabaseHealthy === 'function') {
+            return this.knowledgeBaseManager.checkpointAndAssertDatabaseHealthy(reason);
+        }
+        // 无 KnowledgeBaseManager coordinator 的测试/降级环境中，不能递归调用自身；
+        // 此时没有统一 checkpoint 裁决者，只能视为软通过。
+        return true;
+    }
+
+    async _withRustWriteLease(owner, fn, options = {}) {
+        if (!this.knowledgeBaseManager || typeof this.knowledgeBaseManager.requestRustWriteLease !== 'function') {
+            return await fn();
+        }
+
+        const lease = await this.knowledgeBaseManager.requestRustWriteLease(owner, options);
+        if (!lease) {
+            console.warn(`[TagMemoEngine] 🦀⏳ Rust write lease denied/timed out for "${owner}"; deferring this run.`);
+            return null;
+        }
+
+        try {
+            const result = await fn();
+            const healthy = this._assertHealthyAfterRustWrite(owner);
+            if (!healthy) {
+                console.error(`[TagMemoEngine] 🚨 Database health check failed before releasing Rust write lease "${owner}".`);
+                return null;
+            }
+            return result;
+        } finally {
+            lease.release();
+        }
+    }
+
+    /**
      * 🌟 V8.2-γ: 触发 Rust 预计算成对语义相似度
      * - 默认增量模式（跳过已缓存且 model_sig 一致的 pair）
      * - 与 doMatrixRebuild 共用 _isMatrixRebuilding 锁
      */
     async recomputePairwiseSimilarities(opts = {}) {
-        const { fullRebuild = false, blocking = false, minSimilarity = 0.05 } = opts;
+        const { fullRebuild = false, blocking = false, minSimilarity = 0.05, leaseAlreadyHeld = false } = opts;
 
         if (!this.tagIndex || !this.tagIndex.computePairwiseSimilarities) {
             console.warn('[TagMemoEngine] ⚠️ computePairwiseSimilarities is not available in VexusIndex (Rust binary may need rebuild)');
-            return;
+            return null;
         }
 
         // 锁串行：避免与矩阵重建撞车产生"嵌合矩阵"
         // blocking=true 用于冷启动场景，由调用方持锁
         if (!blocking && this._isMatrixRebuilding) {
             console.log('[TagMemoEngine] 🛡️ V8.2 sim recompute deferred: matrix rebuild in progress');
-            return;
+            return null;
         }
 
-        console.log(`[TagMemoEngine] ⚡ V8.2 Triggering Rust pairwise similarity precomputation (model_sig=${this.modelSig}, fullRebuild=${fullRebuild})...`);
-        try {
-            const dbPath = path.join(path.dirname(this.db.name), 'knowledge_base.sqlite');
-            const result = await this.tagIndex.computePairwiseSimilarities(
-                dbPath,
-                this.modelSig,
-                minSimilarity,
-                fullRebuild
-            );
-            console.log(
-                `[TagMemoEngine] ✅ V8.2 Rust pairwise sim done: ` +
-                `pairs=${result.pairCount}, computed=${result.computedCount}, ` +
-                `skipped=${result.skippedCount}, stored=${result.storedCount}, ` +
-                `elapsed=${result.elapsedMs.toFixed(2)}ms`
-            );
-        } catch (e) {
-            console.error('[TagMemoEngine] ❌ V8.2 Rust pairwise sim failed:', e.message || e);
-            if (e.stack) console.error(e.stack);
-        }
+        const run = async () => {
+            console.log(`[TagMemoEngine] ⚡ V8.2 Triggering Rust pairwise similarity precomputation (model_sig=${this.modelSig}, fullRebuild=${fullRebuild})...`);
+            try {
+                const dbPath = path.join(path.dirname(this.db.name), 'knowledge_base.sqlite');
+                const result = await this.tagIndex.computePairwiseSimilarities(
+                    dbPath,
+                    this.modelSig,
+                    minSimilarity,
+                    fullRebuild
+                );
+                if (!result) return null;
+                console.log(
+                    `[TagMemoEngine] ✅ V8.2 Rust pairwise sim done: ` +
+                    `pairs=${result.pairCount}, computed=${result.computedCount}, ` +
+                    `skipped=${result.skippedCount}, stored=${result.storedCount}, ` +
+                    `elapsed=${result.elapsedMs.toFixed(2)}ms`
+                );
+                return result;
+            } catch (e) {
+                console.error('[TagMemoEngine] ❌ V8.2 Rust pairwise sim failed:', e.message || e);
+                if (e.stack) console.error(e.stack);
+                return null;
+            }
+        };
+
+        if (leaseAlreadyHeld) return await run();
+        return await this._withRustWriteLease('tagmemo:pairwise-sim', run, { pendingThreshold: 0 });
     }
 
     // 🌟 TagMemo V7: 加载内生残差
-    loadIntrinsicResiduals() {
-        try {
+    loadIntrinsicResiduals(options = {}) {
+        const { failOnCorruption = false } = options;
+
+        const doLoad = () => {
             const rows = this.db.prepare(
                 'SELECT tag_id, residual_energy FROM tag_intrinsic_residuals'
             ).all();
-            
+
             this.tagIntrinsicResiduals = new Map();
             for (const row of rows) {
                 // 归一化到 [0.5, 2.0] 范围，避免极端值
                 const clamped = Math.max(0.5, Math.min(2.0, row.residual_energy));
                 this.tagIntrinsicResiduals.set(row.tag_id, clamped);
             }
-            console.log(`[TagMemoEngine] ✅ Loaded ${this.tagIntrinsicResiduals.size} intrinsic residuals`);
+            return this.tagIntrinsicResiduals.size;
+        };
+
+        try {
+            const count = doLoad();
+            console.log(`[TagMemoEngine] ✅ Loaded ${count} intrinsic residuals`);
+            return true;
         } catch (e) {
-            console.warn('[TagMemoEngine] ⚠️ No intrinsic residuals available:', e.message);
             this.tagIntrinsicResiduals = null;
+            const isCorruption = this.knowledgeBaseManager?._isSqliteCorruptionError?.(e);
+
+            if (failOnCorruption && isCorruption) {
+                // 🛡️ P0: 同 pairwise，单次 malformed 先二阶段复检，通过后用健康连接重试一次加载。
+                const recovered = this.knowledgeBaseManager.checkpointAndAssertDatabaseHealthy('loading intrinsic residuals');
+                if (recovered) {
+                    try {
+                        const count = doLoad();
+                        console.warn(`[TagMemoEngine] ♻️ Reloaded ${count} intrinsic residuals after suspect recovery.`);
+                        return true;
+                    } catch (retryErr) {
+                        console.error('[TagMemoEngine] ❌ Intrinsic residual reload still failed after suspect recovery:', retryErr.message || retryErr);
+                        this.tagIntrinsicResiduals = null;
+                        throw retryErr;
+                    }
+                }
+                throw e;
+            }
+
+            console.warn('[TagMemoEngine] ⚠️ No intrinsic residuals available:', e.message);
+            return false;
         }
     }
 
-    // 🌟 TagMemo V7.7: 混合调度器 (阈值门槛 + 滑动窗口防抖)
-    scheduleMatrixRebuild(changeCount = 1) {
-        if (changeCount <= 0) return; 
-        
-        this._accumulatedTagChanges += changeCount;
-        
-        // 动态计算 1% 阈值
-        let threshold = 50; 
+    _getMatrixRebuildThreshold() {
+        let threshold = 50;
         try {
             const totalTags = this.db.prepare('SELECT COUNT(*) as count FROM tags').get()?.count || 0;
             threshold = Math.max(10, Math.min(200, Math.floor(totalTags * 0.01)));
         } catch (e) { /* ignore */ }
+        return threshold;
+    }
+
+    _scheduleThresholdMatrixRebuild(threshold, delayMs = 300000, reason = 'threshold') {
+        if (this._matrixRebuildTimer) {
+            clearTimeout(this._matrixRebuildTimer);
+        }
+
+        this._matrixRebuildTimer = setTimeout(() => {
+            console.log(`[TagMemoEngine] 📈 Changes reached threshold (${this._accumulatedTagChanges} >= ${threshold}) and quiet period finished. Rebuilding matrix...`);
+            this.doMatrixRebuild();
+        }, delayMs);
+
+        if (this._matrixRebuildTimer.unref) this._matrixRebuildTimer.unref();
+
+        if (!this._matrixRebuildScheduleLogged) {
+            console.log(`[TagMemoEngine] 🛡️ Matrix rebuild ${reason}: ${this._accumulatedTagChanges} >= ${threshold}. Scheduled after ${Math.round(delayMs / 1000)}s of quiescence.`);
+            this._matrixRebuildScheduleLogged = true;
+        }
+    }
+
+    _ensureMatrixRebuildScheduledIfThreshold(reason = 'threshold') {
+        const threshold = this._getMatrixRebuildThreshold();
 
         // 仅在达到阈值后，才进入防抖逻辑（实现“大变动后的冷静期”）
         if (this._accumulatedTagChanges >= threshold) {
-            // 无论如何先清除旧计时器，实现“滑动窗口”防抖
-            if (this._matrixRebuildTimer) {
-                clearTimeout(this._matrixRebuildTimer);
-            }
-
-            // 设定 5 分钟（300,000ms）的冷却防抖
-            const COOLING_DELAY = 300000; 
-            this._matrixRebuildTimer = setTimeout(() => {
-                console.log(`[TagMemoEngine] 📈 Changes reached threshold (${this._accumulatedTagChanges} >= ${threshold}) and quiet period finished. Rebuilding matrix...`);
-                this.doMatrixRebuild();
-            }, COOLING_DELAY);
-            
-            if (this._matrixRebuildTimer.unref) this._matrixRebuildTimer.unref();
-
-            // 仅在第一次开启计时器时提示
-            if (!this._matrixRebuildTimer._isLogged) {
-                console.log(`[TagMemoEngine] 🛡️ Threshold reached. Matrix rebuild scheduled after 5min of quiescence.`);
-                this._matrixRebuildTimer._isLogged = true;
-            }
+            this._scheduleThresholdMatrixRebuild(threshold, 300000, reason);
+            return true;
         }
+
+        return false;
+    }
+
+    // 🌟 TagMemo V7.7: 混合调度器 (阈值门槛 + 滑动窗口防抖)
+    scheduleMatrixRebuild(changeCount = 1) {
+        if (changeCount <= 0) return;
+
+        this._accumulatedTagChanges += changeCount;
+        this._ensureMatrixRebuildScheduledIfThreshold('threshold reached');
         // 低于阈值时不执行任何操作，不计入倒计时。
     }
 
@@ -1047,15 +1322,39 @@ class TagMemoEngine {
         const changesAtStart = this._accumulatedTagChanges;
         this._accumulatedTagChanges = 0;
         this._matrixRebuildTimer = null;
+        this._matrixRebuildScheduleLogged = false;
         this._isMatrixRebuilding = true;
 
         try {
-            // 🌟 V8.2-γ: 先增量补齐 sim 表（共用锁，串行执行）
-            // 顺序：sim 预计算 → 加载内存 sim Map → 构建 V8.2 双向矩阵 → 内生残差
-            await this.recomputePairwiseSimilarities({ blocking: true });
-            this.loadPairwiseSimilarities();
-            this.buildDirectedCooccurrenceMatrix();
-            await this.recomputeIntrinsicResiduals();
+            const rebuilt = await this._withRustWriteLease('tagmemo:matrix-rebuild', async () => {
+                // 🌟 V8.2-γ: 先补齐底座，再构建矩阵
+                // 顺序：sim 预计算 → 屏障 → 加载 sim Map → 内生残差预计算/屏障/加载 → 构建 V8.2 双向矩阵
+                const pairResult = await this.recomputePairwiseSimilarities({ blocking: true, leaseAlreadyHeld: true });
+                if (!pairResult) return false;
+                // 🛡️ P0: Rust 写后先 checkpoint + 健康屏障（含 suspect 重开），再用健康连接读取派生表，
+                // 避免跨连接 WAL/SHM 瞬态视图触发读端 malformed。屏障失败即中止本轮，不继续后续阶段。
+                if (!this._assertHealthyAfterRustWrite('pairwise-sim load barrier')) return false;
+                this.loadPairwiseSimilarities({ failOnCorruption: true });
+
+                if (this._isIntrinsicResidualRecomputeEnabled()) {
+                    const intrinsicResult = await this.recomputeIntrinsicResiduals({ leaseAlreadyHeld: true });
+                    if (!intrinsicResult) return false;
+                    if (!this._assertHealthyAfterRustWrite('intrinsic-residuals load barrier')) return false;
+                    this.loadIntrinsicResiduals({ failOnCorruption: true });
+                } else {
+                    console.log('[TagMemoEngine] 🛡️ Intrinsic residual hot recompute skipped: TAGMEMO_INTRINSIC_RESIDUAL_FORCE_RECOMPUTE=false. Loading existing residual cache only.');
+                    this.loadIntrinsicResiduals({ failOnCorruption: true });
+                }
+
+                this.buildDirectedCooccurrenceMatrix();
+                return true;
+            }, { pendingThreshold: 0 });
+
+            if (!rebuilt) {
+                this._accumulatedTagChanges += changesAtStart;
+                this._scheduleMatrixRebuildTimer(300000);
+                return;
+            }
         } finally {
             this._isMatrixRebuilding = false;
             if (this._accumulatedTagChanges > 0) {
@@ -1071,6 +1370,7 @@ class TagMemoEngine {
             clearTimeout(this._matrixRebuildTimer);
         }
 
+        this._matrixRebuildScheduleLogged = true;
         this._matrixRebuildTimer = setTimeout(() => {
             console.log(`[TagMemoEngine] 📈 Follow-up quiet period finished. Rebuilding matrix for ${this._accumulatedTagChanges} accumulated change(s)...`);
             this.doMatrixRebuild();
@@ -1080,23 +1380,206 @@ class TagMemoEngine {
     }
 
     // 🌟 TagMemo V7: 触发 Rust 预计算内生残差
-    async recomputeIntrinsicResiduals() {
+    async recomputeIntrinsicResiduals(opts = {}) {
+        const { leaseAlreadyHeld = false } = opts;
         if (!this.tagIndex || !this.tagIndex.computeIntrinsicResiduals) {
             console.warn('[TagMemoEngine] computeIntrinsicResiduals is not available in VexusIndex');
             return;
         }
-        
-        console.log('[TagMemoEngine] ⚡ Triggering Rust intrinsic residual precomputation...');
+
+        const run = async () => {
+            const irConfig = this.ragParams?.KnowledgeBaseManager?.intrinsicResidual || {};
+            const maxBasis = Number.isFinite(Number(irConfig.maxBasis))
+                ? Math.max(1, Math.floor(Number(irConfig.maxBasis)))
+                : 4;
+            const minNeighbors = Number.isFinite(Number(irConfig.minNeighbors))
+                ? Math.max(1, Math.floor(Number(irConfig.minNeighbors)))
+                : 3;
+            const method = process.env.TAGMEMO_IR_METHOD || irConfig.method || 'anchored_gs';
+            console.log(
+                `[TagMemoEngine] ⚡ Triggering Rust intrinsic residual precomputation ` +
+                `(method=${method}, maxBasis=${maxBasis}, minNeighbors=${minNeighbors}, model_sig=${this.modelSig})...`
+            );
+            try {
+                const dbPath = path.join(path.dirname(this.db.name), 'knowledge_base.sqlite');
+                const result = await this.tagIndex.computeIntrinsicResiduals(
+                    dbPath,
+                    maxBasis,
+                    minNeighbors,
+                    this.modelSig
+                );
+                if (!result) return null;
+                console.log(`[TagMemoEngine] ✅ Rust precomputation complete: ${result.computedCount} computed, ${result.skippedCount} skipped in ${result.elapsedMs.toFixed(2)}ms`);
+
+                // 🛡️ P0: Rust 写后先 checkpoint + 健康屏障，再读取，避免读端瞬态 malformed。
+                if (!this._assertHealthyAfterRustWrite('intrinsic-residuals load barrier')) return null;
+                // 重新加载结果
+                this.loadIntrinsicResiduals({ failOnCorruption: true });
+                return result;
+            } catch (e) {
+                console.error('[TagMemoEngine] ❌ Rust precomputation failed:', e.message || e);
+                if (e.stack) console.error(e.stack);
+                return null;
+            }
+        };
+
+        if (leaseAlreadyHeld) return await run();
+        return await this._withRustWriteLease('tagmemo:intrinsic-residuals', run, { pendingThreshold: 0 });
+    }
+
+    schedulePostStartupDerivedRefresh(delayMs = 300000) {
+        if (this._postStartupDerivedRefreshTimer) {
+            clearTimeout(this._postStartupDerivedRefreshTimer);
+        }
+
+        this._postStartupDerivedRefreshTimer = setTimeout(() => {
+            this._postStartupDerivedRefreshTimer = null;
+            console.log('[TagMemoEngine] 🌙 Post-startup derived refresh window opened.');
+
+            const skipDecision = this._shouldSkipPostStartupDerivedRefresh();
+            if (skipDecision.skip) {
+                console.log(
+                    '[TagMemoEngine] 🛡️ Post-startup derived refresh skipped: warm EPA/pairwise/IR/matrix caches are already loaded, ' +
+                    'EPA/IR hot recompute switches are false, and no tag changes accumulated.'
+                );
+                return;
+            }
+
+            if (this._isEpaBackgroundRecomputeEnabled()) {
+                this._enqueueDerivedTask('epa-basis', async () => {
+                    if (this.epa && typeof this.epa.refreshInBackground === 'function') {
+                        return await this.epa.refreshInBackground();
+                    }
+                    return false;
+                });
+            } else {
+                console.log('[TagMemoEngine] 🛡️ EPA background hot recompute skipped: KNOWLEDGEBASE_EPA_BACKGROUND_RECOMPUTE=false.');
+            }
+
+            const forceBootstrapMatrixRebuild = !skipDecision.pairwiseReady || !skipDecision.matrixReady;
+            const forceFullDerivedRefresh = this._isEpaBackgroundRecomputeEnabled() && this._isIntrinsicResidualRecomputeEnabled();
+            if (forceBootstrapMatrixRebuild || forceFullDerivedRefresh) {
+                if (forceFullDerivedRefresh) {
+                    console.log(
+                        '[TagMemoEngine] 🔥 Full derived refresh requested: ' +
+                        'KNOWLEDGEBASE_EPA_BACKGROUND_RECOMPUTE=true and TAGMEMO_INTRINSIC_RESIDUAL_FORCE_RECOMPUTE=true. ' +
+                        'Matrix/IR pipeline will run after startup cooldown.'
+                    );
+                } else {
+                    console.log(
+                        '[TagMemoEngine] 🧊 Post-startup matrix bootstrap required: ' +
+                        `pairwiseReady=${skipDecision.pairwiseReady}, matrixReady=${skipDecision.matrixReady}.`
+                    );
+                }
+                this._enqueueDerivedTask('matrix-rebuild', async () => {
+                    await this.doMatrixRebuild();
+                    return true;
+                });
+            } else if (this._accumulatedTagChanges > 0) {
+                const scheduled = this._ensureMatrixRebuildScheduledIfThreshold('post-startup accumulated changes');
+                if (!scheduled) {
+                    const threshold = this._getMatrixRebuildThreshold();
+                    console.log(
+                        `[TagMemoEngine] 🛡️ Post-startup matrix rebuild delegated to threshold scheduler: ` +
+                        `${this._accumulatedTagChanges}/${threshold} accumulated tag changes; below threshold, no rebuild scheduled.`
+                    );
+                }
+            }
+        }, Math.max(0, delayMs));
+
+        if (this._postStartupDerivedRefreshTimer.unref) this._postStartupDerivedRefreshTimer.unref();
+        console.log(`[TagMemoEngine] 🕒 Post-startup derived refresh scheduled after ${Math.round(delayMs / 1000)}s.`);
+    }
+
+    _enqueueDerivedTask(type, run, options = {}) {
+        const existing = this._derivedTaskQueue.find(task => task.type === type && task.status === 'queued');
+        if (existing) {
+            existing.run = run;
+            existing.updatedAt = Date.now();
+            return existing.id;
+        }
+
+        const task = {
+            id: `${type}-${Date.now()}-${++this._derivedTaskSeq}`,
+            type,
+            run,
+            status: 'queued',
+            attempts: 0,
+            maxAttempts: options.maxAttempts ?? 3,
+            createdAt: Date.now(),
+            updatedAt: Date.now()
+        };
+        this._derivedTaskQueue.push(task);
+        this._scheduleDerivedTaskPump(0);
+        return task.id;
+    }
+
+    _scheduleDerivedTaskPump(delayMs = 1000) {
+        if (this._derivedTaskTimer) clearTimeout(this._derivedTaskTimer);
+        this._derivedTaskTimer = setTimeout(() => {
+            this._derivedTaskTimer = null;
+            this._processDerivedTaskQueue();
+        }, Math.max(0, delayMs));
+        if (this._derivedTaskTimer.unref) this._derivedTaskTimer.unref();
+    }
+
+    _getDerivedTaskBlockReason() {
+        const kb = this.knowledgeBaseManager;
+        if (!kb) return null;
+        if (kb.databaseCorruptionDetected || kb.dbHealthState === 'corrupt') return 'database-corruption';
+        if (kb.dbHealthState && kb.dbHealthState !== 'healthy') return `database-${kb.dbHealthState}`;
+        if (kb.rustWriteLease) return `rust-lease-active:${kb.rustWriteLease.owner}`;
+        if (kb.isProcessing) return 'js-batch-processing';
+        if (kb.isProcessingDeletes) return 'js-delete-processing';
+        if (kb.pendingDeletes?.size > 0) return `pending-deletes:${kb.pendingDeletes.size}`;
+        if (kb.pendingFiles?.size > 0) return `pending-files:${kb.pendingFiles.size}`;
+        return null;
+    }
+
+    async _processDerivedTaskQueue() {
+        if (this._derivedTaskRunning) return;
+        const task = this._derivedTaskQueue.find(item => item.status === 'queued');
+        if (!task) return;
+
+        const blockReason = this._getDerivedTaskBlockReason();
+        if (blockReason) {
+            console.log(`[TagMemoEngine] 🕒 Derived task queue waiting: ${blockReason}. queued=${this._derivedTaskQueue.length}`);
+            this._scheduleDerivedTaskPump(30000);
+            return;
+        }
+
+        this._derivedTaskRunning = true;
+        task.status = 'running';
+        task.attempts++;
+        task.updatedAt = Date.now();
+
         try {
-            const dbPath = path.join(path.dirname(this.db.name), 'knowledge_base.sqlite');
-            const result = await this.tagIndex.computeIntrinsicResiduals(dbPath);
-            console.log(`[TagMemoEngine] ✅ Rust precomputation complete: ${result.computedCount} computed, ${result.skippedCount} skipped in ${result.elapsedMs.toFixed(2)}ms`);
-            
-            // 重新加载结果
-            this.loadIntrinsicResiduals();
+            console.log(`[TagMemoEngine] ▶️ Derived task started: ${task.type} (${task.id})`);
+            const ok = await task.run();
+            if (ok === false || ok === null) {
+                throw new Error(`derived task returned ${ok}`);
+            }
+            task.status = 'done';
+            task.updatedAt = Date.now();
+            this._derivedTaskQueue = this._derivedTaskQueue.filter(item => item.id !== task.id);
+            console.log(`[TagMemoEngine] ✅ Derived task finished: ${task.type} (${task.id})`);
         } catch (e) {
-            console.error('[TagMemoEngine] ❌ Rust precomputation failed:', e.message || e);
-            if (e.stack) console.error(e.stack);
+            task.updatedAt = Date.now();
+            if (task.attempts >= task.maxAttempts) {
+                task.status = 'failed';
+                console.warn(`[TagMemoEngine] ⚠️ Derived task failed permanently: ${task.type} (${task.id}): ${e.message || e}`);
+                this._derivedTaskQueue = this._derivedTaskQueue.filter(item => item.id !== task.id);
+            } else {
+                task.status = 'queued';
+                const backoffMs = Math.min(15 * 60 * 1000, 60000 * task.attempts);
+                console.warn(`[TagMemoEngine] ⚠️ Derived task failed, will retry in ${Math.round(backoffMs / 1000)}s: ${task.type} (${task.id}): ${e.message || e}`);
+                this._scheduleDerivedTaskPump(backoffMs);
+            }
+        } finally {
+            this._derivedTaskRunning = false;
+            if (this._derivedTaskQueue.some(item => item.status === 'queued')) {
+                this._scheduleDerivedTaskPump(this._derivedTaskTimer ? 30000 : 1000);
+            }
         }
     }
 }

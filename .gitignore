@@ -198,6 +198,8 @@ image/通用表情包/*
 
 # 忽略 FluxGen 生成的图片
 image/fluxgen/
+# 忽略 B站截图的图片
+image/bilibili/
 
 # ===== IDE / OS 文件 =====
 .vscode/
@@ -209,12 +211,14 @@ image/fluxgen/
 # Qwen Code / Snow 工具配置
 **/.qwen/
 **/.snow/
+helloagents/
 
 # Windows 缩略图缓存
 Thumbs.db
 
 # ===== 编译产物 =====
 rust-vexus-lite/target/
+Plugin/DailyNoteSearcher/src/target/
 
 # ==== 分布式开发 ====
 VCPDistributedServer
