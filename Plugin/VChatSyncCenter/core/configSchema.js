@@ -1,5 +1,5 @@
 const SENSITIVE_KEY_PATTERN =
-  /key|token|secret|password|cookie|credential|auth|apikey|bearer/i;
+  /(^|[_-])(key|token|secret|password|cookie|credential|auth|apikey|bearer)([_-]|$)/i;
 
 const AGENT_BOOTSTRAP_ALLOWED = new Set([
   "name",
@@ -20,6 +20,7 @@ const AGENT_BOOTSTRAP_ALLOWED = new Set([
   "topics",
   "presetSystemPrompt",
   "selectedPreset",
+  "uiCollapseStates",
   "disableCustomColors",
   "useThemeColorsInChat",
   "avatarBorderColor",
@@ -30,39 +31,20 @@ const AGENT_BOOTSTRAP_ALLOWED = new Set([
   "ttsVoicePrimary",
   "ttsRegexPrimary",
   "ttsVoiceSecondary",
+  "ttsRegexSecondary",
   "ttsSpeed",
   "stripRegexes",
   "regex_rules",
 ]);
 
-const AGENT_RUNTIME_DENYLIST = new Set([
-  "systemPrompt",
-  "originalSystemPrompt",
-  "advancedSystemPrompt",
-  "advancedSystemPrompt.blocks",
-  "syncPrompt",
-  "model",
-  "temperature",
-  "contextTokenLimit",
-  "maxOutputTokens",
-  "streamOutput",
-  "ttsVoicePrimary",
-  "ttsRegexPrimary",
-  "ttsVoiceSecondary",
-  "ttsSpeed",
-  "customCss",
-  "cardCss",
-  "chatCss",
-  "avatarBorderColor",
-  "nameTextColor",
-  "uiCollapseStates",
-  "stripRegexes",
-  "regex_rules",
-]);
+const AGENT_RUNTIME_DENYLIST = new Set();
 
 const GROUP_BOOTSTRAP_ALLOWED = new Set([
+  "id",
   "name",
   "description",
+  "avatar",
+  "createdAt",
   "avatarCalculatedColor",
   "avatarBorderColor",
   "nameTextColor",
@@ -79,9 +61,9 @@ const GROUP_BOOTSTRAP_ALLOWED = new Set([
 
 const GROUP_RUNTIME_DENYLIST = new Set([
   "groupPrompt",
-  "invitePrompt",
   "useUnifiedModel",
   "unifiedModel",
+  "tagMatchMode",
 ]);
 
 const TOPIC_ALLOWED = new Set([
@@ -93,6 +75,35 @@ const TOPIC_ALLOWED = new Set([
   "creatorSource",
 ]);
 
+const SETTINGS_ALLOWED = new Set([
+  "userName",
+  "userAvatarUrl",
+  "enableAgentBubbleTheme",
+  "assistantAgent",
+  "voiceMode",
+  "speechRecognizerBrowserPath",
+  "speechRecognizerPagePath",
+  "voiceLocalSettings.sovitsUrl",
+  "voiceLocalSettings.sovitsKey",
+  "voiceNetworkSettings.providerUrl",
+  "voiceNetworkSettings.providerKey",
+  "enableDistributedServer",
+  "enableVcpToolInjection",
+  "enableThoughtChainInjection",
+  "enableAiMessageButtons",
+  "enableContextSanitizer",
+  "contextSanitizerDepth",
+  "agentMusicControl",
+  "topicSummaryModel",
+  "enableDistributedServerLogs",
+  "continueWritingPrompt",
+  "flowlockContinueDelay",
+  "enableMiddleClickQuickAction",
+  "middleClickQuickAction",
+  "enableRegenerateConfirmation",
+  "enableMiddleClickAdvanced",
+  "middleClickAdvancedDelay",
+]);
 const CONFIG_SCHEMAS = {
   agent_config: {
     allowed: AGENT_BOOTSTRAP_ALLOWED,
@@ -117,21 +128,9 @@ const CONFIG_SCHEMAS = {
     nestedArrays: {},
   },
   settings: {
-    allowed: new Set([
-      "displayName",
-      "username",
-      "theme",
-      "fontSize",
-      "chatFontSize",
-      "messageSpacing",
-      "bubbleStyle",
-      "sortOrder",
-      "ttsVoicePrimary",
-      "ttsVoiceSecondary",
-      "ttsSpeed",
-      "streamOutput",
-    ]),
+    allowed: SETTINGS_ALLOWED,
     runtimeDenylist: new Set(),
+    allowSensitiveFields: SETTINGS_ALLOWED,
     nestedArrays: {},
   },
   forum_config: {
@@ -145,15 +144,26 @@ function normalizeProfile(profile) {
   return profile === "runtime" || profile === "manual" ? profile : "bootstrap";
 }
 
-function scanNoSensitiveKeys(value, path = "") {
+function isSensitiveFieldAllowed(definition, fieldPath) {
+  return Boolean(
+    definition &&
+      definition.allowSensitiveFields &&
+      definition.allowSensitiveFields.has(fieldPath)
+  );
+}
+
+function scanNoSensitiveKeys(value, path = "", definition = null) {
   if (!value || typeof value !== "object") return;
   for (const [key, child] of Object.entries(value)) {
     const childPath = path ? `${path}.${key}` : key;
-    if (SENSITIVE_KEY_PATTERN.test(key)) {
+    if (
+      SENSITIVE_KEY_PATTERN.test(key) &&
+      !isSensitiveFieldAllowed(definition, childPath)
+    ) {
       throw new Error(`sensitive config field is not syncable: ${childPath}`);
     }
     if (child && typeof child === "object")
-      scanNoSensitiveKeys(child, childPath);
+      scanNoSensitiveKeys(child, childPath, definition);
   }
 }
 
@@ -204,6 +214,57 @@ function validateProjectionFields(
   return projectionFields;
 }
 
+function normalizeDeletedFields(deletedFields) {
+  if (deletedFields === undefined || deletedFields === null) return [];
+  if (!Array.isArray(deletedFields)) {
+    throw new Error("config deleted_fields must be a string array");
+  }
+  const normalized = [];
+  for (const field of deletedFields) {
+    if (typeof field !== "string" || !field.trim()) {
+      throw new Error("config deleted_fields must be a string array");
+    }
+    normalized.push(field.trim());
+  }
+  return [...new Set(normalized)];
+}
+
+function validateDeletedFields(
+  schema,
+  deletedFields,
+  projectionFields,
+  profile = "bootstrap"
+) {
+  const normalized = normalizeDeletedFields(deletedFields);
+  if (normalized.length === 0) return normalized;
+  const validatedProjectionFields = validateProjectionFields(
+    schema,
+    projectionFields,
+    profile
+  );
+  if (!validatedProjectionFields) {
+    throw new Error("config deleted_fields requires projection_fields");
+  }
+  const projectionSet = new Set(validatedProjectionFields);
+  for (const field of normalized) {
+    if (!projectionSet.has(field)) {
+      throw new Error(
+        `deleted field must be declared in projection_fields: ${field}`
+      );
+    }
+    validateProjectionFields(schema, [field], profile);
+    const leaf = field.split(".").filter(Boolean).slice(-1)[0] || field;
+    const definition = CONFIG_SCHEMAS[schema];
+    if (
+      SENSITIVE_KEY_PATTERN.test(leaf) &&
+      !isSensitiveFieldAllowed(definition, field)
+    ) {
+      throw new Error(`sensitive deleted field is not syncable: ${field}`);
+    }
+  }
+  return normalized;
+}
+
 function flattenDtoLeafPaths(value, prefix = "") {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     return prefix ? [prefix] : [];
@@ -238,10 +299,13 @@ function collapseCoveredPaths(fields) {
 function validateSafeConfigDto(schema, dto, options = {}) {
   const definition = CONFIG_SCHEMAS[schema];
   if (!definition) throw new Error(`unsupported config schema: ${schema}`);
-  if (!dto || typeof dto !== "object" || Array.isArray(dto)) {
+  if (!dto || typeof dto !== "object") {
     throw new Error("config safe_projection_json must be an object");
   }
-  scanNoSensitiveKeys(dto);
+  if (Array.isArray(dto) && !definition.wholeDocument) {
+    throw new Error("config safe_projection_json must be an object");
+  }
+  scanNoSensitiveKeys(dto, "", definition);
   const projectionFields = validateProjectionFields(
     schema,
     options.projection_fields,
@@ -282,5 +346,7 @@ module.exports = {
   normalizeProfile,
   scanNoSensitiveKeys,
   validateProjectionFields,
+  normalizeDeletedFields,
+  validateDeletedFields,
   validateSafeConfigDto,
 };

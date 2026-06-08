@@ -3,7 +3,10 @@ const fs = require("fs");
 const os = require("os");
 const path = require("path");
 const { ensureDatabase, closeDatabase } = require("../core/db");
-const { applyConfigOperation, checksumConfigDto } = require("../core/configService");
+const {
+  applyConfigOperation,
+  checksumConfigDto,
+} = require("../core/configService");
 const { exportBaseline } = require("../core/bootstrapService");
 
 function configOperation({ operationId, profile, dto, projectionFields }) {
@@ -14,6 +17,7 @@ function configOperation({ operationId, profile, dto, projectionFields }) {
     relative_path: "Agents/a/config.json",
     profile,
     projection_fields: projectionFields,
+    deleted_fields: [],
     safe_projection_json: dto,
   };
   payload.checksum = checksumConfigDto({
@@ -22,6 +26,7 @@ function configOperation({ operationId, profile, dto, projectionFields }) {
     entity_id: payload.entity_id,
     profile: payload.profile,
     projection_fields: payload.projection_fields,
+    deleted_fields: payload.deleted_fields,
     safe_projection_json: payload.safe_projection_json,
   });
   return {
@@ -35,7 +40,9 @@ function configOperation({ operationId, profile, dto, projectionFields }) {
 }
 
 function main() {
-  const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "vchat-sync-center-profile-"));
+  const tempRoot = fs.mkdtempSync(
+    path.join(os.tmpdir(), "vchat-sync-center-profile-")
+  );
   const config = {
     dbPath: path.join(tempRoot, "center.db"),
     attachmentDir: path.join(tempRoot, "attachments"),
@@ -81,7 +88,9 @@ function main() {
   );
 
   const rows = dbContext.db
-    .prepare("SELECT schema, entity_id, profile, safe_projection_json FROM config_entities ORDER BY profile")
+    .prepare(
+      "SELECT schema, entity_id, profile, safe_projection_json FROM config_entities ORDER BY profile"
+    )
     .all();
   assert.strictEqual(rows.length, 2);
   assert.deepStrictEqual(
@@ -90,9 +99,21 @@ function main() {
   );
 
   const exported = exportBaseline(runtime, { kind: "configs" });
-  assert.strictEqual(exported.baseline.configs.length, 1);
-  assert.strictEqual(exported.baseline.configs[0].profile, "bootstrap");
-  assert.deepStrictEqual(exported.baseline.configs[0].safe_projection_json, bootstrapDto);
+  assert.strictEqual(exported.baseline.configs.length, 2);
+  assert.deepStrictEqual(
+    exported.baseline.configs.map(
+      (config) => `${config.profile}:${config.entity_id}`
+    ),
+    ["bootstrap:Agents/a/config.json", "runtime:Agents/a/config.json"]
+  );
+  assert.deepStrictEqual(
+    exported.baseline.configs[0].safe_projection_json,
+    bootstrapDto
+  );
+  assert.deepStrictEqual(
+    exported.baseline.configs[1].safe_projection_json,
+    runtimeDto
+  );
 
   closeDatabase(dbContext);
   fs.rmSync(tempRoot, { recursive: true, force: true });

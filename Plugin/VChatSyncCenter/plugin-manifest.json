@@ -35,7 +35,6 @@
     "VCHAT_BACKUP_RETENTION_DAYS": { "type": "integer", "default": 30 },
     "VCHAT_RELEASE_MODE": { "type": "string", "default": "mvp-local-only" },
     "VCHAT_SYNC_MAX_LIMIT": { "type": "integer", "default": 5000 },
-    "VCHAT_SYNC_MAX_JSON_BODY_MB": { "type": "integer", "default": 20 },
     "VCHAT_SYNC_MAX_ATTACHMENT_MB": { "type": "integer", "default": 512 },
     "DebugMode": { "type": "boolean", "default": false }
   },

@@ -1,6 +1,7 @@
+const path = require("path");
 const { requireSyncAuth } = require("../core/auth");
 const { getDbStatus } = require("../core/db");
-const { getLatestSeq, getChanges } = require("../core/changeLog");
+const { getLatestSeq, getCompactedChanges } = require("../core/changeLog");
 const { runIntegrityCheck } = require("../core/integrityService");
 const {
   getBackupStatus,
@@ -20,6 +21,13 @@ const {
   upsertAttachment,
   verifyAttachmentFile,
 } = require("../core/attachmentStore");
+const {
+  listThemes,
+  getTheme,
+  upsertThemeAsset,
+  getThemeAsset,
+  readThemeAssetFile,
+} = require("../core/themeService");
 const {
   requireBootstrapAuth,
   importBootstrap,
@@ -112,6 +120,146 @@ function notifyLatestSeq(runtime, latestSeq, detail = {}) {
   }
 }
 
+function summarizeOperation(operation = {}) {
+  const payload = operation.payload || {};
+  const message = payload.message || payload.raw_json || payload.raw || {};
+  const topic = payload.topic || payload.metadata || {};
+  return {
+    operation_id: operation.operation_id || operation.operationId || null,
+    device_id: operation.device_id || operation.deviceId || null,
+    entity_type: operation.entity_type || operation.type || null,
+    action: operation.action || operation.operation || null,
+    entity_id: operation.entity_id || operation.entityId || null,
+    item_type:
+      operation.item_type || payload.item_type || topic.item_type || null,
+    item_id: operation.item_id || payload.item_id || topic.item_id || null,
+    topic_id:
+      operation.topic_id ||
+      payload.topic_id ||
+      payload.topicId ||
+      topic.topic_id ||
+      topic.topicId ||
+      topic.id ||
+      message.topic_id ||
+      null,
+    message_id:
+      operation.entity_type === "message" || operation.type === "message"
+        ? operation.entity_id ||
+          payload.message_id ||
+          payload.id ||
+          message.id ||
+          null
+        : null,
+  };
+}
+
+function buildRejectedOperationResponse(error, operation = {}) {
+  const operationSummary = summarizeOperation(operation);
+  const response = {
+    ok: false,
+    code: error.code || "OPERATION_REJECTED",
+    error: error.message,
+    operation: operationSummary,
+  };
+  if (error.details && typeof error.details === "object") {
+    response.details = error.details;
+  }
+  return response;
+}
+
+function parseCheckBatch(body, fieldName, maxBatchSize = 500) {
+  const items = body && Array.isArray(body[fieldName]) ? body[fieldName] : null;
+  if (!items) {
+    const error = new Error(`${fieldName} must be an array`);
+    error.statusCode = 400;
+    throw error;
+  }
+  if (items.length > maxBatchSize) {
+    const error = new Error(
+      `${fieldName} exceeds max batch size ${maxBatchSize}`
+    );
+    error.statusCode = 413;
+    throw error;
+  }
+  return items;
+}
+
+function checkMessages(db, messages) {
+  const stmt = db.prepare(`
+SELECT id, checksum, server_seq, deleted
+FROM messages
+WHERE item_type = ? AND item_id = ? AND topic_id = ? AND id = ?
+`);
+  return messages.map((item = {}) => {
+    const itemType = item.item_type || item.itemType;
+    const itemId = item.item_id || item.itemId;
+    const topicId = item.topic_id || item.topicId;
+    const messageId = item.message_id || item.messageId || item.id;
+    if (!itemType || !itemId || !topicId || !messageId) {
+      return {
+        message_id: messageId || null,
+        exists: false,
+        error: "item_type, item_id, topic_id and message_id are required",
+      };
+    }
+    const row = stmt.get(
+      String(itemType),
+      String(itemId),
+      String(topicId),
+      String(messageId)
+    );
+    if (!row) {
+      return { message_id: String(messageId), exists: false };
+    }
+    const result = {
+      message_id: row.id,
+      exists: true,
+      server_seq: Number(row.server_seq || 0),
+      deleted: Number(row.deleted || 0) === 1,
+      checksum: row.checksum || null,
+    };
+    if (
+      item.checksum !== undefined &&
+      item.checksum !== null &&
+      item.checksum !== ""
+    ) {
+      result.checksum_match =
+        String(item.checksum) === String(row.checksum || "");
+    }
+    return result;
+  });
+}
+
+function checkTopics(db, topics) {
+  const stmt = db.prepare(`
+SELECT id, deleted
+FROM topics
+WHERE item_type = ? AND item_id = ? AND id = ?
+`);
+  return topics.map((item = {}) => {
+    const itemType = item.item_type || item.itemType;
+    const itemId = item.item_id || item.itemId;
+    const topicId = item.topic_id || item.topicId || item.id;
+    if (!itemType || !itemId || !topicId) {
+      return {
+        topic_id: topicId || null,
+        exists: false,
+        error: "item_type, item_id and topic_id are required",
+      };
+    }
+    const row = stmt.get(String(itemType), String(itemId), String(topicId));
+    if (!row) {
+      return { topic_id: String(topicId), exists: false };
+    }
+    return {
+      topic_id: row.id,
+      exists: true,
+      server_seq: null,
+      deleted: Number(row.deleted || 0) === 1,
+    };
+  });
+}
+
 function createSyncRoutes(router, runtime) {
   router.get("/status", requireSyncAuth(runtime), (req, res) => {
     const db = getReadyDb(runtime, res);
@@ -137,7 +285,6 @@ function createSyncRoutes(router, runtime) {
       backup: getBackupStatus(runtime.config),
       limits: {
         max_limit: runtime.config.maxLimit,
-        max_json_body_mb: runtime.config.maxJsonBodyMb,
         max_attachment_mb: runtime.config.maxAttachmentMb,
       },
     });
@@ -169,31 +316,65 @@ function createSyncRoutes(router, runtime) {
       }
       return res.status(result.ok === false ? 409 : 200).json(result);
     } catch (error) {
+      const operation = req.body || {};
       runtime.logger.warn("VChatSyncCenter operation rejected", {
         error: error.message,
+        code: error.code,
+        operation: summarizeOperation(operation),
+        details: error.details || null,
       });
-      return res.status(400).json({ ok: false, error: error.message });
+      return res
+        .status(400)
+        .json(buildRejectedOperationResponse(error, operation));
+    }
+  });
+
+  router.post("/messages/check", requireSyncAuth(runtime), (req, res) => {
+    const db = getReadyDb(runtime, res);
+    if (!db) return null;
+    try {
+      const messages = parseCheckBatch(req.body || {}, "messages", 500);
+      return res.json({ ok: true, results: checkMessages(db, messages) });
+    } catch (error) {
+      return res
+        .status(error.statusCode || 400)
+        .json({ ok: false, error: error.message });
+    }
+  });
+
+  router.post("/topics/check", requireSyncAuth(runtime), (req, res) => {
+    const db = getReadyDb(runtime, res);
+    if (!db) return null;
+    try {
+      const topics = parseCheckBatch(req.body || {}, "topics", 500);
+      return res.json({ ok: true, results: checkTopics(db, topics) });
+    } catch (error) {
+      return res
+        .status(error.statusCode || 400)
+        .json({ ok: false, error: error.message });
     }
   });
 
   router.get("/changes", requireSyncAuth(runtime), (req, res) => {
     const db = getReadyDb(runtime, res);
     if (!db) return null;
+
     const afterSeq = Math.max(
       Number.parseInt(req.query.after_seq || "0", 10) || 0,
       0
     );
     const limit = parseLimit(req.query.limit, runtime, 1000);
-    const events = getChanges(db, afterSeq, limit);
+    const events = getCompactedChanges(db, afterSeq, limit);
     const latestSeq = getLatestSeq(db);
-    const nextAfterSeq =
+    const checkpointSeq =
       events.length > 0 ? events[events.length - 1].seq : afterSeq;
     return res.json({
       ok: true,
       latest_seq: latestSeq,
+      checkpoint_seq: checkpointSeq,
       events,
-      has_more: events.length === limit && nextAfterSeq < latestSeq,
-      next_after_seq: nextAfterSeq,
+      has_more: events.length === limit && checkpointSeq < latestSeq,
+      next_after_seq: checkpointSeq,
     });
   });
 
@@ -299,8 +480,9 @@ function createSyncRoutes(router, runtime) {
       runtime.logger.warn("bootstrap import rejected", {
         error: error.message,
       });
-      const status = /authorization/i.test(error.message) ? 401 : 400;
-      return res.status(status).json({ ok: false, error: error.message });
+      return res
+        .status(error.statusCode || 400)
+        .json({ ok: false, error: error.message });
     }
   });
 
@@ -325,8 +507,159 @@ function createSyncRoutes(router, runtime) {
       runtime.logger.warn("bootstrap export rejected", {
         error: error.message,
       });
-      const status = /authorization/i.test(error.message) ? 401 : 400;
-      return res.status(status).json({ ok: false, error: error.message });
+      return res
+        .status(error.statusCode || 400)
+        .json({ ok: false, error: error.message });
+    }
+  });
+
+  router.get("/themes", requireSyncAuth(runtime), (req, res) => {
+    const db = getReadyDb(runtime, res);
+    if (!db) return null;
+    try {
+      return res.json({ ok: true, themes: listThemes(db, req.query || {}) });
+    } catch (error) {
+      runtime.logger.warn("theme list rejected", { error: error.message });
+      return res.status(400).json({ ok: false, error: error.message });
+    }
+  });
+
+  router.get(
+    "/themes/assets/:hash",
+    requireSyncAuth(runtime),
+    async (req, res) => {
+      const db = getReadyDb(runtime, res);
+      if (!db) return null;
+      try {
+        const asset = getThemeAsset(db, runtime.config, req.params.hash);
+        if (!asset)
+          return res
+            .status(404)
+            .json({ ok: false, error: "theme asset not found" });
+        const buffer = await readThemeAssetFile(asset);
+        const filenameExt = path.extname(asset.filename || "") || ".bin";
+        const asciiFilename = `${asset.asset_hash}${filenameExt}`.replace(
+          /[^A-Za-z0-9_.-]/g,
+          "_"
+        );
+        res.setHeader(
+          "Content-Type",
+          asset.mime_type || "application/octet-stream"
+        );
+        res.setHeader("X-Content-Type-Options", "nosniff");
+        res.setHeader(
+          "Content-Disposition",
+          `attachment; filename="${asciiFilename}"`
+        );
+        res.setHeader("Content-Length", String(buffer.length));
+        res.setHeader("X-VChat-Theme-Asset-Hash", asset.asset_hash);
+        res.setHeader("X-VChat-Theme-Asset-Type", asset.asset_type || "");
+        res.setHeader("X-VChat-Theme-Asset-Slot", asset.slot || "");
+        return res.end(buffer);
+      } catch (error) {
+        runtime.logger.warn("theme asset download rejected", {
+          error: error.message,
+        });
+        const status = /binary is not available/i.test(error.message)
+          ? 409
+          : 400;
+        return res.status(status).json({ ok: false, error: error.message });
+      }
+    }
+  );
+
+  router.post("/themes/assets", requireSyncAuth(runtime), async (req, res) => {
+    const db = getReadyDb(runtime, res);
+    if (!db) return null;
+    try {
+      const multipart = parseMultipartFormData(req);
+      const body = multipart ? multipart.fields : req.body || {};
+      const rawBody = req.rawBody || req.bodyRaw || null;
+      const base64 = body.content_base64 || body.base64 || body.data;
+      const buffer = multipart
+        ? multipart.fileBuffer
+        : Buffer.isBuffer(rawBody) && !base64
+        ? rawBody
+        : Buffer.from(String(base64 || ""), "base64");
+      const result = await upsertThemeAsset(runtime, {
+        buffer,
+        theme_id: body.theme_id || body.themeId,
+        asset_hash: body.asset_hash || body.hash,
+        asset_type: body.asset_type || body.assetType,
+        slot: body.slot,
+        mime_type:
+          body.mime_type || (multipart && multipart.fileInfo.mime_type),
+        filename: body.filename || (multipart && multipart.fileInfo.filename),
+        relative_path: body.relative_path || body.relativePath,
+        device_id: body.device_id || body.deviceId,
+        operation_id: body.operation_id,
+      });
+      if (result && result.latest_seq !== undefined) {
+        notifyLatestSeq(runtime, result.latest_seq, {
+          operation_id: result.operation_id,
+          entity_type: "theme_asset",
+          action: "upsert",
+          hash: result.asset && result.asset.asset_hash,
+        });
+      }
+      return res.json({ ok: true, ...result });
+    } catch (error) {
+      runtime.logger.warn("theme asset upload rejected", {
+        error: error.message,
+      });
+      return res.status(400).json({ ok: false, error: error.message });
+    }
+  });
+
+  router.post("/themes", requireSyncAuth(runtime), (req, res) => {
+    const db = getReadyDb(runtime, res);
+    if (!db) return null;
+    try {
+      const body = req.body || {};
+      const themeId =
+        body.theme_id || body.themeId || body.file_name || body.fileName;
+      const deviceId = body.device_id || body.deviceId || body.source_device_id;
+      if (!deviceId) throw new Error("device_id is required");
+      const operation = {
+        operation_id:
+          body.operation_id ||
+          `theme_package.${themeId || "unknown"}.${Date.now()}`,
+        device_id: deviceId,
+        entity_type: "theme_package",
+        entity_id: themeId,
+        action: body.deleted ? "delete" : "upsert",
+        payload: body,
+      };
+      const result = processOperation(db, operation, {
+        requireDeviceBinding: runtime.config.requireDeviceBinding,
+      });
+      if (result && result.latest_seq !== undefined) {
+        notifyLatestSeq(runtime, result.latest_seq, {
+          operation_id: result.operation_id,
+          entity_type: result.entity_type,
+          action: result.action,
+        });
+      }
+      return res.status(result.ok === false ? 409 : 200).json(result);
+    } catch (error) {
+      runtime.logger.warn("theme package upsert rejected", {
+        error: error.message,
+      });
+      return res.status(400).json({ ok: false, error: error.message });
+    }
+  });
+
+  router.get("/themes/:theme_id", requireSyncAuth(runtime), (req, res) => {
+    const db = getReadyDb(runtime, res);
+    if (!db) return null;
+    try {
+      const theme = getTheme(db, req.params.theme_id);
+      if (!theme)
+        return res.status(404).json({ ok: false, error: "theme not found" });
+      return res.json({ ok: true, theme });
+    } catch (error) {
+      runtime.logger.warn("theme detail rejected", { error: error.message });
+      return res.status(400).json({ ok: false, error: error.message });
     }
   });
 

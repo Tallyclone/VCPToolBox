@@ -307,6 +307,140 @@ CREATE INDEX IF NOT EXISTS idx_config_entities_updated ON config_entities(update
 CREATE INDEX IF NOT EXISTS idx_config_entities_profile ON config_entities(profile, updated_at);
 `,
   },
+  {
+    version: 7,
+    name: "add_full_soft_delete_metadata",
+    sql: `
+ALTER TABLE items ADD COLUMN deleted_at TEXT;
+ALTER TABLE topics ADD COLUMN deleted_at TEXT;
+ALTER TABLE config_entities ADD COLUMN deleted_at TEXT;
+ALTER TABLE tombstones ADD COLUMN snapshot_json TEXT;
+ALTER TABLE tombstones ADD COLUMN base_version INTEGER;
+CREATE INDEX IF NOT EXISTS idx_items_deleted ON items(deleted, updated_at);
+CREATE INDEX IF NOT EXISTS idx_topics_deleted ON topics(deleted, updated_at);
+CREATE INDEX IF NOT EXISTS idx_config_entities_deleted ON config_entities(deleted, updated_at);
+`,
+  },
+  {
+    version: 8,
+    name: "add_avatar_entities",
+    sql: `
+CREATE TABLE IF NOT EXISTS avatars (
+  owner_type TEXT NOT NULL,
+  owner_id TEXT NOT NULL,
+  hash TEXT,
+  mime_type TEXT,
+  ext TEXT,
+  relative_path TEXT,
+  metadata_json TEXT,
+  version INTEGER NOT NULL DEFAULT 1,
+  deleted INTEGER NOT NULL DEFAULT 0,
+  deleted_at TEXT,
+  updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  PRIMARY KEY (owner_type, owner_id),
+  FOREIGN KEY (hash) REFERENCES attachments(hash) ON DELETE SET NULL
+);
+CREATE INDEX IF NOT EXISTS idx_avatars_hash ON avatars(hash);
+CREATE INDEX IF NOT EXISTS idx_avatars_deleted ON avatars(deleted, updated_at);
+`,
+  },
+  {
+    version: 9,
+    name: "add_theme_resource_library",
+    sql: `
+CREATE TABLE IF NOT EXISTS theme_packages (
+  theme_id TEXT PRIMARY KEY,
+  display_name TEXT NOT NULL,
+  version INTEGER NOT NULL DEFAULT 1,
+  source_device_id TEXT,
+  mode TEXT NOT NULL DEFAULT 'dual',
+  variables_dark_json TEXT NOT NULL DEFAULT '{}',
+  variables_light_json TEXT NOT NULL DEFAULT '{}',
+  extra_css TEXT NOT NULL DEFAULT '',
+  manifest_json TEXT NOT NULL DEFAULT '{}',
+  checksum TEXT NOT NULL,
+  deleted INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+CREATE INDEX IF NOT EXISTS idx_theme_packages_updated ON theme_packages(deleted, updated_at);
+CREATE INDEX IF NOT EXISTS idx_theme_packages_checksum ON theme_packages(checksum);
+CREATE TABLE IF NOT EXISTS theme_assets (
+  asset_hash TEXT PRIMARY KEY,
+  theme_id TEXT,
+  asset_type TEXT NOT NULL DEFAULT 'wallpaper',
+  slot TEXT NOT NULL DEFAULT 'default',
+  filename TEXT NOT NULL,
+  mime_type TEXT NOT NULL,
+  size_bytes INTEGER NOT NULL DEFAULT 0,
+  storage_path TEXT NOT NULL,
+  checksum TEXT NOT NULL,
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+CREATE INDEX IF NOT EXISTS idx_theme_assets_theme ON theme_assets(theme_id, asset_type, slot);
+CREATE INDEX IF NOT EXISTS idx_theme_assets_updated ON theme_assets(updated_at);
+CREATE TABLE IF NOT EXISTS theme_package_assets (
+  theme_id TEXT NOT NULL,
+  asset_hash TEXT NOT NULL,
+  slot TEXT NOT NULL DEFAULT 'default',
+  asset_type TEXT NOT NULL DEFAULT 'wallpaper',
+  PRIMARY KEY (theme_id, asset_hash, slot, asset_type),
+  FOREIGN KEY (theme_id) REFERENCES theme_packages(theme_id) ON DELETE CASCADE,
+  FOREIGN KEY (asset_hash) REFERENCES theme_assets(asset_hash) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_theme_package_assets_hash ON theme_package_assets(asset_hash);
+`,
+  },
+  {
+    version: 10,
+    name: "add_topic_content_and_order_metadata",
+    sql: `
+ALTER TABLE topics ADD COLUMN order_rank INTEGER;
+ALTER TABLE topics ADD COLUMN content_updated_at TEXT;
+ALTER TABLE topics ADD COLUMN order_updated_at TEXT;
+ALTER TABLE topics ADD COLUMN content_device_id TEXT;
+ALTER TABLE topics ADD COLUMN order_device_id TEXT;
+UPDATE topics
+SET order_rank = COALESCE(
+  order_rank,
+  (
+    SELECT COUNT(*) * 1000
+    FROM topics AS ranked
+    WHERE ranked.item_type = topics.item_type
+      AND ranked.item_id = topics.item_id
+      AND (ranked.created_at < topics.created_at OR (ranked.created_at = topics.created_at AND ranked.id <= topics.id))
+  )
+);
+CREATE INDEX IF NOT EXISTS idx_topics_order ON topics(item_type, item_id, deleted, order_rank);
+`,
+  },
+  {
+    version: 11,
+    name: "add_theme_asset_relative_path",
+    sql: `
+ALTER TABLE theme_assets ADD COLUMN relative_path TEXT;
+CREATE INDEX IF NOT EXISTS idx_theme_assets_relative_path ON theme_assets(relative_path);
+`,
+  },
+  {
+    version: 12,
+    name: "add_topic_activity_state",
+    sql: `
+CREATE TABLE IF NOT EXISTS topic_activity_state (
+  item_type TEXT NOT NULL,
+  item_id TEXT NOT NULL,
+  topic_id TEXT NOT NULL,
+  latest_seq INTEGER NOT NULL,
+  latest_device_id TEXT,
+  activity_at INTEGER,
+  updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  PRIMARY KEY(item_type, item_id, topic_id)
+);
+CREATE INDEX IF NOT EXISTS idx_topic_activity_state_latest_seq ON topic_activity_state(latest_seq);
+CREATE INDEX IF NOT EXISTS idx_topic_activity_state_owner ON topic_activity_state(item_type, item_id, latest_seq);
+`,
+  },
 ];
 
 function ensureSchemaMigrationsTable(db) {

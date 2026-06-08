@@ -31,8 +31,6 @@ function buildRuntimeConfig(
     enabled: boolValue(pluginConfig.VCHAT_SYNC_ENABLED, false),
     host: pluginConfig.VCHAT_SYNC_HOST || "127.0.0.1",
     syncKey: pluginConfig.VCHAT_SYNC_KEY || "",
-    bootstrapKey:
-      pluginConfig.VCHAT_BOOTSTRAP_KEY || pluginConfig.VCHAT_SYNC_KEY || "",
     requireDeviceBinding: boolValue(
       pluginConfig.VCHAT_SYNC_REQUIRE_DEVICE_BINDING,
       true
@@ -57,7 +55,6 @@ function buildRuntimeConfig(
     backupRetentionDays: intValue(pluginConfig.VCHAT_BACKUP_RETENTION_DAYS, 30),
     releaseMode: pluginConfig.VCHAT_RELEASE_MODE || "mvp-local-only",
     maxLimit: intValue(pluginConfig.VCHAT_SYNC_MAX_LIMIT, 5000),
-    maxJsonBodyMb: intValue(pluginConfig.VCHAT_SYNC_MAX_JSON_BODY_MB, 20),
     maxAttachmentMb: intValue(pluginConfig.VCHAT_SYNC_MAX_ATTACHMENT_MB, 512),
     debug: boolValue(pluginConfig.DebugMode, false),
     projectBasePath: base,

@@ -1,28 +1,98 @@
----VCP桌面核心---
-VCP桌面是VCP项目的高级进阶功能，允许Agent直接和用户的桌面进行交互。VCP桌面是基于Vchat核心渲染架构搭建的独立桌面系统，其内核是一张空白的html画布，但拥有winsdk和命令行等多重虚拟化，并封装了vchat前端应用群ipc和后端vcp所有api的虚拟化包装，使得几乎完美复刻了pc桌面的所有功能，并可以轻易调用前端和后端的所有关键功能节点和数据节点。
-VCP桌面继承了Vchat的强大流式渲染器，可以渲染“任何”内容。
-
-在vchat中，可以直接通过流式输入来“流式生成”widget应用。
-
-直接流式输出注入widget
-```
+---VCP 桌面核心与流式渲染---
+VCP 桌面内核是一张空白 HTML 画布，具有 WinSDK、命令行等虚拟化，封装了 Vchat 前端及后端 VCP 所有 API。
+1. 流式输出直接生成或局部修改 DOM（内存运行，开头必须是白名单字符如 ['<!doctype', '<div', '<section', '<arnvas', '<svg', '<style', 'target:'];
+aside', '<canvas', '<svg', '<style', 'target:']，否则会被忽略。）：
 <<<[DESKTOP_PUSH]>>>
-<div style="padding:16px; background:rgba(0,0,0,0.5); color:#fff;">
-  <h2>标题</h2>
-  <p>内容</p>
-</div>
+<div style="padding:16px; background:rgba(0,0,0,0.5); color:#fff;"><h2>标题</h2></div>
 <<<[DESKTOP_PUSH_END]>>>
-```
-该方法可以创建诸如
-['<!doctype', '<div', '<section', '<article', '<main', '<header', '<nav', '<aside', '<canvas', '<svg', '<style', 'target:'];
-等等功能内容，支持几乎所有js类，尤其是对anime.js和three.js有强大优化。[需要注意推送的开头必须是以上白名单字符，否则会被忽略]
-
-利用流式输出编辑widget
-```
+或局部替换 DOM：
 <<<[DESKTOP_PUSH]>>>
 target:「始」.vw-temp-now「末」,
-replace:「始」<span style="font-size:52px;">22°C</span>「末」
+replace:「始」<span>22°C</span>「末」
 <<<[DESKTOP_PUSH_END]>>>
-```
-创建的widget直接运行在内存中，当用户选择收藏widget对应挂件会被持久化储存。
-被收藏的widget储存于VCPChat目录下的\AppData\DesktopWidgets目录，被储存的Widget允许调用同目录下的内部外挂js文件，且支持访问vchat应用群所有依赖，ipc。支持createRange、createComment、createDocumentFragment、addEventListener、removeEventListener、documentElement 等方法。
+2. 收藏：用户收藏的挂件持久化在 .\AppData\DesktopWidgets 目录。
+
+---NativeFileMount 文件映射卡片：DESKTOP_BUILTIN 协议---
+将用户本机文件夹映射为桌面文件管理卡片。使用 DESKTOP_BUILTIN 协议创建：
+<<<[DESKTOP_BUILTIN]>>>
+type: nativeFileMount
+title:「始」项目目录「末」
+mountPath:「始」D:\Projects\MyApp「末」
+mode: readonly
+width: 760
+height: 520
+<<<[DESKTOP_BUILTIN_END]>>>
+语法：
+- key: value 简单值，自动类型转换。支持点路径（如 frame.radius: 12, ui.layout.view: list）。
+- key:「始」内容「末」 块值，支持多行。
+- # 或 // 开头为注释行。
+- 外层容器与内置UI配置（frame.* / ui.*）：支持配置卡片外观与布局（非必需，若无定制可不写）。
+  * frame.transparent: true (背景透明无边框阴影) | background: rgba(0,0,0,0.5) | radius: 12 (圆角) | backdropFilter: blur(16px) (毛玻璃) | showGrip: true (拖拽条)
+  * ui.layout.view: list | grid | compact (视图模式) | showToolbar: true (工具栏) | showPath: true (路径栏)
+  * ui.theme.background: 背景色 | foreground: 前景色 | accent: 强调色 (支持标准 CSS 颜色字符串)
+  * ui.actions.toolbar: 自定义工具按钮 (标准ID: up,refresh,newFolder,copy,cut,paste,rename,trash,reveal,separator)
+- customUI：协议中存在 html/css/js 任一字段时自动启用，完全接管卡片内容区 Shadow DOM 渲染。
+- nfm API（注入 customUI 内部，路径均为挂载根目录内相对路径）：
+  nfm.getInfo() | nfm.list(path?, {limit, cursor, withMeta}) | nfm.open(path) | nfm.openWith(path) | nfm.reveal(path) | nfm.refresh() | nfm.copy(paths[]) | nfm.cut(paths[]) | nfm.paste(dir?, {conflictStrategy}) | nfm.clipboardPreview() | nfm.rename(path, newName) | nfm.trash(paths[]) | nfm.newFolder(parentDir?, name) | nfm.move(from, to, {conflictStrategy}) | nfm.copyTo(from, to, {conflictStrategy}) | nfm.resolve(relativePath) | nfm.relative(absolutePath) | nfm.confirm(options) | nfm.requestOperations(plan) | nfm.onChange(cb) | nfm.onJobProgress(cb) | nfm.onAgentRequest(cb)
+
+---卡片感知与源码级编辑（DESKTOP_WIDGET_EDIT）---
+系统将卡片升级为源码/包模型：htmlWidget (普通 HTML), nativeFileMount (文件映射卡片), desktopBuiltin (内置卡片)。支持源码级编辑及完整收藏恢复。
+1. 感知（通过 DesktopRemote 工具 RPC 查询）：
+   - QueryDesktop: 查询桌面卡片摘要、布局与版本。返回 widgets 列表 (含 id, type, title, saved, editable, sourceAvailable, sourceVersion, layoutVersion, widgetVersion, summary 等) 及 icons。
+   - QueryWidget: 查询单卡片详情。参数：{ widgetId, level: "summary"|"editable"|"source" }。level为 source 时返回完整源码、文件列表(多文件 HTML 包 files[])、外层布局等。
+2. 源码编辑（DESKTOP_WIDGET_EDIT）：
+   - 支持两种调用方式：
+     (a) 流式块模式：直接在聊天中输出 <<<[DESKTOP_WIDGET_EDIT]>>> ... <<<[DESKTOP_WIDGET_EDIT_END]>>>
+     (b) Tool RPC 模式：调用 DesktopRemote 插件的 EditWidget 或 DESKTOP_WIDGET_EDIT 命令。
+   - 核心参数：
+     - widgetId (必填): 卡片 ID。
+     - mode: "targetReplace" (局部替换，默认) | "replace" (整体替换)。
+     - sourceFormat: "inlineHtml" | "htmlPackage" | "desktopBuiltin" (NativeFileMount)。
+     - baseSourceVersion: 乐观锁版本号 (推荐，与当前 sourceVersion 不一致时会拒绝编辑，报 ERR_SOURCE_VERSION_CONFLICT)。
+     - persist: "runtime" (仅修改实例，默认) | "ask" (弹窗询问用户更新/保存收藏)。"silent" 暂禁用。
+     - targetFile: 可选，针对 htmlPackage 多文件卡片指定编辑的文件，默认为主入口 widget.html。
+     - source: "replace" 模式下的完整源码。
+     - target / replace: "targetReplace" 模式下的单处替换（块值）。
+     - 流式多处替换：流式块模式下，支持重复书写多组 target / replace 块，系统会自动解析为 replacements 数组执行严格替换（target 必须唯一且存在，任一失败则全部回滚）。
+3. 示例：
+   - 示例 1：流式局部替换 NativeFileMount 属性（多处替换）
+<<<[DESKTOP_WIDGET_EDIT]>>>
+widgetId:「始」nfm-f-drive「末」
+mode: targetReplace
+baseSourceVersion: 5
+target:「始」layout.view: list「末」
+replace:「始」layout.view: grid「末」
+target:「始」frame.radius: 12「末」
+replace:「始」frame.radius: 18「末」
+persist: ask
+<<<[DESKTOP_WIDGET_EDIT_END]>>>
+   - 示例 2：流式整体替换 HTML 卡片主入口源码
+<<<[DESKTOP_WIDGET_EDIT]>>>
+widgetId:「始」weather-card「末」
+mode: replace
+sourceFormat: htmlPackage
+source:「始」
+<style>.temp { color: #38bdf8; }</style>
+<div class="card">22°C</div>
+「末」
+persist: ask
+<<<[DESKTOP_WIDGET_EDIT_END]>>>
+
+当需要编辑内部包含「始」「末」等VCP指令语法的文件时，必须使用转义写入。
+即使用source:「始ESCAPE」 包裹包含VCP指令的内容 「末ESCAPE」。
+
+---Agent 协作：DesktopRemote 工具 RPC 速查---
+AI 可通过 DesktopRemote 插件调用以下命令：
+1. SetWallpaper: { wallpaperSource } - 设置壁纸。
+2. QueryDesktop: {} - 查询桌面摘要（返回 widgets 与 icons）。
+3. QueryDock: {} - 查询 Dock 栏应用与内置卡片状态。
+4. QueryWidget: { widgetId, level } - 查询卡片详情与源码（level: summary | editable | source）。
+5. EditWidget / DESKTOP_WIDGET_EDIT: { widgetId, mode, sourceFormat, baseSourceVersion, persist, targetFile, source, target, replace, replacements } - 编辑卡片。
+6. NativeFileMountAction: { widgetId, mountId, summary, operations[], risk } - 提交挂载操作。
+   - operations 支持: newFolder(parentDir, name) | move(from, to) | copy(from, to) | rename(from, newName) | trash(path)。
+7. QueryNativeFileMounts: {} - 查询活跃文件挂载卡片。
+
+注意：
+1. 不要将 <<<[DESKTOP_BUILTIN]>>> 或 <<<[DESKTOP_WIDGET_EDIT]>>> 协议块包裹在 Markdown 代码块 ``` 中，否则系统无法识别，仅作为普通文本显示。
+2. 乐观锁机制：编辑卡片时，强烈建议先 QueryWidget 获取最新 sourceVersion，并在编辑时带上 baseSourceVersion，防止并发覆盖。
+3.VCP桌面继承了Vchat的强大流式渲染器，可以渲染“任何”内容。支持几乎所有js类，尤其是对anime.js和three.js有强大优化

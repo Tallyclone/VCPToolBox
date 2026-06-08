@@ -30,45 +30,61 @@ VChatSyncCenter/
 ## 核心能力
 
 1. **中心数据库初始化与迁移**
+
    - `index.js` 通过 `buildRuntimeConfig()` 解析运行配置。
    - `ensureDatabase()` 初始化 SQLite 数据库并运行 migrations。
    - 默认数据库路径为 `./Plugin/VChatSyncCenter/data/vchat_data.db`。
    - 当前 `config_entities` 以 `(schema, entity_id, profile)` 为主键，确保 `bootstrap` 与 `runtime` 配置互不覆盖。
 
 2. **统一 Operation 写入口**
+
    - 桌面端、移动端应通过 `POST /operations` 提交结构化 operation。
    - 聊天历史同步以 `message create/update/delete` 等 message-level/entity-level 事件为准。
    - 禁止把 `history.json` 当作文件镜像或 JSON Patch 同步对象。
 
 3. **可靠增量拉取**
+
    - 客户端通过 `GET /changes?after_seq=...&limit=...` 拉取缺失事件。
    - 返回 `latest_seq`、`events`、`has_more` 和 `next_after_seq`。
    - WebSocket 只用于 latest_seq 通知，不能替代 REST 拉取。
 
 4. **设备注册与鉴权**
+
    - `POST /devices/register` 注册客户端设备。
    - API 通过同步密钥鉴权。
    - 同步密钥由 `VCHAT_SYNC_KEY` 配置，默认 `change-me` 仅用于占位，实际部署必须修改。
 
 5. **配置同步存储隔离**
-   - Center 接收配置 operation 时校验 `profile`、`projection_fields`、`safe_projection_json`。
-   - Runtime 配置必须携带 `projection_fields`。
-   - Center 会递归校验 `safe_projection_json`，拒绝未声明字段。
-   - Bootstrap 导出只导出 `profile='bootstrap'` 的配置基线，不会把 runtime 局部配置当全量基线导出。
+
+   - Center 接收配置 operation 时校验 `profile`、`projection_fields`、`deleted_fields`、`safe_projection_json`。
+   - Runtime 配置同步范围由客户端 Adapter 的 `sync_profile.json` 决定；Center 不再额外维护 agent/group runtime 字段黑名单。
+   - Runtime 配置必须携带 `projection_fields`，且字段仍必须属于 Center 的 bootstrap allowlist。
+   - Center 会递归校验 `safe_projection_json`，拒绝敏感 key，并拒绝未声明字段。
+   - `deleted_fields` 用于表达显式字段删除：字段必须已声明在 `projection_fields` 中，并且同样必须属于 bootstrap allowlist，不能命中敏感 key。
+   - Bootstrap 导出包含 `profile='bootstrap'` 与 `profile='runtime'` 的配置行，确保新设备加入后不会跳过历史 runtime 配置。
 
 6. **附件同步**
+
    - `POST /attachments` 支持 base64 或 multipart 上传。
    - `GET /attachments/:hash` 按内容 hash 下载附件。
    - 附件事实源存放在 `VCHAT_ATTACHMENT_DIR` 指向的目录。
 
 7. **备份、恢复与完整性检查**
+
    - `/backup/list`、`/backup/create`、`/backup/verify`、`/backup/restore` 提供中心库备份与恢复能力。
    - `/status` 返回数据库 WAL、完整性、迁移状态、表计数、备份状态和限制参数。
 
 8. **Bootstrap 支持**
+
    - `/bootstrap/import` 用于初始导入本地基线。
    - `/bootstrap/export` 用于客户端加入或合并时导出中心基线。
    - Bootstrap 接口同样需要高权限鉴权。
+
+9. **主题资源库同步**
+   - `theme_package` 表示主题 manifest、变量、extra_css 与 asset 引用关系，同步的是“主题资源库”，不是当前应用状态。
+   - `theme_package` 可以通过 `POST /operations` 或 `POST /themes` 提交，`upsert` 会作为 change_log action 原样保留。
+   - `theme_asset` 是二进制图片资源，只通过 `POST /themes/assets` 上传；`POST /operations` 不接收 `theme_asset`。
+   - 主题资源下载使用 `GET /themes/assets/:hash`，客户端必须校验 hash 后落盘。
 
 ## 主要 API
 
@@ -82,6 +98,10 @@ VChatSyncCenter/
 /api/plugins/VChatSyncCenter/conflicts
 /api/plugins/VChatSyncCenter/attachments
 /api/plugins/VChatSyncCenter/attachments/:hash
+/api/plugins/VChatSyncCenter/themes
+/api/plugins/VChatSyncCenter/themes/:theme_id
+/api/plugins/VChatSyncCenter/themes/assets
+/api/plugins/VChatSyncCenter/themes/assets/:hash
 /api/plugins/VChatSyncCenter/bootstrap/import
 /api/plugins/VChatSyncCenter/bootstrap/export
 /api/plugins/VChatSyncCenter/backup/list
@@ -100,23 +120,22 @@ Authorization: Bearer <VCHAT_SYNC_KEY>
 
 配置项来自 `plugin-manifest.json` 的 `configSchema`：
 
-| 配置项 | 默认值 | 说明 |
-| --- | --- | --- |
-| `VCHAT_SYNC_ENABLED` | `false` | 是否启用同步中心 |
-| `VCHAT_SYNC_HOST` | `127.0.0.1` | 同步服务主机标识 |
-| `VCHAT_SYNC_KEY` | `change-me` | 同步 API 鉴权密钥，部署时必须修改 |
-| `VCHAT_SYNC_REQUIRE_DEVICE_BINDING` | `true` | 是否要求设备绑定 |
-| `VCHAT_SYNC_WS_ENABLED` | `false` | 是否启用 latest_seq WebSocket 通知 |
-| `VCHAT_DB_PATH` | `./Plugin/VChatSyncCenter/data/vchat_data.db` | SQLite 中心库路径 |
-| `VCHAT_ATTACHMENT_DIR` | `./Plugin/VChatSyncCenter/data/vchat_attachments` | 附件对象存储目录 |
-| `VCHAT_BACKUP_DIR` | `./Plugin/VChatSyncCenter/data/backups` | 备份目录 |
-| `VCHAT_BACKUP_INTERVAL` | `6h` | 自动备份周期 |
-| `VCHAT_BACKUP_RETENTION_DAYS` | `30` | 备份保留天数 |
-| `VCHAT_RELEASE_MODE` | `mvp-local-only` | 发布/能力分层标记 |
-| `VCHAT_SYNC_MAX_LIMIT` | `5000` | changes/export 最大分页限制 |
-| `VCHAT_SYNC_MAX_JSON_BODY_MB` | `20` | JSON 请求体大小限制 |
-| `VCHAT_SYNC_MAX_ATTACHMENT_MB` | `512` | 附件大小限制 |
-| `DebugMode` | `false` | 调试日志开关 |
+| 配置项                              | 默认值                                            | 说明                               |
+| ----------------------------------- | ------------------------------------------------- | ---------------------------------- |
+| `VCHAT_SYNC_ENABLED`                | `false`                                           | 是否启用同步中心                   |
+| `VCHAT_SYNC_HOST`                   | `127.0.0.1`                                       | 同步服务主机标识                   |
+| `VCHAT_SYNC_KEY`                    | `change-me`                                       | 同步 API 鉴权密钥，部署时必须修改  |
+| `VCHAT_SYNC_REQUIRE_DEVICE_BINDING` | `true`                                            | 是否要求设备绑定                   |
+| `VCHAT_SYNC_WS_ENABLED`             | `false`                                           | 是否启用 latest_seq WebSocket 通知 |
+| `VCHAT_DB_PATH`                     | `./Plugin/VChatSyncCenter/data/vchat_data.db`     | SQLite 中心库路径                  |
+| `VCHAT_ATTACHMENT_DIR`              | `./Plugin/VChatSyncCenter/data/vchat_attachments` | 附件对象存储目录                   |
+| `VCHAT_BACKUP_DIR`                  | `./Plugin/VChatSyncCenter/data/backups`           | 备份目录                           |
+| `VCHAT_BACKUP_INTERVAL`             | `6h`                                              | 自动备份周期                       |
+| `VCHAT_BACKUP_RETENTION_DAYS`       | `30`                                              | 备份保留天数                       |
+| `VCHAT_RELEASE_MODE`                | `mvp-local-only`                                  | 发布/能力分层标记                  |
+| `VCHAT_SYNC_MAX_LIMIT`              | `5000`                                            | changes/export 最大分页限制        |
+| `VCHAT_SYNC_MAX_ATTACHMENT_MB`      | `512`                                             | 附件大小限制                       |
+| `DebugMode`                         | `false`                                           | 调试日志开关                       |
 
 ## 数据库与 migration 说明
 
@@ -150,9 +169,13 @@ PRIMARY KEY (schema, entity_id, profile)
 
 - 不同步 API Key、token、Cookie、密码、本机路径、端口等敏感或设备本地字段。
 - 消息唯一身份必须包含 `item_type + item_id + topic_id + message_id`，不能只使用 `message.id`。
-- Runtime 配置 operation 必须携带 `projection_fields`。
-- `safe_projection_json` 会递归校验，未声明字段会被拒绝。
-- Bootstrap 导出只导出 `profile='bootstrap'` 配置，防止 runtime 局部配置污染新设备基线。
+- Runtime 配置同步范围由客户端 Adapter 决定；Center 仅做协议底线校验，不对 agent/group runtime 字段设置额外 denylist。
+- Runtime 配置 operation 必须携带 `projection_fields`，且 `projection_fields` 只能包含 Center bootstrap allowlist 内字段。
+- Runtime 字段删除必须显式写入 `deleted_fields`；缺失字段本身不再作为可靠删除语义。
+- `deleted_fields` 中的字段必须同时存在于 `projection_fields`，并通过 bootstrap allowlist 与敏感 key 校验。
+- `safe_projection_json` 会递归校验，敏感 key 和未声明字段都会被拒绝。
+- Bootstrap 导出包含 `bootstrap` 与 `runtime` profile 配置，防止新设备 join_existing 后跳过历史 runtime 配置。
+- Bootstrap 的主题资源只导入/导出 asset metadata，不内嵌二进制；导入后如果 `binary_available=false`，客户端必须从源 Center 按 `/themes/assets/:hash` 拉取二进制，再上传到目标 Center 或写入本地主题库。
 - WebSocket 只发 latest_seq 通知；客户端必须通过 REST 补拉事件。
 - 所有高风险接口会记录审计日志。
 - 备份和恢复接口会影响中心事实源，生产环境应严格控制访问权限。

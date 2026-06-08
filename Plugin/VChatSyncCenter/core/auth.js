@@ -24,14 +24,14 @@ function validateSyncAuth(runtime, req) {
   if (!configuredKey || configuredKey === "change-me") {
     return {
       ok: false,
-      status: 403,
+      status: 401,
       error: "VChatSyncCenter sync key is not configured",
     };
   }
 
   const token = readBearerToken(req);
   if (!timingSafeEqualString(token, configuredKey)) {
-    return { ok: false, status: 403, error: "Forbidden" };
+    return { ok: false, status: 401, error: "authorization failed" };
   }
 
   return { ok: true };

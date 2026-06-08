@@ -14,7 +14,9 @@
     "protocol": "stdio"
   },
   "configSchema": {
-    "VOLCENGINE_API_KEY": "string"
+    "VOLCENGINE_API_KEY": "string",
+    "BASE_URL": "string",
+    "MODEL_ID": "string"
   },
   "capabilities": {
     "invocationCommands": [

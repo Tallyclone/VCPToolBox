@@ -2,6 +2,15 @@ const crypto = require("crypto");
 const { getLatestSeq, getOperationResult } = require("./changeLog");
 const { applyCreate, applyUpdate, applyDelete } = require("./messageService");
 const { applyConfigOperation } = require("./configService");
+const { applyEntityDelete } = require("./deleteService");
+const {
+  applyTopicUpsert,
+  applyTopicOrderMove,
+  applyTopicOrderReplace,
+} = require("./topicService");
+const { applyAvatarOperation } = require("./avatarService");
+const { applyThemePackageOperation } = require("./themeService");
+const { CONFIG_SCHEMAS } = require("./configSchema");
 const { safeJsonStringify } = require("../utils/safeJson");
 
 function hashDeviceKey(deviceKey) {
@@ -44,6 +53,13 @@ ON CONFLICT(id) DO UPDATE SET
   };
 }
 
+function isConfigEntityType(entityType) {
+  return Object.prototype.hasOwnProperty.call(
+    CONFIG_SCHEMAS,
+    String(entityType || "")
+  );
+}
+
 function validateOperation(operation) {
   if (!operation || typeof operation !== "object")
     throw new Error("operation body is required");
@@ -51,18 +67,60 @@ function validateOperation(operation) {
   if (!operation.device_id) throw new Error("device_id is required");
   const entityType = operation.entity_type || operation.type;
   const action = operation.action || operation.operation;
-  const isConfig =
-    String(entityType || "").includes("config") || entityType === "settings";
-  if (entityType !== "message" && !isConfig)
-    throw new Error("only message/config operations are supported");
+  const isConfig = isConfigEntityType(entityType);
+  const isSoftDeleteEntity =
+    entityType === "item" ||
+    entityType === "topic" ||
+    entityType === "topic_history" ||
+    entityType === "group_member";
+  const isAvatar = entityType === "avatar";
+  const isThemePackage = entityType === "theme_package";
+  const isTopicOrder = entityType === "topic_order";
+  if (
+    entityType !== "message" &&
+    !isConfig &&
+    !isSoftDeleteEntity &&
+    !isAvatar &&
+    !isThemePackage &&
+    !isTopicOrder
+  )
+    throw new Error(
+      "only message/config/item/topic/topic_history/group_member/avatar/theme_package/topic_order operations are supported"
+    );
   if (
     entityType === "message" &&
     !["create", "update", "delete"].includes(action)
   )
     throw new Error("unsupported message action");
-  if (isConfig && !["create", "update"].includes(action))
+  if (isConfig && !["create", "update", "delete"].includes(action))
     throw new Error("unsupported config action");
-  return { ...operation, entity_type: entityType, action };
+  if (
+    entityType === "topic" &&
+    !["create", "update", "upsert", "delete"].includes(action)
+  )
+    throw new Error("unsupported topic action");
+  if (isSoftDeleteEntity && entityType !== "topic" && action !== "delete")
+    throw new Error("unsupported item/topic_history/group_member action");
+  if (isTopicOrder && !["move", "replace"].includes(action))
+    throw new Error("unsupported topic_order action");
+  if (isAvatar && !["create", "update", "delete", "upsert"].includes(action))
+    throw new Error("unsupported avatar action");
+  if (
+    isThemePackage &&
+    !["create", "update", "delete", "upsert"].includes(action)
+  )
+    throw new Error("unsupported theme_package action");
+  const normalizedAction =
+    entityType === "topic" || isTopicOrder || isThemePackage
+      ? action
+      : action === "upsert"
+      ? "update"
+      : action;
+  return {
+    ...operation,
+    entity_type: entityType,
+    action: normalizedAction,
+  };
 }
 
 function ensureRegisteredDevice(db, operation, options = {}) {
@@ -80,10 +138,31 @@ function processOperation(db, input, options = {}) {
     if (previous) return previous;
 
     ensureRegisteredDevice(db, operation, options);
-    const isConfig =
-      String(operation.entity_type || "").includes("config") ||
-      operation.entity_type === "settings";
-    if (isConfig) return applyConfigOperation(db, operation);
+    if (isConfigEntityType(operation.entity_type)) {
+      return applyConfigOperation(db, operation);
+    }
+    if (operation.entity_type === "avatar") {
+      return applyAvatarOperation(db, operation);
+    }
+    if (operation.entity_type === "theme_package") {
+      return applyThemePackageOperation(db, operation);
+    }
+    if (operation.entity_type === "topic_order") {
+      if (operation.action === "move")
+        return applyTopicOrderMove(db, operation);
+      return applyTopicOrderReplace(db, operation);
+    }
+    if (operation.entity_type === "topic" && operation.action !== "delete") {
+      return applyTopicUpsert(db, operation);
+    }
+    if (
+      operation.entity_type === "item" ||
+      operation.entity_type === "topic" ||
+      operation.entity_type === "topic_history" ||
+      operation.entity_type === "group_member"
+    ) {
+      return applyEntityDelete(db, operation);
+    }
     if (operation.action === "create") return applyCreate(db, operation);
     if (operation.action === "update") return applyUpdate(db, operation);
     return applyDelete(db, operation);

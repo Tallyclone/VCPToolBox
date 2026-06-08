@@ -1,0 +1,15 @@
+{
+  "keyPool": {
+    "currentIndex": 0,
+    "keys": [
+      {
+        "key": "your_api_key_here",
+        "active": true,
+        "errorCount": 1,
+        "maxErrors": 3,
+        "lastError": "2026-06-05T08:10:56.109Z",
+        "lastErrorType": "auth_failed"
+      }
+    ]
+  }
+}

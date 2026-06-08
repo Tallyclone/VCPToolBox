@@ -28,8 +28,10 @@ function getOperationResult(db, operationId) {
       ? "message already exists with different checksum"
       : undefined,
     entity_type: row.entity_type,
+    entity_id: row.entity_id,
     action: row.action,
     version: row.version,
+    payload,
   };
 }
 
@@ -57,6 +59,23 @@ VALUES (@operation_id, @device_id, @item_type, @item_id, @topic_id, @entity_type
   return Number(info.lastInsertRowid);
 }
 
+function mapChangeRow(row) {
+  return {
+    seq: Number(row.seq),
+    operation_id: row.operation_id,
+    device_id: row.device_id,
+    item_type: row.item_type,
+    item_id: row.item_id,
+    topic_id: row.topic_id,
+    entity_type: row.entity_type,
+    entity_id: row.entity_id,
+    action: row.action,
+    version: row.version,
+    payload: safeJsonParse(row.payload_json, null),
+    created_at: row.created_at,
+  };
+}
+
 function getChanges(db, afterSeq = 0, limit = 1000) {
   const rows = db
     .prepare(
@@ -70,20 +89,58 @@ LIMIT ?
     )
     .all(Number(afterSeq || 0), Number(limit || 1000));
 
-  return rows.map((row) => ({
-    seq: Number(row.seq),
-    operation_id: row.operation_id,
-    device_id: row.device_id,
-    item_type: row.item_type,
-    item_id: row.item_id,
-    topic_id: row.topic_id,
-    entity_type: row.entity_type,
-    entity_id: row.entity_id,
-    action: row.action,
-    version: row.version,
-    payload: safeJsonParse(row.payload_json, null),
-    created_at: row.created_at,
-  }));
+  return rows.map(mapChangeRow);
+}
+
+function getCompactedChanges(db, afterSeq = 0, limit = 1000) {
+  const normalizedAfterSeq = Number(afterSeq || 0);
+  const normalizedLimit = Number(limit || 1000);
+  const rows = db
+    .prepare(
+      `
+WITH compacted_events AS (
+  SELECT
+    latest_seq AS seq,
+    NULL AS operation_id,
+    latest_device_id AS device_id,
+    item_type,
+    item_id,
+    topic_id,
+    'topic_order' AS entity_type,
+    topic_id AS entity_id,
+    'move' AS action,
+    NULL AS version,
+    json_object(
+      'mode', 'move_to_front',
+      'source', 'activity',
+      'activity_at', activity_at,
+      'compacted', 1,
+      'applied', 1
+    ) AS payload_json,
+    updated_at AS created_at
+  FROM topic_activity_state
+  WHERE latest_seq > ?
+), ordinary_events AS (
+  SELECT seq, operation_id, device_id, item_type, item_id, topic_id, entity_type, entity_id, action, version, payload_json, created_at
+  FROM change_log
+  WHERE seq > ?
+    AND NOT (
+      entity_type = 'topic_order'
+      AND action = 'move'
+      AND payload_json LIKE '%"source":"activity"%'
+      AND payload_json LIKE '%"mode":"move_to_front"%'
+    )
+)
+SELECT * FROM ordinary_events
+UNION ALL
+SELECT * FROM compacted_events
+ORDER BY seq ASC
+LIMIT ?
+`
+    )
+    .all(normalizedAfterSeq, normalizedAfterSeq, normalizedLimit);
+
+  return rows.map(mapChangeRow);
 }
 
 module.exports = {
@@ -91,4 +148,5 @@ module.exports = {
   getOperationResult,
   appendChange,
   getChanges,
+  getCompactedChanges,
 };

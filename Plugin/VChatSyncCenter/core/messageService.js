@@ -3,16 +3,10 @@ const { safeJsonParse, safeJsonStringify } = require("../utils/safeJson");
 const { appendChange } = require("./changeLog");
 const { recordConflict } = require("./conflictService");
 const { ensureItem } = require("./itemService");
-const { ensureTopic } = require("./topicService");
+const { getTombstone, insertTombstone } = require("./deleteService");
 
 function nowIso() {
   return new Date().toISOString();
-}
-
-function plusDaysIso(days) {
-  const date = new Date();
-  date.setUTCDate(date.getUTCDate() + days);
-  return date.toISOString();
 }
 
 function messageKey(input) {
@@ -169,6 +163,138 @@ WHERE item_type = ? AND item_id = ? AND topic_id = ? AND id = ?
     .get(identity.item_type, identity.item_id, identity.topic_id, identity.id);
 }
 
+function getDeletedParent(db, identity) {
+  const itemEntityKey = `${identity.item_type}:${identity.item_id}`;
+  const topicEntityKey = `${identity.item_type}:${identity.item_id}:${identity.topic_id}`;
+  const item = db
+    .prepare("SELECT deleted FROM items WHERE item_type = ? AND item_id = ?")
+    .get(identity.item_type, identity.item_id);
+  if (item && Number(item.deleted || 0) === 1) {
+    return {
+      entity_type: "item",
+      entity_key: itemEntityKey,
+    };
+  }
+  if (getTombstone(db, "item", itemEntityKey)) {
+    return {
+      entity_type: "item",
+      entity_key: itemEntityKey,
+    };
+  }
+  const topic = db
+    .prepare(
+      "SELECT deleted FROM topics WHERE item_type = ? AND item_id = ? AND id = ?"
+    )
+    .get(identity.item_type, identity.item_id, identity.topic_id);
+  if (topic && Number(topic.deleted || 0) === 1) {
+    return {
+      entity_type: "topic",
+      entity_key: topicEntityKey,
+    };
+  }
+  if (getTombstone(db, "topic", topicEntityKey)) {
+    return {
+      entity_type: "topic",
+      entity_key: topicEntityKey,
+    };
+  }
+  return null;
+}
+
+function requireActiveTopic(db, identity) {
+  const topicEntityKey = `${identity.item_type}:${identity.item_id}:${identity.topic_id}`;
+  const topic = db
+    .prepare(
+      "SELECT deleted FROM topics WHERE item_type = ? AND item_id = ? AND id = ?"
+    )
+    .get(identity.item_type, identity.item_id, identity.topic_id);
+  if (!topic) {
+    const error = new Error("message parent topic does not exist");
+    error.code = "MESSAGE_TOPIC_MISSING";
+    error.details = {
+      parent: {
+        entity_type: "topic",
+        entity_key: topicEntityKey,
+        item_type: identity.item_type,
+        item_id: identity.item_id,
+        topic_id: identity.topic_id,
+      },
+      message: {
+        entity_type: "message",
+        entity_key: messageKey(identity),
+        message_id: identity.id,
+      },
+      retry_hint: "submit topic upsert before retrying this message operation",
+    };
+    throw error;
+  }
+  if (
+    Number(topic.deleted || 0) === 1 ||
+    getTombstone(db, "topic", topicEntityKey)
+  ) {
+    const error = new Error("message parent topic is deleted");
+    error.code = "MESSAGE_TOPIC_DELETED";
+    error.details = {
+      parent: {
+        entity_type: "topic",
+        entity_key: topicEntityKey,
+        item_type: identity.item_type,
+        item_id: identity.item_id,
+        topic_id: identity.topic_id,
+      },
+      message: {
+        entity_type: "message",
+        entity_key: messageKey(identity),
+        message_id: identity.id,
+      },
+    };
+    throw error;
+  }
+  return topic;
+}
+
+function rejectDeletedMessageCreate(
+  db,
+  operation,
+  identity,
+  entityKey,
+  current,
+  reason
+) {
+  recordConflict(db, {
+    operation_id: operation.operation_id,
+    device_id: operation.device_id,
+    entity_type: "message",
+    entity_key: entityKey,
+    incoming: identity.message,
+    current: rowToMessage(current),
+    resolution: "delete_wins",
+  });
+  const seq = appendChange(db, {
+    ...operation,
+    item_type: identity.item_type,
+    item_id: identity.item_id,
+    topic_id: identity.topic_id,
+    entity_type: "message",
+    entity_id: identity.id,
+    action: "create_rejected_deleted",
+    version: current ? current.version : null,
+    payload: {
+      message: identity.message,
+      conflict: true,
+      deleted: true,
+      reason,
+    },
+  });
+  return {
+    ok: true,
+    seq,
+    conflict: true,
+    deleted: true,
+    resolution: "delete_wins",
+  };
+}
+
 function filterExistingAttachments(db, attachments) {
   const skipped = [];
   const existing = [];
@@ -249,19 +375,6 @@ function applyCreate(db, operation) {
   let identity = normalizeMessagePayload(operation);
   rejectPlaceholderMessage(identity.message);
   identity = normalizeAndSanitizeMessage(identity);
-  ensureItem(
-    db,
-    identity.item_type,
-    identity.item_id,
-    operation.payload && operation.payload.item
-  );
-  ensureTopic(
-    db,
-    identity.item_type,
-    identity.item_id,
-    identity.topic_id,
-    operation.payload && operation.payload.topic
-  );
 
   const rawJson = safeJsonStringify(identity.message);
   const checksum = sha256(rawJson || "");
@@ -269,6 +382,16 @@ function applyCreate(db, operation) {
   const entityKey = messageKey(identity);
 
   if (existing) {
+    if (Number(existing.deleted || 0) === 1) {
+      return rejectDeletedMessageCreate(
+        db,
+        operation,
+        identity,
+        entityKey,
+        existing,
+        "message_deleted"
+      );
+    }
     if (existing.checksum === checksum) {
       const seq = appendChange(db, {
         ...operation,
@@ -325,6 +448,36 @@ function applyCreate(db, operation) {
       error: "message already exists with different checksum",
     };
   }
+
+  if (getTombstone(db, "message", entityKey)) {
+    return rejectDeletedMessageCreate(
+      db,
+      operation,
+      identity,
+      entityKey,
+      null,
+      "message_tombstone"
+    );
+  }
+  const deletedParent = getDeletedParent(db, identity);
+  if (deletedParent) {
+    return rejectDeletedMessageCreate(
+      db,
+      operation,
+      identity,
+      entityKey,
+      null,
+      `${deletedParent.entity_type}_deleted`
+    );
+  }
+  requireActiveTopic(db, identity);
+
+  ensureItem(
+    db,
+    identity.item_type,
+    identity.item_id,
+    operation.payload && operation.payload.item
+  );
 
   db.prepare(
     `
@@ -388,7 +541,12 @@ function applyUpdate(db, operation) {
   identity = normalizeAndSanitizeMessage(identity);
   const current = getMessage(db, identity);
   const entityKey = messageKey(identity);
-  if (!current) throw new Error("message update target does not exist");
+  requireActiveTopic(db, identity);
+  if (!current) {
+    const error = new Error("message update target does not exist");
+    error.code = "MESSAGE_UPDATE_TARGET_MISSING";
+    throw error;
+  }
 
   if (Number(current.deleted || 0) === 1) {
     recordConflict(db, {
@@ -515,7 +673,7 @@ function applyDelete(db, operation) {
   });
   const current = getMessage(db, identity);
   const deletedAt = payload.deleted_at || nowIso();
-  const retainUntil = payload.retain_until || plusDaysIso(30);
+  const retainUntil = payload.retain_until || null;
   const entityKey = messageKey(identity);
 
   if (current) {
@@ -534,20 +692,18 @@ WHERE item_type = ? AND item_id = ? AND topic_id = ? AND id = ?
     );
   }
 
-  db.prepare(
-    `
-INSERT INTO tombstones(operation_id, device_id, entity_type, entity_key, reason, payload_json, deleted_at, retain_until)
-VALUES (?, ?, 'message', ?, ?, ?, ?, ?)
-`
-  ).run(
-    operation.operation_id,
-    operation.device_id || null,
-    entityKey,
-    payload.reason || "delete",
-    safeJsonStringify(payload),
-    deletedAt,
-    retainUntil
-  );
+  insertTombstone(db, {
+    operation_id: operation.operation_id,
+    device_id: operation.device_id,
+    entity_type: "message",
+    entity_key: entityKey,
+    reason: payload.reason || "delete",
+    payload,
+    deleted_at: deletedAt,
+    retain_until: retainUntil,
+    snapshot: rowToMessage(current),
+    base_version: current ? Number(current.version || 0) : null,
+  });
 
   const seq = appendChange(db, {
     ...operation,
