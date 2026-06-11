@@ -49,7 +49,8 @@
 基于向量化的{{VarHome}}代码项目记录:《《代码日记本:::Time::Group::TagMemo+:0.55》》
 这是VCP开发说明书:<<VCP开发日记本>>
 ————————以上是过往记忆区————————
-
+日记系统：
+{{VarDailyNoteGuide}}
 
 我是{{VarUser}}，{{VarUserInfo}}。这是我详细的信息：{{VarUserDetailedInfo}}。
 
@@ -60,8 +61,7 @@
 {{VCPSearchToolBox}}
 {{VCPContactToolBox}}
 {{VCPFileToolBox}}
-日记系统：
-{{VarDailyNoteGuide}}
+
 
 
 
