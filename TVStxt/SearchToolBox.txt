@@ -6,7 +6,7 @@
 tool_name:「始」VSearch「末」,
 SearchTopic:「始」探讨AI在医疗诊断中的最新应用「末」,// 检索的目标主题或研究背景，帮助AI理解搜索意图
 Keywords:「始」AI medical diagnosis 2024, 深度学习 医疗影像 突破, transformer models in healthcare「末」,//具体的检索关键词，多个关键词请用逗号或换行分隔。
-SearchMode:「始」grounding「末」,  // 可选, 默认'kimisearch': 搜索模式。可选值: 'grounding' (Google搜索), 'grok' (Grok内置搜索), 'tavily' (Tavily外部搜索), 'kimisearch' (Kimi Search 外部搜索)。
+SearchMode:「始」grounding「末」,  // 可选, 默认'kimisearch'。可选值: 'grounding' (Gemini-Google搜索-快), 'grok' (Grok推理级搜索-缓慢-支持舆论媒体搜索-注意偏见), 'tavily' (Tavily外部广泛搜索), 'kimisearch' (Kimi Search数据库搜索)。
 ShowURL:「始」false「末」,// 布尔值, 可选, 默认false
 ink:「始」mark_history「末」 //可选，是否将检索结果写入history.json，一般不用
 
@@ -14,10 +14,7 @@ ink:「始」mark_history「末」 //可选，是否将检索结果写入history
 用于获取特定网页、在线文件或本地文件的文本/快照。
 tool_name:「始」UrlFetch「末」,
 url:「始」(必需) 网页/文件 URL (本地路径请以 file:// 开头)「末」, 
-mode:「始」(可选) 'text' (默认) 或 'snapshot' (多模态网页快照)「末」
-
-额外小技巧，使用JinaAPI讲HTML转化为MD格式 例如 https://r.jina.ai/https://www.bilibili.com 格式，可以把任意网页以MD文档的方式请求。
-
+mode:「始」(可选) 'text' (默认) 或 'snapshot' (多模态网页快照) 或 'jina' (AI级网页转md，推荐该模式) 或 'image' (读取网络图片)「末」
 
 [===vcp_fold:0.3===]
 
@@ -42,6 +39,7 @@ action:「始」get_up_videos「末」,
 mid:「始」用户 ID「末」,
 pn:「始」1「末」
 
+[===vcp_fold:0.5===]
 
 ## 4.调查github仓库源码和使用方法
 ### 1. 获取文档目录结构
@@ -95,15 +93,39 @@ url: owner1/repo1, owner2/repo2
 question: 详细分析这两个项目的完整通信架构
 deep_research: true
 
-[===vcp_fold:0.5===]
-
-## 4. 全能联网搜索 (TavilySearch)
+## 5. 全能联网搜索 (TavilySearch)
 AI 专属搜索引擎。支持搜图和原始网页内容转化。
 tool_name:「始」TavilySearch「末」,
 query:「始」(必需) 搜索关键词「末」,
 topic:「始」general / news / finance「末」,
 search_depth:「始」advanced「末」, //语义搜索模式
 include_raw_content:「始」'markdown'「末」 //获取原始内容
+
+## 6. 专业级信息深度垂直检索，AnySearch，支持1000并发的超级聚类爬虫
+调用 AnySearch 进行实时搜索、垂直领域搜索、批量搜索、领域目录查询或网页正文提取。
+参数:
+- command/action (string, 可选, 默认 search): search、list_domains、batch_search、extract。
+- query/q/text (string, search 必需): 搜索词。垂直搜索时必须遵循 list_domains 返回的 query_format。
+- domain (string, 可选): 垂直领域，如 finance、academic、security、code、tech、legal 等。
+- sub_domain (string, 垂直搜索建议/通常必需): 子领域路由，如 finance.us_stock、academic.doi、security.cve。
+- sub_domain_params (object|string, 可选): 子领域额外参数。
+- content_types (string|array, 可选): web、news、code、doc、academic、data、image、video、audio。
+- zone (string, 可选): cn 或 intl；当 list_domains 标记 zone=CN 时必须传 cn。
+- max_results (integer, 可选): 结果数量，范围 1-100。
+- freshness (string, 可选): day、week、month、year。
+- domains (string|array, list_domains 可选): 批量查询最多 5 个领域；与 domain 二选一。
+- queries (array|string, batch_search 必需): 1-5 个查询对象或字符串。
+- url (string, extract 必需): 需要提取正文的网页 URL。
+调用格式示例:
+
+tool_name:「始」AnySearch「末」,
+command:「始」search「末」,
+query:「始」AI regulation 2026「末」,
+content_types:「始」news「末」,
+freshness:「始」week「末」,
+max_results:「始」5「末」
+
+复杂垂直搜索前建议先调用 list_domains 获取 sub_domain、query_format、params_schema 和 zone 约束。
 
 [===vcp_fold:0.7===]
 

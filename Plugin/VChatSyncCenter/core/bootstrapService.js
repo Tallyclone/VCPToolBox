@@ -4,7 +4,7 @@ const { applyCreate } = require("./messageService");
 const { applyConfigOperation } = require("./configService");
 const { applyAvatarOperation } = require("./avatarService");
 const { ensureItem } = require("./itemService");
-const { applyTopicUpsert } = require("./topicService");
+const { applyTopicUpsert, ORDER_RANK_STEP } = require("./topicService");
 const {
   listThemeAssets,
   upsertThemePackage,
@@ -205,6 +205,10 @@ function loadTopicsForConfigExport(db, owner) {
           row.order_rank === undefined || row.order_rank === null
             ? null
             : Number(row.order_rank),
+        order_version:
+          row.order_version === undefined || row.order_version === null
+            ? 0
+            : Number(row.order_version),
         msg_count:
           row.msg_count === undefined || row.msg_count === null
             ? undefined
@@ -213,6 +217,7 @@ function loadTopicsForConfigExport(db, owner) {
         updated_at: row.updated_at,
         content_updated_at: row.content_updated_at,
         order_updated_at: row.order_updated_at,
+        order_device_id: row.order_device_id,
       };
     });
 }
@@ -246,11 +251,11 @@ function deriveBootstrapTopicsFromConfigs(db, configs, deviceId) {
       title: dto.name || owner.item_id,
       source: "bootstrap_config_topics",
     });
-    for (const topic of topics) {
+    topics.forEach((topic, index) => {
       const topicId = topic && (topic.id || topic.topic_id || topic.topicId);
-      if (!topicId) continue;
+      if (!topicId) return;
       const key = `${owner.item_type}:${owner.item_id}:${topicId}`;
-      if (seen.has(key)) continue;
+      if (seen.has(key)) return;
       seen.add(key);
       applyTopicUpsert(db, {
         operation_id: `bootstrap.topic.${deviceId || "unknown"}.${
@@ -263,9 +268,14 @@ function deriveBootstrapTopicsFromConfigs(db, configs, deviceId) {
         item_id: owner.item_id,
         topic_id: topicId,
         action: "upsert",
-        payload: { topic },
+        payload: {
+          topic: {
+            ...topic,
+            order_rank: index * ORDER_RANK_STEP,
+          },
+        },
       });
-    }
+    });
   }
   return seen.size;
 }
@@ -579,6 +589,10 @@ function exportBaseline(runtime, options = {}) {
         row.order_rank === undefined || row.order_rank === null
           ? null
           : Number(row.order_rank),
+      order_version:
+        row.order_version === undefined || row.order_version === null
+          ? 0
+          : Number(row.order_version),
       msg_count:
         row.msg_count === undefined || row.msg_count === null
           ? undefined
@@ -587,6 +601,7 @@ function exportBaseline(runtime, options = {}) {
       updated_at: row.updated_at,
       content_updated_at: row.content_updated_at,
       order_updated_at: row.order_updated_at,
+      order_device_id: row.order_device_id,
     };
   });
 

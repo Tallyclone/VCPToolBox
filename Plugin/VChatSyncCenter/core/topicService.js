@@ -1,5 +1,7 @@
 const { appendChange } = require("./changeLog");
 
+const ORDER_RANK_STEP = 1000000;
+
 function normalizeMetadata(metadata) {
   return metadata && typeof metadata === "object" && !Array.isArray(metadata)
     ? metadata
@@ -25,6 +27,13 @@ function nowExpr() {
   return "strftime('%Y-%m-%dT%H:%M:%fZ','now')";
 }
 
+function nextOrderVersion(db) {
+  const info = db
+    .prepare("INSERT INTO topic_order_versions DEFAULT VALUES")
+    .run();
+  return Number(info.lastInsertRowid);
+}
+
 function minOrderRank(db, itemType, itemId) {
   const row = db
     .prepare(
@@ -33,11 +42,12 @@ function minOrderRank(db, itemType, itemId) {
     .get(itemType, itemId);
   return row && row.min_rank !== null && row.min_rank !== undefined
     ? Number(row.min_rank)
-    : 1000;
+    : null;
 }
 
 function nextFrontRank(db, itemType, itemId) {
-  return minOrderRank(db, itemType, itemId) - 1000;
+  const minRank = minOrderRank(db, itemType, itemId);
+  return minRank === null ? 0 : minRank - ORDER_RANK_STEP;
 }
 
 function ensureTopic(db, itemType, itemId, topicId, metadata = {}) {
@@ -47,16 +57,38 @@ function ensureTopic(db, itemType, itemId, topicId, metadata = {}) {
     id: String(topicId),
   };
   const title = topicTitleOf(topic, topicId);
-  const orderRank = nextFrontRank(db, itemType, itemId);
+  const existing = db
+    .prepare(
+      "SELECT order_rank, order_version FROM topics WHERE item_type = ? AND item_id = ? AND id = ?"
+    )
+    .get(itemType, itemId, topicId);
+  const orderRank =
+    existing &&
+    existing.order_rank !== null &&
+    existing.order_rank !== undefined
+      ? Number(existing.order_rank)
+      : nextFrontRank(db, itemType, itemId);
+  const orderVersion =
+    existing && Number(existing.order_version || 0) > 0
+      ? Number(existing.order_version)
+      : nextOrderVersion(db);
   db.prepare(
     `
-INSERT INTO topics(item_id, item_type, id, title, metadata_json, order_rank, deleted, content_updated_at, order_updated_at)
-VALUES (?, ?, ?, ?, ?, ?, 0, ${nowExpr()}, ${nowExpr()})
+INSERT INTO topics(item_id, item_type, id, title, metadata_json, order_rank, order_version, deleted, content_updated_at, order_updated_at)
+VALUES (?, ?, ?, ?, ?, ?, ?, 0, ${nowExpr()}, ${nowExpr()})
 ON CONFLICT(item_id, item_type, id) DO UPDATE SET
   updated_at = ${nowExpr()}
 WHERE topics.deleted = 0
 `
-  ).run(itemId, itemType, topicId, title, JSON.stringify(topic), orderRank);
+  ).run(
+    itemId,
+    itemType,
+    topicId,
+    title,
+    JSON.stringify(topic),
+    orderRank,
+    orderVersion
+  );
 }
 
 function normalizeTopicOperation(operation) {
@@ -132,7 +164,6 @@ function applyTopicUpsert(db, operation) {
 
   if (incomingNameSource === "generated") {
     if (currentNameSource === "generated" || currentNameSource === "manual") {
-      // generated 标题 first-wins：已有 generated/manual 名称时，后到 generated 不覆盖。
       nextTopic.name =
         currentMeta.name ||
         currentMeta.title ||
@@ -161,18 +192,38 @@ function applyTopicUpsert(db, operation) {
   }
 
   const nextVersion = current ? Number(current.version || 0) + 1 : 1;
-  const orderRank =
-    current && current.order_rank !== null && current.order_rank !== undefined
-      ? Number(current.order_rank)
-      : nextFrontRank(db, identity.item_type, identity.item_id);
+  const isNewOrder =
+    !current || current.order_rank === null || current.order_rank === undefined;
+  const incomingOrderRankRaw =
+    incoming.order_rank !== undefined && incoming.order_rank !== null
+      ? incoming.order_rank
+      : incoming.orderRank;
+  const incomingOrderRank = Number(incomingOrderRankRaw);
+  const hasIncomingOrderRank = Number.isFinite(incomingOrderRank);
+  const orderRank = isNewOrder
+    ? hasIncomingOrderRank
+      ? incomingOrderRank
+      : nextFrontRank(db, identity.item_type, identity.item_id)
+    : Number(current.order_rank);
+  const orderVersion = isNewOrder
+    ? nextOrderVersion(db)
+    : Number(current.order_version || 0);
+  nextTopic = {
+    ...nextTopic,
+    order_rank: orderRank,
+    order_version: orderVersion,
+  };
+
   db.prepare(
     `
-INSERT INTO topics(item_id, item_type, id, title, metadata_json, version, deleted, order_rank, content_updated_at, updated_at)
-VALUES (?, ?, ?, ?, ?, ?, 0, ?, ${nowExpr()}, ${nowExpr()})
+INSERT INTO topics(item_id, item_type, id, title, metadata_json, version, deleted, order_rank, order_version, order_updated_at, order_device_id, content_updated_at, content_device_id, updated_at)
+VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ${nowExpr()}, ?, ${nowExpr()}, ?, ${nowExpr()})
 ON CONFLICT(item_id, item_type, id) DO UPDATE SET
   title = excluded.title,
   metadata_json = excluded.metadata_json,
   version = excluded.version,
+  order_rank = CASE WHEN topics.order_rank IS NULL THEN excluded.order_rank ELSE topics.order_rank END,
+  order_version = CASE WHEN COALESCE(topics.order_version, 0) = 0 THEN excluded.order_version ELSE topics.order_version END,
   content_updated_at = ${nowExpr()},
   content_device_id = ?,
   updated_at = ${nowExpr()}
@@ -186,6 +237,9 @@ WHERE topics.deleted = 0
     JSON.stringify(nextTopic),
     nextVersion,
     orderRank,
+    orderVersion,
+    operation.device_id || null,
+    operation.device_id || null,
     operation.device_id || null
   );
   const seq = appendChange(db, {
@@ -213,23 +267,6 @@ WHERE topics.deleted = 0
   return { ok: true, seq, version: nextVersion };
 }
 
-function listActiveTopics(db, itemType, itemId) {
-  return db
-    .prepare(
-      "SELECT * FROM topics WHERE item_type = ? AND item_id = ? AND deleted = 0 ORDER BY order_rank ASC, created_at ASC, id ASC"
-    )
-    .all(itemType, itemId);
-}
-
-function updateRanks(db, itemType, itemId, topicIds) {
-  const update = db.prepare(
-    `UPDATE topics SET order_rank = ?, order_updated_at = ${nowExpr()}, updated_at = ${nowExpr()} WHERE item_type = ? AND item_id = ? AND id = ?`
-  );
-  topicIds.forEach((topicId, index) => {
-    update.run((index + 1) * 1000, itemType, itemId, topicId);
-  });
-}
-
 function normalizeOrderIdentity(operation) {
   const payload = operation.payload || {};
   const itemType = String(
@@ -250,41 +287,136 @@ function normalizeOrderIdentity(operation) {
   return { item_type: itemType, item_id: itemId, topic_id: topicId };
 }
 
-function activityTimestampOf(operation) {
-  const payload = operation.payload || {};
-  const raw =
-    payload.activity_at ||
-    payload.activityAt ||
-    payload.updated_at ||
-    payload.updatedAt ||
-    payload.timestamp ||
-    Date.now();
-  const numeric = Number(raw);
-  return Number.isFinite(numeric) ? numeric : Date.now();
+function getActiveTopic(db, identity) {
+  return db
+    .prepare(
+      "SELECT * FROM topics WHERE item_type = ? AND item_id = ? AND id = ? AND deleted = 0"
+    )
+    .get(identity.item_type, identity.item_id, identity.topic_id);
 }
 
-function upsertTopicActivityState(db, operation, identity, seq) {
-  db.prepare(
-    `
-INSERT INTO topic_activity_state(
-  item_type, item_id, topic_id, latest_seq, latest_device_id, activity_at, updated_at
-)
-VALUES (?, ?, ?, ?, ?, ?, ${nowExpr()})
-ON CONFLICT(item_type, item_id, topic_id) DO UPDATE SET
-  latest_seq = excluded.latest_seq,
-  latest_device_id = excluded.latest_device_id,
-  activity_at = excluded.activity_at,
-  updated_at = ${nowExpr()}
-WHERE excluded.latest_seq > topic_activity_state.latest_seq
-`
-  ).run(
-    identity.item_type,
-    identity.item_id,
-    identity.topic_id,
-    seq,
-    operation.device_id || null,
-    activityTimestampOf(operation)
+function rankBefore(db, identity, beforeRank) {
+  return db
+    .prepare(
+      `SELECT id, order_rank FROM topics
+       WHERE item_type = ? AND item_id = ? AND deleted = 0 AND id <> ? AND order_rank < ?
+       ORDER BY order_rank DESC, id DESC LIMIT 1`
+    )
+    .get(identity.item_type, identity.item_id, identity.topic_id, beforeRank);
+}
+
+function rankAfter(db, identity, afterRank) {
+  return db
+    .prepare(
+      `SELECT id, order_rank FROM topics
+       WHERE item_type = ? AND item_id = ? AND deleted = 0 AND id <> ? AND order_rank > ?
+       ORDER BY order_rank ASC, id ASC LIMIT 1`
+    )
+    .get(identity.item_type, identity.item_id, identity.topic_id, afterRank);
+}
+
+function rebalanceOwnerRanks(db, itemType, itemId) {
+  const rows = db
+    .prepare(
+      `SELECT id FROM topics
+       WHERE item_type = ? AND item_id = ? AND deleted = 0
+       ORDER BY order_rank ASC, created_at ASC, id ASC`
+    )
+    .all(itemType, itemId);
+  const update = db.prepare(
+    `UPDATE topics SET order_rank = ?, order_updated_at = ${nowExpr()}, updated_at = ${nowExpr()}
+     WHERE item_type = ? AND item_id = ? AND id = ? AND deleted = 0`
   );
+  rows.forEach((row, index) => {
+    update.run(index * ORDER_RANK_STEP, itemType, itemId, row.id);
+  });
+}
+
+function midpointRank(leftRank, rightRank) {
+  if (leftRank === null || leftRank === undefined)
+    return Number(rightRank) - ORDER_RANK_STEP;
+  if (rightRank === null || rightRank === undefined)
+    return Number(leftRank) + ORDER_RANK_STEP;
+  const left = Number(leftRank);
+  const right = Number(rightRank);
+  const mid = Math.floor((left + right) / 2);
+  return mid > left && mid < right ? mid : null;
+}
+
+function rankForMoveToFront(db, identity) {
+  return nextFrontRank(db, identity.item_type, identity.item_id);
+}
+
+function rankForMoveBefore(db, identity, beforeTopicId) {
+  const before = getActiveTopic(db, { ...identity, topic_id: beforeTopicId });
+  if (!before) throw new Error("topic_order move_before target not found");
+  const previous = rankBefore(db, identity, Number(before.order_rank));
+  let rank = midpointRank(
+    previous ? previous.order_rank : null,
+    before.order_rank
+  );
+  if (rank === null) {
+    rebalanceOwnerRanks(db, identity.item_type, identity.item_id);
+    const refreshed = getActiveTopic(db, {
+      ...identity,
+      topic_id: beforeTopicId,
+    });
+    const refreshedPrevious = rankBefore(
+      db,
+      identity,
+      Number(refreshed.order_rank)
+    );
+    rank = midpointRank(
+      refreshedPrevious ? refreshedPrevious.order_rank : null,
+      refreshed.order_rank
+    );
+  }
+  return rank;
+}
+
+function rankForMoveAfter(db, identity, afterTopicId) {
+  const after = getActiveTopic(db, { ...identity, topic_id: afterTopicId });
+  if (!after) throw new Error("topic_order move_after target not found");
+  const next = rankAfter(db, identity, Number(after.order_rank));
+  let rank = midpointRank(after.order_rank, next ? next.order_rank : null);
+  if (rank === null) {
+    rebalanceOwnerRanks(db, identity.item_type, identity.item_id);
+    const refreshed = getActiveTopic(db, {
+      ...identity,
+      topic_id: afterTopicId,
+    });
+    const refreshedNext = rankAfter(db, identity, Number(refreshed.order_rank));
+    rank = midpointRank(
+      refreshed.order_rank,
+      refreshedNext ? refreshedNext.order_rank : null
+    );
+  }
+  return rank;
+}
+
+function appendTopicOrderChange(
+  db,
+  operation,
+  identity,
+  applied,
+  orderResult = {}
+) {
+  return appendChange(db, {
+    ...operation,
+    item_type: identity.item_type,
+    item_id: identity.item_id,
+    topic_id: identity.topic_id || null,
+    entity_type: "topic_order",
+    entity_id: identity.item_id,
+    action: "move",
+    version: orderResult.order_version || null,
+    payload: {
+      ...(operation.payload || {}),
+      applied,
+      center_assigned: applied,
+      ...orderResult,
+    },
+  });
 }
 
 function applyTopicOrderMove(db, operation) {
@@ -293,107 +425,81 @@ function applyTopicOrderMove(db, operation) {
   const payload = operation.payload || {};
   const mode = String(payload.mode || "move_to_front");
   const source = String(payload.source || "manual");
-
-  if (source === "activity" && mode === "move_to_front") {
-    const result = db
-      .prepare(
-        `UPDATE topics SET content_updated_at = ${nowExpr()}, content_device_id = ?, updated_at = ${nowExpr()}
-         WHERE item_type = ? AND item_id = ? AND id = ? AND deleted = 0`
-      )
-      .run(
-        operation.device_id || null,
-        identity.item_type,
-        identity.item_id,
-        identity.topic_id
-      );
-    const applied = result.changes > 0;
-    const seq = appendTopicOrderChange(db, operation, identity, applied);
-    if (applied) {
-      upsertTopicActivityState(db, operation, identity, seq);
-    }
-    return {
-      ok: true,
-      seq,
-      skipped: result.changes === 0,
-    };
-  }
-
-  const rows = listActiveTopics(db, identity.item_type, identity.item_id);
-  const ids = rows
-    .map((row) => row.id)
-    .filter((id) => id !== identity.topic_id);
-  if (!rows.some((row) => row.id === identity.topic_id)) {
+  const current = getActiveTopic(db, identity);
+  if (!current) {
     return {
       ok: true,
       seq: appendTopicOrderChange(db, operation, identity, false),
       skipped: true,
     };
   }
+
+  let orderRank;
   if (mode === "move_before") {
     const beforeId = String(
       payload.before_topic_id || payload.beforeTopicId || ""
     );
-    const index = ids.indexOf(beforeId);
-    ids.splice(index >= 0 ? index : 0, 0, identity.topic_id);
+    if (!beforeId)
+      throw new Error("topic_order move_before requires before_topic_id");
+    orderRank = rankForMoveBefore(db, identity, beforeId);
   } else if (mode === "move_after") {
     const afterId = String(
       payload.after_topic_id || payload.afterTopicId || ""
     );
-    const index = ids.indexOf(afterId);
-    ids.splice(index >= 0 ? index + 1 : 0, 0, identity.topic_id);
+    if (!afterId)
+      throw new Error("topic_order move_after requires after_topic_id");
+    orderRank = rankForMoveAfter(db, identity, afterId);
   } else {
-    ids.unshift(identity.topic_id);
+    orderRank = rankForMoveToFront(db, identity);
   }
-  updateRanks(db, identity.item_type, identity.item_id, ids);
-  return {
-    ok: true,
-    seq: appendTopicOrderChange(db, operation, identity, true),
-  };
-}
 
-function applyTopicOrderReplace(db, operation) {
-  const identity = normalizeOrderIdentity(operation);
-  const payload = operation.payload || {};
-  const requested = Array.isArray(payload.topics_order)
-    ? payload.topics_order
-    : payload.order;
-  const rows = listActiveTopics(db, identity.item_type, identity.item_id);
-  const existing = new Set(rows.map((row) => row.id));
-  const seen = new Set();
-  const ids = [];
-  for (const value of requested || []) {
-    const id = String(value || "");
-    if (!id || !existing.has(id) || seen.has(id)) continue;
-    seen.add(id);
-    ids.push(id);
-  }
-  for (const row of rows) {
-    if (!seen.has(row.id)) ids.push(row.id);
-  }
-  updateRanks(db, identity.item_type, identity.item_id, ids);
-  return {
-    ok: true,
-    seq: appendTopicOrderChange(db, operation, identity, true),
-  };
-}
-
-function appendTopicOrderChange(db, operation, identity, applied) {
-  return appendChange(db, {
-    ...operation,
-    item_type: identity.item_type,
-    item_id: identity.item_id,
-    topic_id: identity.topic_id || null,
-    entity_type: "topic_order",
-    entity_id: identity.item_id,
-    action: operation.action,
-    version: null,
-    payload: { ...(operation.payload || {}), applied },
+  const orderVersion = nextOrderVersion(db);
+  const orderUpdatedAt = new Date().toISOString();
+  const result = db
+    .prepare(
+      `UPDATE topics
+       SET order_rank = ?,
+           order_version = ?,
+           order_updated_at = ?,
+           order_device_id = ?,
+           content_updated_at = CASE WHEN ? = 'activity' THEN ? ELSE content_updated_at END,
+           content_device_id = CASE WHEN ? = 'activity' THEN ? ELSE content_device_id END,
+           updated_at = ${nowExpr()}
+       WHERE item_type = ? AND item_id = ? AND id = ? AND deleted = 0`
+    )
+    .run(
+      orderRank,
+      orderVersion,
+      orderUpdatedAt,
+      operation.device_id || null,
+      source,
+      orderUpdatedAt,
+      source,
+      operation.device_id || null,
+      identity.item_type,
+      identity.item_id,
+      identity.topic_id
+    );
+  const applied = result.changes > 0;
+  const seq = appendTopicOrderChange(db, operation, identity, applied, {
+    order_rank: orderRank,
+    order_version: orderVersion,
+    order_updated_at: orderUpdatedAt,
+    source,
+    mode,
   });
+  return {
+    ok: true,
+    seq,
+    version: orderVersion,
+    order_version: orderVersion,
+    skipped: !applied,
+  };
 }
 
 module.exports = {
+  ORDER_RANK_STEP,
   ensureTopic,
   applyTopicUpsert,
   applyTopicOrderMove,
-  applyTopicOrderReplace,
 };

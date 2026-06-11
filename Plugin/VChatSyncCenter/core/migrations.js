@@ -441,6 +441,26 @@ CREATE INDEX IF NOT EXISTS idx_topic_activity_state_latest_seq ON topic_activity
 CREATE INDEX IF NOT EXISTS idx_topic_activity_state_owner ON topic_activity_state(item_type, item_id, latest_seq);
 `,
   },
+  {
+    version: 13,
+    name: "add_topic_order_version_authority",
+    sql: `
+ALTER TABLE topics ADD COLUMN order_version INTEGER NOT NULL DEFAULT 0;
+CREATE TABLE IF NOT EXISTS topic_order_versions (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+CREATE INDEX IF NOT EXISTS idx_topics_owner_order ON topics(item_type, item_id, deleted, order_rank, id);
+CREATE INDEX IF NOT EXISTS idx_topics_owner_topic ON topics(item_type, item_id, id);
+`,
+  },
+  {
+    version: 14,
+    name: "add_topic_order_device_id",
+    sql: `
+ALTER TABLE topics ADD COLUMN order_device_id TEXT;
+`,
+  },
 ];
 
 function ensureSchemaMigrationsTable(db) {

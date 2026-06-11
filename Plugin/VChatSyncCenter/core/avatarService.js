@@ -55,10 +55,10 @@ function parseAvatarIdentity(relativePath) {
   if (match)
     return { owner_type: "group", owner_id: decodeURIComponent(match[1]) };
   if (/^user_avatar\.[^/]+$/i.test(normalized)) {
-    return { owner_type: "user", owner_id: "local_user" };
+    return { owner_type: "user", owner_id: "user_avatar" };
   }
   if (/^avatarimage\/[^/]+\.(?:png|jpe?g|webp|gif)$/i.test(normalized)) {
-    return { owner_type: "user", owner_id: "local_user" };
+    return { owner_type: "user", owner_id: "user_avatar" };
   }
   return null;
 }
@@ -93,6 +93,9 @@ function normalizeAvatarPayload(operation) {
     throw new Error("avatar owner_type must be agent, group, or user");
   }
   const safeOwnerId = assertSafePathSegment(ownerId, "avatar owner_id");
+  if (ownerType === "user" && safeOwnerId !== "user_avatar") {
+    throw new Error("user avatar owner_id must be user_avatar");
+  }
   const ext = sanitizeExt(payload.ext || "");
   return {
     owner_type: ownerType,

@@ -3,11 +3,7 @@ const { getLatestSeq, getOperationResult } = require("./changeLog");
 const { applyCreate, applyUpdate, applyDelete } = require("./messageService");
 const { applyConfigOperation } = require("./configService");
 const { applyEntityDelete } = require("./deleteService");
-const {
-  applyTopicUpsert,
-  applyTopicOrderMove,
-  applyTopicOrderReplace,
-} = require("./topicService");
+const { applyTopicUpsert, applyTopicOrderMove } = require("./topicService");
 const { applyAvatarOperation } = require("./avatarService");
 const { applyThemePackageOperation } = require("./themeService");
 const { CONFIG_SCHEMAS } = require("./configSchema");
@@ -101,8 +97,8 @@ function validateOperation(operation) {
     throw new Error("unsupported topic action");
   if (isSoftDeleteEntity && entityType !== "topic" && action !== "delete")
     throw new Error("unsupported item/topic_history/group_member action");
-  if (isTopicOrder && !["move", "replace"].includes(action))
-    throw new Error("unsupported topic_order action");
+  if (isTopicOrder && action !== "move")
+    throw new Error("topic_order.replace is removed; use topic_order.move");
   if (isAvatar && !["create", "update", "delete", "upsert"].includes(action))
     throw new Error("unsupported avatar action");
   if (
@@ -148,9 +144,7 @@ function processOperation(db, input, options = {}) {
       return applyThemePackageOperation(db, operation);
     }
     if (operation.entity_type === "topic_order") {
-      if (operation.action === "move")
-        return applyTopicOrderMove(db, operation);
-      return applyTopicOrderReplace(db, operation);
+      return applyTopicOrderMove(db, operation);
     }
     if (operation.entity_type === "topic" && operation.action !== "delete") {
       return applyTopicUpsert(db, operation);

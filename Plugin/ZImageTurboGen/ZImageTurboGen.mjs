@@ -275,7 +275,7 @@ async function processApiRequest(rawArgs) {
     } else if (responseData.url) {
         // API returned a URL to download
         const imageResponse = await fetchWithProxy(responseData.url, {
-            signal: AbortSignal.timeout(60000),
+            signal: AbortSignal.timeout(180000),
         });
         if (!imageResponse.ok) {
             throw new Error(`Failed to download image from URL: ${responseData.url}`);
@@ -358,7 +358,7 @@ async function imageInputToDataUri(imageInput) {
 
     if (input.startsWith('http://') || input.startsWith('https://')) {
         const response = await fetchWithProxy(input, {
-            signal: AbortSignal.timeout(60000),
+            signal: AbortSignal.timeout(180000),
         });
         if (!response.ok) {
             const errorBody = await response.text().catch(() => '');
@@ -474,7 +474,7 @@ async function processEditRequest(args, showBase64) {
             'Authorization': `Bearer ${API_KEY}`,
         },
         body: formData,
-        signal: AbortSignal.timeout(120000),
+        signal: AbortSignal.timeout(300000),
     });
 
     if (!taskResponse.ok) {
@@ -502,7 +502,7 @@ async function processEditRequest(args, showBase64) {
         imageBuffer = Buffer.from(String(outputBase64).replace(/^data:image\/[^;]+;base64,/, '').replace(/\s/g, ''), 'base64');
     } else if (outputUrl) {
         const imageResponse = await fetchWithProxy(outputUrl, {
-            signal: AbortSignal.timeout(60000),
+            signal: AbortSignal.timeout(180000),
         });
         if (!imageResponse.ok) {
             throw new Error(`Failed to download edited image from URL: ${outputUrl}`);

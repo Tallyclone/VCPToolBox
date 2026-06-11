@@ -12,7 +12,7 @@
   },
   "communication": {
     "protocol": "stdio",
-    "timeout": 180000
+    "timeout": 600000
   },
   "configSchema": {
     "ZIMAGE_API_KEY": "string(可选)，如果留空则使用内置体验密钥",

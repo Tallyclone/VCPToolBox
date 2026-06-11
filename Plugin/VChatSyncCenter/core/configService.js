@@ -6,7 +6,7 @@ const {
   configKey,
 } = require("./deleteService");
 const { ensureItem } = require("./itemService");
-const { applyTopicUpsert } = require("./topicService");
+const { applyTopicUpsert, ORDER_RANK_STEP } = require("./topicService");
 const { safeJsonStringify, stableJsonStringify } = require("../utils/safeJson");
 const { sha256 } = require("../utils/checksum");
 const {
@@ -128,10 +128,10 @@ function deriveTopicsFromConfigDto(
     source,
   });
   let count = 0;
-  for (const topic of topics) {
+  topics.forEach((topic, index) => {
     const safeTopic = normalizeDerivedTopic(topic);
     const topicId = safeTopic && safeTopic.id;
-    if (!topicId || topicParentExists(db, owner, topicId)) continue;
+    if (!topicId || topicParentExists(db, owner, topicId)) return;
     applyTopicUpsert(db, {
       operation_id: `${operation.operation_id || "config"}.derived_topic.${
         owner.item_type
@@ -143,10 +143,16 @@ function deriveTopicsFromConfigDto(
       item_id: owner.item_id,
       topic_id: topicId,
       action: "upsert",
-      payload: { topic: safeTopic, source },
+      payload: {
+        topic: {
+          ...safeTopic,
+          order_rank: index * ORDER_RANK_STEP,
+        },
+        source,
+      },
     });
     count += 1;
-  }
+  });
   return count;
 }
 

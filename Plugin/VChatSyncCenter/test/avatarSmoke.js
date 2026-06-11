@@ -73,6 +73,59 @@ async function main() {
     assert(createChange, "avatar create change should exist");
     assert.strictEqual(createChange.action, "create");
 
+    const userAvatarResult = processOperation(dbContext.db, {
+      operation_id: "avatar-create-user-avatar",
+      device_id: "device-1",
+      entity_type: "avatar",
+      entity_id: "user:user_avatar",
+      action: "create",
+      payload: {
+        owner_type: "user",
+        owner_id: "user_avatar",
+        hash: avatarHash,
+        ext: ".png",
+        mime_type: "image/png",
+        relative_path: "user_avatar.png",
+      },
+    });
+    assert.strictEqual(userAvatarResult.ok, true);
+    const userAvatarRow = dbContext.db
+      .prepare("SELECT * FROM avatars WHERE owner_type = ? AND owner_id = ?")
+      .get("user", "user_avatar");
+    assert(userAvatarRow, "user avatar row should exist");
+    assert.strictEqual(userAvatarRow.hash, avatarHash);
+    assert.throws(
+      () =>
+        processOperation(dbContext.db, {
+          operation_id: "avatar-create-user-local-user",
+          device_id: "device-1",
+          entity_type: "avatar",
+          entity_id: "user:local_user",
+          action: "create",
+          payload: {
+            owner_type: "user",
+            owner_id: "local_user",
+            hash: avatarHash,
+            ext: ".png",
+            relative_path: "user_avatar.png",
+          },
+        }),
+      /user avatar owner_id must be user_avatar/
+    );
+    const deleteUserAvatarResult = processOperation(dbContext.db, {
+      operation_id: "avatar-delete-user-avatar",
+      device_id: "device-1",
+      entity_type: "avatar",
+      entity_id: "user:user_avatar",
+      action: "delete",
+      payload: {
+        owner_type: "user",
+        owner_id: "user_avatar",
+        relative_path: "user_avatar.png",
+      },
+    });
+    assert.strictEqual(deleteUserAvatarResult.ok, true);
+
     assert.throws(
       () =>
         processOperation(dbContext.db, {
