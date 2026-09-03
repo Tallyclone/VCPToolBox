@@ -5,10 +5,20 @@ import { HttpsProxyAgent } from 'https-proxy-agent';
 import fs from 'fs/promises';
 import path from 'path';
 import { v4 as uuidv4 } from 'uuid';
+import { config } from 'dotenv';
+import { fileURLToPath } from 'url';
+
+// 加载 config.env 文件
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+config({ path: path.join(__dirname, 'config.env') });
 
 // --- 1. 配置加载与初始化 ---
 const {
-    CHANNELS,
+    CHAT_CONFIG,
+    IMAGES_CONFIG,
+    PROTOCOL_MODE,
+    FALLBACK_PRIORITY,
     PROXY_AGENT,
     DIST_IMAGE_SERVERS,
     PROJECT_BASE_PATH,
@@ -17,38 +27,56 @@ const {
     VAR_HTTP_URL,
     USE_PUBLIC_URL
 } = (() => {
-    // ─── 渠道解析 ───
-    let channels = [];
-    const multiChannel = (process.env.MULTI_CHANNEL || '').toLowerCase() === 'true';
-
-    if (multiChannel && process.env.API_CHANNELS) {
-        // 多渠道绑定模式：URL|KEY|MODEL1,MODEL2;URL|KEY|MODEL3
-        channels = process.env.API_CHANNELS.split(';').map(group => {
-            const parts = group.split('|');
-            const url = (parts[0] || '').trim().replace(/\/+$/, '');
-            const key = (parts[1] || '').trim();
-            const models = (parts[2] || '').split(',').map(m => m.trim()).filter(Boolean);
-            if (!url || models.length === 0) return null;
-            return { url, key, models };
-        }).filter(Boolean);
-
-        if (channels.length > 0) {
-            console.error(`[NanoBananaGen2] 多渠道模式: 已加载 ${channels.length} 个渠道`);
-            channels.forEach((ch, i) => {
-                console.error(`  渠道 ${i + 1}: ${ch.url} | ${ch.models.length} 个模型`);
-            });
-        }
-    }
-
-    if (channels.length === 0) {
-        // 单渠道模式：API_URL + API_KEY + NANO_BANANA_MODEL（模型支持逗号分隔多个）
-        const url = (process.env.API_URL || 'http://127.0.0.1:3106/v1').trim().replace(/\/+$/, '');
-        const key = (process.env.API_KEY || '').trim();
-        const models = (process.env.NANO_BANANA_MODEL || 'hyb-Optimal/antigravity/gemini-3-pro-image')
+    // ─── 协议配置解析 ───
+    const parseChatConfig = () => {
+        // 优先使用新配置，兼容旧配置
+        const url = (process.env.CHAT_API_URL || process.env.API_URL || 'http://127.0.0.1:8080/v1').trim().replace(/\/+$/, '');
+        const key = (process.env.CHAT_API_KEY || process.env.API_KEY || '').trim();
+        const models = (process.env.CHAT_MODELS || process.env.NANO_BANANA_MODEL || 'hyb-Optimal/antigravity/gemini-3-pro-image')
             .split(',').map(m => m.trim()).filter(Boolean);
+        
+        if (models.length === 0) return null;
+        return { url, key, models };
+    };
 
-        channels.push({ url, key, models });
-        console.error(`[NanoBananaGen2] 单渠道模式: ${url} | ${models.length} 个模型`);
+    const parseImagesConfig = () => {
+        const url = (process.env.IMAGES_API_URL || '').trim().replace(/\/+$/, '');
+        const key = (process.env.IMAGES_API_KEY || '').trim();
+        const models = (process.env.IMAGES_MODELS || '')
+            .split(',').map(m => m.trim()).filter(Boolean);
+        
+        if (!url || models.length === 0) return null;
+        return { url, key, models };
+    };
+
+    const chatConfig = parseChatConfig();
+    const imagesConfig = parseImagesConfig();
+
+    // ─── 协议调用策略 ───
+    const protocolMode = (process.env.PROTOCOL_MODE || 'fallback').toLowerCase();
+    const fallbackPriority = (process.env.FALLBACK_PRIORITY || 'images').toLowerCase();
+
+    // ─── 日志输出 ───
+    console.error(`[NanoBananaGen2] ========== 配置信息 ==========`);
+    console.error(`[NanoBananaGen2] 协议模式: ${protocolMode}`);
+    if (protocolMode === 'fallback') {
+        console.error(`[NanoBananaGen2] 故障转移优先级: ${fallbackPriority}`);
+    }
+    if (chatConfig) {
+        console.error(`[NanoBananaGen2] Chat 协议: ${chatConfig.url} | ${chatConfig.models.length} 个模型`);
+    } else {
+        console.error(`[NanoBananaGen2] Chat 协议: 未配置`);
+    }
+    if (imagesConfig) {
+        console.error(`[NanoBananaGen2] Images 协议: ${imagesConfig.url} | ${imagesConfig.models.length} 个模型`);
+    } else {
+        console.error(`[NanoBananaGen2] Images 协议: 未配置`);
+    }
+    console.error(`[NanoBananaGen2] ===============================`);
+
+    // 至少需要一种协议配置
+    if (!chatConfig && !imagesConfig) {
+        throw new Error('[NanoBananaGen2] 错误: 至少需要配置 Chat 或 Images 协议之一');
     }
 
     // ─── 代理 ───
@@ -63,7 +91,10 @@ const {
     const usePublicUrl = (process.env.USE_PUBLIC_URL || 'true').toLowerCase() === 'true';
 
     return {
-        CHANNELS: channels,
+        CHAT_CONFIG: chatConfig,
+        IMAGES_CONFIG: imagesConfig,
+        PROTOCOL_MODE: protocolMode,
+        FALLBACK_PRIORITY: fallbackPriority,
         PROXY_AGENT: agent,
         DIST_IMAGE_SERVERS: distServers,
         PROJECT_BASE_PATH: process.env.PROJECT_BASE_PATH,
@@ -74,14 +105,63 @@ const {
     };
 })();
 
+// 协议调用计数器（用于 polling 模式）
+let protocolCallCounter = 0;
+
 /**
- * 随机选择一个渠道（URL + KEY 绑定）并从该渠道的模型池随机选一个模型
+ * 根据协议配置随机选择 URL、KEY 和模型
+ * @param {'chat'|'images'} protocol - 协议类型
  * @returns {{ url: string, key: string, model: string }}
  */
-function getRandomChannel() {
-    const channel = CHANNELS[Math.floor(Math.random() * CHANNELS.length)];
-    const model = channel.models[Math.floor(Math.random() * channel.models.length)];
-    return { url: channel.url, key: channel.key, model };
+function selectProtocolConfig(protocol) {
+    const config = protocol === 'chat' ? CHAT_CONFIG : IMAGES_CONFIG;
+    if (!config) {
+        throw new Error(`[NanoBananaGen2] ${protocol} 协议未配置`);
+    }
+    const model = config.models[Math.floor(Math.random() * config.models.length)];
+    return { url: config.url, key: config.key, model };
+}
+
+/**
+ * 选择要使用的协议（chat 或 images）
+ * @returns {'chat'|'images'}
+ */
+function selectProtocol() {
+    // 如果只配置了一种协议，直接返回
+    if (!CHAT_CONFIG && IMAGES_CONFIG) return 'images';
+    if (CHAT_CONFIG && !IMAGES_CONFIG) return 'chat';
+
+    // 两种协议都配置时，根据策略选择
+    switch (PROTOCOL_MODE) {
+        case 'random':
+            // 随机选择
+            return Math.random() < 0.5 ? 'chat' : 'images';
+        
+        case 'polling':
+            // 轮询：奇数次用第一种，偶数次用第二种
+            protocolCallCounter++;
+            return (protocolCallCounter % 2 === 1) ? 'chat' : 'images';
+        
+        case 'fallback':
+        default:
+            // fallback 模式：返回优先协议
+            return FALLBACK_PRIORITY === 'chat' ? 'chat' : 'images';
+    }
+}
+
+/**
+ * 获取故障转移的备用协议
+ * @param {'chat'|'images'} failedProtocol - 失败的协议
+ * @returns {'chat'|'images'|null}
+ */
+function getFallbackProtocol(failedProtocol) {
+    if (PROTOCOL_MODE !== 'fallback') return null;
+    
+    // 返回另一种协议（如果已配置）
+    if (failedProtocol === 'chat' && IMAGES_CONFIG) return 'images';
+    if (failedProtocol === 'images' && CHAT_CONFIG) return 'chat';
+    
+    return null;
 }
 
 // --- 2. 核心功能函数 ---
@@ -129,23 +209,23 @@ async function getImageDataFromUrl(url) {
 }
 
 /**
- * 调用 API 并返回响应
- * @param {object} payload - 发送给 API 的请求体
+ * 调用 Chat 协议 API
+ * @param {object} payload - Chat API 请求体
+ * @param {string} model - 模型名称
+ * @param {string} url - API URL
+ * @param {string} key - API Key
  * @returns {Promise<object>} - API 响应中的 message 对象
  */
-async function callApi(payload) {
-    const channel = getRandomChannel();
-    const fullUrl = `${channel.url}/chat/completions`;
-
-    // 动态注入当前渠道的模型名
-    payload.model = channel.model;
+async function callChatApi(payload, model, url, key) {
+    const fullUrl = `${url}/chat/completions`;
+    payload.model = model;
 
     const headers = { 'Content-Type': 'application/json' };
-    if (channel.key) {
-        headers['Authorization'] = `Bearer ${channel.key}`;
+    if (key) {
+        headers['Authorization'] = `Bearer ${key}`;
     }
 
-    console.error(`[NanoBananaGen2] 调用渠道: ${channel.url} | 模型: ${channel.model}`);
+    console.error(`[NanoBananaGen2] 调用 Chat 协议: ${url} | 模型: ${model}`);
 
     const response = await axios.post(fullUrl, payload, {
         headers: headers,
@@ -157,11 +237,111 @@ async function callApi(payload) {
 
     const message = response.data?.choices?.[0]?.message;
     if (!message) {
-        const detailedError = `从 API 响应中未能提取到消息内容。收到的响应: ${JSON.stringify(response.data, null, 2)}`;
+        const detailedError = `从 Chat API 响应中未能提取到消息内容。收到的响应: ${JSON.stringify(response.data, null, 2)}`;
         throw new Error(detailedError);
     }
 
     return message;
+}
+
+/**
+ * 调用 Images 协议 API
+ * @param {object} args - 统一参数对象
+ * @param {string} model - 模型名称
+ * @param {string} url - API URL
+ * @param {string} key - API Key
+ * @returns {Promise<object>} - 返回包含图片 URL 的消息对象
+ */
+async function callImagesApi(args, model, url, key) {
+    // 根据命令选择端点
+    const endpoint = args.command === 'edit' ? '/images/edits' : '/images/generations';
+    const fullUrl = `${url}${endpoint}`;
+
+    const payload = {
+        model: model,
+        prompt: args.prompt,
+        n: 1,
+        response_format: 'url'
+    };
+
+    // 图片尺寸映射
+    if (args.image_size) {
+        const sizeMap = { '1K': '1024x1024', '2K': '2048x2048', '4K': '4096x4096' };
+        payload.size = sizeMap[args.image_size] || args.image_size;
+    }
+
+    // 编辑模式需要提供图片
+    if (args.command === 'edit' && args.image_url) {
+        // Images API 的 edits 端点需要 image 字段（base64 或 URL）
+        payload.image = args.image_url;
+    }
+
+    const headers = { 'Content-Type': 'application/json' };
+    if (key) {
+        headers['Authorization'] = `Bearer ${key}`;
+    }
+
+    console.error(`[NanoBananaGen2] 调用 Images 协议: ${url}${endpoint} | 模型: ${model}`);
+
+    const response = await axios.post(fullUrl, payload, {
+        headers: headers,
+        httpsAgent: PROXY_AGENT,
+        timeout: 300000,
+        maxBodyLength: Infinity,
+        maxContentLength: Infinity
+    });
+
+    // Images API 返回格式：{ data: [{ url: "..." }] }
+    const imageUrl = response.data?.data?.[0]?.url;
+    if (!imageUrl) {
+        const detailedError = `从 Images API 响应中未能提取到图片 URL。收到的响应: ${JSON.stringify(response.data, null, 2)}`;
+        throw new Error(detailedError);
+    }
+
+    // 转换为统一的 message 格式
+    return {
+        content: '',
+        images: [{ url: imageUrl }]
+    };
+}
+
+/**
+ * 统一 API 调用入口（支持双协议和故障转移）
+ * @param {object} args - 统一参数对象
+ * @param {object} chatPayload - Chat 协议 payload（如果需要）
+ * @returns {Promise<object>} - API 响应 message
+ */
+async function callApiWithFallback(args, chatPayload) {
+    const protocol = selectProtocol();
+    const config = selectProtocolConfig(protocol);
+
+    try {
+        if (protocol === 'chat') {
+            return await callChatApi(chatPayload, config.model, config.url, config.key);
+        } else {
+            return await callImagesApi(args, config.model, config.url, config.key);
+        }
+    } catch (error) {
+        // 尝试故障转移
+        const fallbackProtocol = getFallbackProtocol(protocol);
+        if (fallbackProtocol) {
+            console.error(`[NanoBananaGen2] ${protocol} 协议失败: ${error.message}，尝试降级到 ${fallbackProtocol} 协议`);
+            const fallbackConfig = selectProtocolConfig(fallbackProtocol);
+            
+            try {
+                if (fallbackProtocol === 'chat') {
+                    return await callChatApi(chatPayload, fallbackConfig.model, fallbackConfig.url, fallbackConfig.key);
+                } else {
+                    return await callImagesApi(args, fallbackConfig.model, fallbackConfig.url, fallbackConfig.key);
+                }
+            } catch (fallbackError) {
+                throw new Error(`${protocol} 和 ${fallbackProtocol} 协议均失败。${protocol}: ${error.message}; ${fallbackProtocol}: ${fallbackError.message}`);
+            }
+        }
+        
+        // 没有故障转移，直接抛出原错误
+        throw error;
+    }
 }
 
 /**
@@ -413,7 +593,8 @@ async function generateImage(args, showBase64) {
         throw new Error("参数错误: 'prompt' 是必需的字符串。");
     }
 
-    const payload = {
+    // Chat 协议 payload
+    const chatPayload = {
         "stream": false,
         "messages": [
             {
@@ -429,7 +610,7 @@ async function generateImage(args, showBase64) {
         ...buildCommonPayloadFields(args)
     };
 
-    const message = await callApi(payload);
+    const message = await callApiWithFallback(args, chatPayload);
     return await processApiResponseAndSaveImage(message, args, showBase64);
 }
 
@@ -457,7 +638,11 @@ async function editImage(args, showBase64) {
         imageUrl = `data:${mimeType};base64,${base64Data}`;
     }
 
-    const payload = {
+    // 将图片 URL 存入 args，供 Images API 使用
+    args.image_url = imageUrl;
+
+    // Chat 协议 payload
+    const chatPayload = {
         "stream": false,
         "messages": [
             {
@@ -477,7 +662,7 @@ async function editImage(args, showBase64) {
         ...buildCommonPayloadFields(args)
     };
 
-    const message = await callApi(payload);
+    const message = await callApiWithFallback(args, chatPayload);
     return await processApiResponseAndSaveImage(message, args, showBase64);
 }
 
@@ -526,7 +711,13 @@ async function composeImage(args, showBase64) {
         });
     }
 
-    const payload = {
+    // 存储第一张图片 URL 供 Images API 使用（Images API 通常只支持单图编辑）
+    if (imageInputs.length > 0) {
+        args.image_url = contentArray.find(c => c.type === 'image_url')?.image_url?.url;
+    }
+
+    // Chat 协议 payload
+    const chatPayload = {
         "stream": false,
         "messages": [
             {
@@ -537,7 +728,7 @@ async function composeImage(args, showBase64) {
         ...buildCommonPayloadFields(args)
     };
 
-    const message = await callApi(payload);
+    const message = await callApiWithFallback(args, chatPayload);
     return await processApiResponseAndSaveImage(message, args, showBase64);
 }
 

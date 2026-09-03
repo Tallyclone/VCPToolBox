@@ -56,3 +56,115 @@ setInterval(async function(){
 }, 2000);
 </script>
 <<<[DESKTOP_PUSH_END]>>>
+
+本地文件系统挂载挂件（type: nativeFileMount 且配置 customUI 自定义文件浏览器）：
+<<<[DESKTOP_PUSH]>>>
+type: nativeFileMount
+mountPath:「始」D:\MyWorkspace「末」
+mode: readwrite
+width: 600
+height: 400
+ui.customUI.html:「始」
+<div id="app" style="padding:12px; color:#fff; font-family:sans-serif; height:100%; display:flex; flex-direction:column; gap:8px;">
+  <div style="display:flex; gap:8px;">
+    <button id="btn-back">⬅ 返回上级</button>
+    <button id="btn-new">📁 新建文件夹</button>
+    <button id="btn-paste">📋 粘贴</button>
+    <span id="cur-dir" style="color:#a6adc8; font-size:12px; align-self:center;"></span>
+  </div>
+  <div id="file-list" style="flex:1; overflow-y:auto; border:1px solid #313244; padding:6px; background:#181825; border-radius:4px;"></div>
+</div>
+「末」
+ui.customUI.js:「始ESCAPE」
+var currentPath = ".";
+var curDirEl = document.getElementById("cur-dir");
+var fileListEl = document.getElementById("file-list");
+
+async function loadDir(path) {
+    currentPath = path;
+    curDirEl.textContent = "当前目录: " + path;
+    fileListEl.innerHTML = "<div style='color:#6c7086'>加载中...</div>";
+    try {
+        var res = await nfm.list(path);
+        fileListEl.innerHTML = "";
+        if (res && res.entries) {
+            res.entries.forEach(function(item) {
+                var div = document.createElement("div");
+                div.style.cssText = "padding:6px; cursor:pointer; border-bottom:1px solid #313244; display:flex; justify-content:space-between; align-items:center;";
+                
+                var nameSpan = document.createElement("span");
+                nameSpan.textContent = (item.isDir ? "📁 " : "📄 ") + item.name;
+                div.appendChild(nameSpan);
+                
+                var actionsSpan = document.createElement("span");
+                actionsSpan.style.cssText = "display:flex; gap:8px;";
+                
+                var btnCut = document.createElement("button");
+                btnCut.textContent = "剪切";
+                btnCut.onclick = function(e) {
+                    e.stopPropagation();
+                    nfm.cutToClipboard(item.path).then(function() { alert("已剪切: " + item.name); });
+                };
+                actionsSpan.appendChild(btnCut);
+                
+                var btnDel = document.createElement("button");
+                btnDel.textContent = "删除";
+                btnDel.style.color = "#f38ba8";
+                btnDel.onclick = function(e) {
+                    e.stopPropagation();
+                    if(confirm("确定删除 " + item.name + " 吗？")) {
+                        nfm.trash(item.path).then(function() { loadDir(currentPath); });
+                    }
+                };
+                actionsSpan.appendChild(btnDel);
+                
+                div.appendChild(actionsSpan);
+                
+                div.onclick = function() {
+                    if (item.isDir) {
+                        loadDir(item.path);
+                    } else {
+                        nfm.open(item.path);
+                    }
+                };
+                fileListEl.appendChild(div);
+            });
+        }
+    } catch(err) {
+        fileListEl.innerHTML = "<div style='color:#f38ba8'>加载出错: " + err + "</div>";
+    }
+}
+
+document.getElementById("btn-back").onclick = function() {
+    if (currentPath === "." || currentPath === "") return;
+    var parts = currentPath.split("/");
+    parts.pop();
+    loadDir(parts.join("/") || ".");
+};
+
+document.getElementById("btn-new").onclick = function() {
+    var name = prompt("请输入文件夹名称:");
+    if (name) {
+        nfm.newFolder(currentPath, name).then(function() { loadDir(currentPath); });
+    }
+};
+
+document.getElementById("btn-paste").onclick = function() {
+    nfm.paste(currentPath, "rename").then(function(r) {
+        if(r.success) {
+            loadDir(currentPath);
+        } else {
+            alert("粘贴失败: " + r.error);
+        }
+    });
+};
+
+nfm.onFileChange(function(data) {
+    if (data.directoryPath === currentPath) {
+        loadDir(currentPath);
+    }
+});
+
+loadDir(".");
+「末ESCAPE」
+<<<[DESKTOP_PUSH_END]>>>

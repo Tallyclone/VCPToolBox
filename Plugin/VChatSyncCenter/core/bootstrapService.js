@@ -190,7 +190,7 @@ function loadTopicsForConfigExport(db, owner) {
     .prepare(
       `SELECT * FROM topics
        WHERE deleted = 0 AND item_type = ? AND item_id = ?
-       ORDER BY COALESCE(order_rank, 2147483647), created_at, id`
+       ORDER BY CASE WHEN order_rank IS NULL THEN 1 ELSE 0 END ASC, order_rank ASC, created_at ASC, id ASC`
     )
     .all(owner.item_type, owner.item_id)
     .map((row) => {
@@ -257,27 +257,51 @@ function deriveBootstrapTopicsFromConfigs(db, configs, deviceId) {
       const key = `${owner.item_type}:${owner.item_id}:${topicId}`;
       if (seen.has(key)) return;
       seen.add(key);
-      applyTopicUpsert(db, {
-        operation_id: `bootstrap.topic.${deviceId || "unknown"}.${
-          owner.item_type
-        }.${owner.item_id}.${topicId}`,
-        device_id: deviceId,
-        entity_type: "topic",
-        entity_id: topicId,
-        item_type: owner.item_type,
-        item_id: owner.item_id,
-        topic_id: topicId,
-        action: "upsert",
-        payload: {
-          topic: {
-            ...topic,
-            order_rank: index * ORDER_RANK_STEP,
+      applyTopicUpsert(
+        db,
+        {
+          operation_id: `bootstrap.topic.${deviceId || "unknown"}.${
+            owner.item_type
+          }.${owner.item_id}.${topicId}`,
+          device_id: deviceId,
+          entity_type: "topic",
+          entity_id: topicId,
+          item_type: owner.item_type,
+          item_id: owner.item_id,
+          topic_id: topicId,
+          action: "upsert",
+          payload: {
+            topic: {
+              ...topic,
+              order_rank: index * ORDER_RANK_STEP,
+            },
           },
         },
-      });
+        { trustInitialOrderRank: true }
+      );
     });
   }
   return seen.size;
+}
+
+function buildAuthoritativeConfigSnapshots(db, configs) {
+  return (Array.isArray(configs) ? configs : [])
+    .map((config) => config.payload || config)
+    .filter((payload) => payload && typeof payload === "object")
+    .map((payload) =>
+      backfillConfigTopicsForExport(db, {
+        ...payload,
+        safe_projection_json: parseJson(
+          payload.safe_projection_json,
+          payload.safe_projection_json || {}
+        ),
+        projection_fields: parseJson(
+          payload.projection_fields,
+          payload.projection_fields || []
+        ),
+        profile: payload.profile || "bootstrap",
+      })
+    );
 }
 
 function importBootstrap(runtime, manifest = {}) {
@@ -515,6 +539,7 @@ ON CONFLICT(hash) DO UPDATE SET
     );
     throw error;
   }
+  const authoritativeConfigs = buildAuthoritativeConfigSnapshots(db, configs);
   audit(runtime, "import", {
     mode,
     session_id: sessionId,
@@ -526,6 +551,7 @@ ON CONFLICT(hash) DO UPDATE SET
     themes: themes.length,
     conflicts: conflicts.length,
     latest_seq: latestSeq,
+    authoritative_configs: authoritativeConfigs.length,
   });
   return {
     ok: true,
@@ -540,6 +566,7 @@ ON CONFLICT(hash) DO UPDATE SET
       conflicts: conflicts.length,
     },
     latest_seq: latestSeq,
+    authoritative_configs: authoritativeConfigs,
   };
 }
 
@@ -568,7 +595,7 @@ function exportBaseline(runtime, options = {}) {
   const topicRows = loadTopics
     ? db
         .prepare(
-          `SELECT * FROM topics WHERE deleted = 0 ORDER BY item_type, item_id, COALESCE(order_rank, 2147483647), created_at, id LIMIT ? OFFSET ?`
+          `SELECT * FROM topics WHERE deleted = 0 ORDER BY item_type, item_id, CASE WHEN order_rank IS NULL THEN 1 ELSE 0 END ASC, order_rank ASC, created_at ASC, id ASC LIMIT ? OFFSET ?`
         )
         .all(pageLimit, cursor)
     : [];

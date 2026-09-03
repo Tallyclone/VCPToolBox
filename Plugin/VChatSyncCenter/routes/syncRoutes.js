@@ -261,6 +261,35 @@ WHERE item_type = ? AND item_id = ? AND id = ?
 }
 
 function createSyncRoutes(router, runtime) {
+  router.use((req, res, next) => {
+    if (req.rawBody || req.bodyRaw) {
+      return next();
+    }
+    const contentType = req.headers["content-type"] || "";
+    if (
+      req.method === "POST" ||
+      req.method === "PUT" ||
+      req.method === "PATCH"
+    ) {
+      if (contentType.includes("multipart/form-data")) {
+        const chunks = [];
+        req.on("data", (chunk) => {
+          chunks.push(chunk);
+        });
+        req.on("end", () => {
+          req.rawBody = Buffer.concat(chunks);
+          req.bodyRaw = req.rawBody.toString("binary");
+          next();
+        });
+        req.on("error", (err) => {
+          next(err);
+        });
+        return;
+      }
+    }
+    next();
+  });
+
   router.get("/status", requireSyncAuth(runtime), (req, res) => {
     const db = getReadyDb(runtime, res);
     if (!db) return null;

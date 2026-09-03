@@ -1,0 +1,67 @@
+音乐播放器插件说明书 (MusicPlay)
+
+1. 基础控制与状态 (controlPlayer / getPlayerState)
+tool_name:「始」MusicPlay「末」,
+command:「始」controlPlayer「末」,
+action:「始」open/close/quit/minimize/play/pause/next/prev/volume/playMode「末」, // open(启动), close(一般用这个), quit(彻底退出), minimize(隐藏到托盘)
+value:「始」value「末」// volume传0~1之间数字(如0.5)；playMode可选'repeat'/'repeat-one'/'shuffle'
+
+获取当前状态(音量、模式、播放状态、歌曲)：
+command:「始」getPlayerState「末」
+
+2. 曲库检索与随便听听 (searchOnline / getLibrary / randomListen)
+在线检索：
+command:「始」searchOnline「末」,
+query:「始」周杰伦「末」,
+platform:「始」all/netease/qq/kuwo「末」
+
+获取本地曲库列表：
+command:「始」getLibrary「末」
+
+随便听听：
+command:「始」randomListen「末」,
+platform:「始」netease/qq/kuwo「末」,
+tag:「始」hot/new/soaring「末」 //支持热歌/新歌/飙升，或分类标签如'华语'/'流行'
+
+3. 排行榜与推荐歌单 (manageToplist / manageOnlinePlaylist)
+command:「始」manageToplist「末」,
+action:「始」query/detail/play/add「末」, // query(查排行榜列表), detail(查详情列表), play(一键替换播放), add(追加到队尾)
+id:「始」id「末」, // detail/play/add 时必需，指定排行榜ID
+platform:「始」netease/qq/kuwo「末」,
+quality:「始」flac/320k/128k「末」 // 可选，默认 flac (无损)
+
+在线歌单：
+command:「始」manageOnlinePlaylist「末」,
+action:「始」query/detail/play/add「末」,
+id:「始」id「末」, // detail/play/add 必需
+platform:「始」netease/qq/kuwo「末」,
+cat:「始」全部「末」, // query 可选分类（华语/流行等）
+page:「始」1「末」,
+limit:「始」20「末」,
+quality:「始」flac/320k/128k「末」
+
+4. 点播、加歌与下载 (playTrack / addTracksToQueue / downloadTrack)
+点播曲目（支持单/多首）：
+command:「始」playTrack「末」,
+tracks:「始」netease|60264|不要说我们是朋友|阿木;netease|60263|他一定很爱你|阿杜「末」, // 简写DSL格式：平台|ID|歌名|歌手，多首用分号分隔。本地格式为：local|路径|歌名|歌手
+quality:「始」flac/320k/128k「末」
+
+追加到稍后播放队尾：
+command:「始」addTracksToQueue「末」,
+tracks:「始」netease|60264|不要说我们是朋友|阿木「末」,
+quality:「始」flac/320k/128k「末」
+
+批量/单曲下载（优先拷贝本地Temp缓存，免下载流量并重扫本地曲库）：
+command:「始」downloadTrack「末」,
+tracks:「始」netease|60264|不要说我们是朋友|阿木「末」,
+quality:「始"flac/320k/128k「末」
+
+5. 本地用户自定义歌单管理 (manageCustomPlaylist)
+command:「始」manageCustomPlaylist「末」,
+action:「始」query/create/delete/play/playSong/addSong/removeSong「末」, // query(查全部), create(建歌单), delete(删歌单), play(播整单)
+id:「始」歌单id「末」, // delete/play/playSong/addSong/removeSong 时必需
+name:「始」歌单名称「末」, // create 时必需
+tracks:「始」netease|60264|不要说我们是朋友|阿木「末」, // addSong/removeSong 批量加/删歌曲，支持分号分隔
+songIndex:「始」0;2「末」, // playSong/removeSong 可选，支持分号分隔索引
+songTitle:「始」晴天;告白气球「末」, // playSong/removeSong 可选，支持分号分隔歌名匹配
+trackPath:「始」path1;path2「末」 // removeSong 可选，支持分号分隔物理路径匹配

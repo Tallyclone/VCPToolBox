@@ -25,11 +25,7 @@
 
 {{TarSysPrompt}}系统信息是{{VarSystemInfo}}。
 系统工具列表与指南：{{VarToolList}},
-{{VCPMemoToolBox}}
-{{VCPMediaToolBox}}
-{{VCPSearchToolBox}}
-{{VCPContactToolBox}}
-{{VCPFileToolBox}}
+
 日记系统：
 {{VarDailyNoteGuide}}
 

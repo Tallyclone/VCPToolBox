@@ -634,10 +634,14 @@ function applyItemDelete(db, operation) {
 
   const schema = configSchemaForItemType(itemType);
   let configDeleted = 0;
+  const derivedConfigEntityId = schema
+    ? configRelativePath(schema, itemId)
+    : null;
   const configEntityIds = Array.from(
     new Set(
       [
         itemId,
+        derivedConfigEntityId,
         payload.config_entity_id,
         ...(Array.isArray(payload.config_entity_ids)
           ? payload.config_entity_ids

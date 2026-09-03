@@ -1,5 +1,5 @@
 const { sha256 } = require("../utils/checksum");
-const { safeJsonParse, safeJsonStringify } = require("../utils/safeJson");
+const { safeJsonParse, safeJsonStringify, stableJsonStringify } = require("../utils/safeJson");
 const { appendChange } = require("./changeLog");
 const { recordConflict } = require("./conflictService");
 const { ensureItem } = require("./itemService");
@@ -376,7 +376,10 @@ function applyCreate(db, operation) {
   rejectPlaceholderMessage(identity.message);
   identity = normalizeAndSanitizeMessage(identity);
 
-  const rawJson = safeJsonStringify(identity.message);
+  if (identity.message && identity.message._syncDerivatives) {
+    delete identity.message._syncDerivatives;
+  }
+  const rawJson = stableJsonStringify(identity.message);
   const checksum = sha256(rawJson || "");
   const existing = getMessage(db, identity);
   const entityKey = messageKey(identity);
@@ -601,7 +604,10 @@ function applyUpdate(db, operation) {
   }
 
   const nextVersion = Number(current.version || 0) + 1;
-  const rawJson = safeJsonStringify(identity.message);
+  if (identity.message && identity.message._syncDerivatives) {
+    delete identity.message._syncDerivatives;
+  }
+  const rawJson = stableJsonStringify(identity.message);
   const checksum = sha256(rawJson || "");
   db.prepare(
     `

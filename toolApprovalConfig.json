@@ -1,5 +1,5 @@
 {
-  "enabled": true,
+  "enabled": false,
   "approveAll": false,
   "timeoutMinutes": 5,
   "fuzzyToolMatching": true,

@@ -32,6 +32,23 @@
 - musicAPI.setVolume(0-100) → 设置音量
 - musicAPI.send('music-remote-command', 'next') → 下一首
 - musicAPI.send('music-remote-command', 'previous') → 上一首
+### nfm（本地文件挂载沙箱 API，仅限 nativeFileMount 且配置了 customUI 时可用）
+- nfm.mountId / nfm.mountPath / nfm.mode → 挂载元数据
+- nfm.list(relPath) → 列出指定目录（支持返回 entry.isDir/isDirectory 判断，relPath 默认 "."）
+- nfm.open(relPath) → 打开文件（只允许文件，若为目录会 reject）
+- nfm.reveal(relPath) → 在资源管理器中定位显示
+- nfm.newFolder(parentPath, name) / nfm.newFile(parentPath, name) → 新建文件夹/文件
+- nfm.rename(oldPath, newName) → 重命名
+- nfm.trash(paths) → 删除到回收站（支持单路径或路径数组）
+- nfm.copyToClipboard(paths) / nfm.cutToClipboard(paths) → 复制/剪切到系统剪贴板（支持数组，剪切设 DropEffect=MOVE）
+- nfm.paste(destDir, strategy) → 粘贴剪贴板内容到 destDir（strategy 可选 "rename"/"overwrite"/"skip"）
+- nfm.onFileChange(callback) → 监听当前挂载目录的实时文件变更事件（chokidar 驱动）
+
+### widgetFS（已收藏挂件的本地文件读写，仅限已收藏 Widget 可用）
+- widgetFS.saveFile(fileName, content, encoding) → 保存文件到收藏挂件目录（encoding 默认 utf-8）
+- widgetFS.loadFile(fileName) → 读取收藏挂件目录中的文件内容
+- widgetFS.listFiles() → 列出收藏挂件目录中的所有文件
+- 注意：未收藏的 Widget 调用这些方法会 reject 报错 "Widget not saved yet"
 
 vcpAPI.post() 参数说明：
 - messages: OpenAI 格式消息数组 [{role: "system", content: "..."}, {role: "user", content: "..."}]

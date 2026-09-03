@@ -1,0 +1,129 @@
+# 本地文件挂载 (NativeFileMount) 完整知识
+
+NativeFileMount 是 VCP 桌面的内置挂件子系统，由 13 个文件协作实现。本文档整合全部源码功能。
+
+---
+
+## 一、完整数据流
+
+Agent 输出 DESKTOP_PUSH builtin 块 → streamManager.js 识别 `type:` 前缀进入 builtin 模式 → 收到 DESKTOP_PUSH_END 后调用 desktopBuiltinParser.js 解析 key-value 协议 → 输出 { type, config, options } → streamManager 通过 preload 发送 desktopPush({ action:"createBuiltinWidget", builtinType:"nativeFileMount", config, options }) → 主进程 desktopHandlers.js 转发到桌面窗口 → ipcBridge.js 对 createBuiltinWidget 做 no-op（避免 Unknown action 警告）→ nativeFileMountWidget.js 监听到 builtinType === "nativeFileMount" → 调用 spawnNativeFileMount → 通过 preload API 调用 nativeFsHandlers.js → NativeFsService.js 注册挂载 → 创建 widget + 注入 HTML → widgetManager.js 处理 Shadow DOM 沙箱与内联脚本 → NativeFsWatcher.js 启动 chokidar 监听
+
+---
+
+## 二、builtin key-value 协议格式 (desktopBuiltinParser.js)
+
+DESKTOP_PUSH 中以 `type:` 开头的内容进入 builtin 解析模式（区别于 HTML 流式注入和 target/replace 编辑）：
+- 普通值：`key: value`
+- 定界符值：`key:「始」含空格或特殊字符的值「末」`
+- 多行 ESCAPE 值：`key:「始ESCAPE」`（独占一行开始）+ 多行内容 + `「末ESCAPE」`（独占一行结束）
+- 路由规则：`ui.*` → config.ui.*；`frame.*` → options.frame.*；width/height/x/y → options；其他 → config
+- 类型转换：非字符串白名单字段自动转为 boolean/number
+
+DESKTOP_PUSH 中以 `action:` 开头的内容进入 edit 解析模式，解析为 editBuiltinWidget 指令（见第十节）。
+
+---
+
+## 三、挂载管理与安全 (NativeFsService.js)
+
+- 注册挂载：验证路径存在且为目录，生成 mountId + capabilityToken（crypto 随机 32 字节）
+- 访问模式：readonly（默认，写操作全部拒绝）/ readwrite
+- 路径安全：所有操作均通过 `path.relative` 校验防逃逸，越界时抛出 `Path escape detected` 错误
+- 冲突策略 (strategy)：rename（自动追加序号，上限 999）/ overwrite / skip
+
+---
+
+## 四、系统剪贴板互通
+
+- 复制：PowerShell 写入 CF_HDROP 文件列表
+- 剪切：写入 CF_HDROP + Preferred DropEffect=MOVE(2) 字节流，使 Windows 资源管理器能识别为移动操作
+- 粘贴：读取剪贴板文件列表和 DropEffect 标识，自动判断复制/移动；PowerShell 输出前设置 `[Console]::OutputEncoding = UTF8` 防止中文路径乱码
+
+---
+
+## 五、实时监听 (NativeFsWatcher.js)
+
+- 使用 chokidar 监听（depth:0 仅当前层级，awaitWriteFinish 防抖 300ms）
+- LRU 策略：最多维护 8 个 watcher，超出时淘汰最久未访问的
+- 节流：单目录 1 秒内超 100 事件时发送 resync:true 信号（前端应全量刷新列表）
+- 事件格式：`{ mountId, directoryPath, changes: [{ type, name }], resync }`
+- 卸载 mount 时自动清理该 mount 下所有 watcher
+
+---
+
+## 六、前端挂件 (nativeFileMountWidget.js) 三层定制
+
+**Layer 1 - 默认 UI**：完整的文件浏览器，包含：
+- 工具栏（上级/路径/刷新/新建/删除/粘贴）
+- 文件列表（图标/名称/大小/时间），目录排在前面
+- 多选（Ctrl 单选切换、Shift 范围选择、Ctrl+A 全选）
+- 快捷键：Delete（删除）、F2（重命名）、Ctrl+C/X/V（复制/剪切/粘贴）
+- 双右键菜单：文件行菜单（打开/显示/重命名/复制/剪切/删除/粘贴）+ 空白区域菜单（粘贴/新建/刷新）
+- fixedSize:true 防止 MutationObserver 导致挂件尺寸爬升
+- 错误卡片：mountPath 缺失或注册挂载失败时，自动渲染错误提示卡片（显示错误原因和路径），不会崩溃
+
+**Layer 2 - 外观微调**（通过 config.ui.* 参数）：
+- theme.*：primary, background, foreground, border, hover, accent
+- layout.variant："grid" | "list"
+- actions.toolbar：逗号分隔过滤工具栏按钮（up, path, refresh, newfolder, newfile, delete, paste）
+- actions.contextMenu：逗号分隔过滤右键菜单项（open, reveal, rename, copy, cut, delete, paste）
+- icons.[ext]：自定义后缀图标映射
+
+**Layer 3 - CustomUI 完全接管**（通过 config.ui.customUI.*）：
+- html/css/js 三个字段，html 和 css 用「始」「末」定界符，js 必须用多行「始ESCAPE」「末ESCAPE」
+- 沙箱自动注入 window.nfm API（见下文）
+- hasDelimiterResidue() 检测：若 js 内含完整定界符残留（如 `「始」`），则清空 js 防止解析错误
+
+**Frame 配置**（通过 options.frame.*）：
+- transparent, background, border, shadow, opacity 控制外壳样式
+- showGrip:false 隐藏拖动手柄（注意：会导致挂件无法通过手柄拖动，这是配置效果非 Bug）
+- showCloseButton:false 隐藏关闭按钮
+- resizable:false 禁用缩放
+
+---
+
+## 七、桌面感知增强 (QueryDesktop 对 nativeFileMount 的扩展返回)
+
+当 QueryDesktop 返回挂件列表时，nativeFileMount 类型的挂件会额外携带：
+- builtinType: "nativeFileMount"
+- contentType: "builtin"
+- queryInfo.nativeFileMount: { mountPath, mode, currentPath（当前浏览目录）, selectedItems（当前选中的文件名列表）}
+- source: 原始推送配置文本（可用于 editBuiltinWidget 的 targetReplace）
+- sourceFormat: "builtinKeyValue"
+
+---
+
+## 八、IPC 通道与响应约定 (nativeFsHandlers.js)
+
+所有 nativeFs:* 通道统一返回：
+- 成功：`{ success: true, ...result }`
+- 失败：`{ success: false, error: "错误信息" }`
+前端必须显式检查 `result.success === false`，不能只依赖 try/catch。
+
+---
+
+## 九、preload API 白名单 (desktop.js + roles.js)
+
+桌面窗口通过 preload 暴露的 NativeFs API 必须在 roles.js 的 DESKTOP_KEYS 白名单中注册，否则渲染端拿不到函数。当前已注册：nativeFsRegisterMount, nativeFsUnmount, nativeFsGetInfo, nativeFsList, nativeFsStat, nativeFsOpen, nativeFsReveal, nativeFsCopy, nativeFsCut, nativeFsRename, nativeFsTrash, nativeFsNewFolder, nativeFsNewFile, nativeFsCopyToClipboard, nativeFsCutToClipboard, nativeFsPasteFromClipboard, nativeFsRequestOperations, nativeFsConfirm, onNativeFsChange
+
+---
+
+## 十、挂件编辑 (editBuiltinWidget)
+
+对于已创建的 nativeFileMount 挂件，无需销毁重建即可修改其配置（如切换挂载路径、更改模式等）。
+
+工作原理：每个内置挂件创建时会保存原始推送配置文本到 `_builtinSource`。editBuiltinWidget 通过 `targetReplace` 模式在该文本中执行字符串查找替换，然后用修改后的配置自动卸载旧挂载、销毁旧挂件、重新解析配置并 respawn 新挂件（保持原始坐标位置）。
+
+推送语法：
+<<<[DESKTOP_PUSH]>>>
+action: editBuiltinWidget
+widgetId:「始」nfm-123456「末」
+mode: targetReplace
+target:「始」mountPath:「始」D:\OldPath「末」「末」
+replace:「始」mountPath:「始」D:\NewPath「末」「末」
+<<<[DESKTOP_PUSH_END]>>>
+
+注意：
+- widgetId 必须是 QueryDesktop 返回的有效挂件 ID
+- target 必须能在原始 _builtinSource 文本中找到精确匹配，否则替换失败
+- 替换后会自动重新解析并验证配置，若解析失败（如 type 不再是 nativeFileMount）则不会执行
+- 此编辑模式也可用于修改 ui.theme、frame 等任意配置字段

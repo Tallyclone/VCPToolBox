@@ -1,0 +1,26 @@
+{
+  "manifestVersion": "1.0.0",
+  "name": "ServerRhinoVCP",
+  "version": "0.2.0-wip",
+  "displayName": "Rhino VCP (Server Local)",
+  "description": "VCP服务器本机版 RhinoVCP。通过本机 Named Pipe 调用 RhinoMCP 插件中的 RhinoCommon、Rhino 命令和 Grasshopper 工具。仅在 VCPToolBox 服务器本机也运行 Rhino 时可用。",
+  "author": "RhinoMCP",
+  "pluginType": "synchronous",
+  "requiresAdmin": false,
+  "entryPoint": {
+    "type": "executable",
+    "command": "RhinoVCPDaemon.exe"
+  },
+  "communication": {
+    "protocol": "stdio",
+    "timeout": 120000
+  },
+  "capabilities": {
+    "invocationCommands": [
+      {
+        "commandIdentifier": "RhinoCommand",
+        "description": "调用 Rhino 中的一个工具。Rhino 必须正在运行且 RhinoMCP 插件已加载。\n参数:\n- command (字符串, 必需): Rhino 工具名。\n- args (对象, 可选): 工具参数对象；也可将工具参数直接放在 command 同级。\n\n核心状态与视图工具: get_context, get_selection, list_objects, get_commands, get_viewport_image, set_selection, set_camera, zoom_to_object, zoom_to_layer。\n文档与执行工具: open_doc, close_doc, save_doc, run_command, run_python, run_csharp, set_layer_material。\nGrasshopper 1: g1_start, g1_search_components, g1_describe_component, g1_get_canvas_graph, g1_place_component, g1_place_slider, g1_connect, g1_connect_many, g1_apply_graph, g1_solve_graph, g1_clear_canvas。\nGrasshopper 2: g2_start, g2_search_components, g2_describe_component, g2_get_canvas_graph, g2_place_component, g2_place_slider, g2_connect, g2_connect_many, g2_apply_graph, g2_solve_canvas, g2_clear_canvas。\nask_user 不通过 RhinoVCP 暴露。\n\n重要规则:\n1. 修改 Rhino 前先调用 get_context/get_selection/list_objects 等读取实际状态，不得假设。\n2. run_python 必须使用 doc = __rhino_doc__；禁止 import rhinoscriptsyntax 和 scriptcontext.doc。\n3. run_csharp 必须使用 __rhino_doc__；禁止 RhinoDoc.ActiveDoc。\n4. run_command 使用英文命令和下划线前缀，例如 _Box。\n5. Grasshopper 修改后必须 solve 并检查 diagnostics。\n\n调用格式:\n<<<[TOOL_REQUEST]>>>\ntool_name:「始」ServerRhinoVCP「末」,\ncommand:「始」get_context「末」\n<<<[END_TOOL_REQUEST]>>>\n\n带参数示例:\n<<<[TOOL_REQUEST]>>>\ntool_name:「始」ServerRhinoVCP「末」,\ncommand:「始」run_command「末」,\nargs:「始」{\"command\":\"_Box 0,0,0 10,10,10 _Enter\"}「末」\n<<<[END_TOOL_REQUEST]>>>"
+      }
+    ]
+  }
+}

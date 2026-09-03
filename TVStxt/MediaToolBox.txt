@@ -31,11 +31,59 @@ showbase64:「始」(可选) 是否在返回结果中附带 base64 图片数据�
 - NanoBananaGen2：image_size主要支持1K、2K、4K；长prompt和复杂修图适合优先使用。
 - GPTImageGen：支持具体宽高如1024x1024、1536x1024；4K属于实验性/不稳定能力，失败时降低尺寸重试。
 
-## 2. VCP点歌台 (MusicController)
-用于控制服务器音乐播放。
-tool_name:「始」MusicController「末」,
-command:「始」playSong「末」,
-songname:「始」星の余韻「末」 // 注意观察当前服务器音乐列表是否包含曲目，可用LightMemo检索。
+[===vcp_fold:0.5::desc:音乐播放器控制与点歌台===]
+
+## 2. 外部音乐播放器 (MusicPlay)
+用于控制 VCP Music Player 的播放、下载、切歌、音量及歌单管理。
+
+### 基础控制与状态
+tool_name:「始」MusicPlay「末」,
+command:「始」controlPlayer「末」,
+action:「始」open/close/quit/minimize/show/play/pause/next/prev/volume/playMode「末」, // minimize(最小化到托盘), show(从托盘唤起恢复窗口)
+value:「始」value「末」// volume 传 0~1 (如0.5)；playMode 可选 'repeat'/'repeat-one'/'shuffle'
+
+获取播放状态（当前曲目、进度及模式）：
+command:「始」getPlayerState「末」
+
+### 在线检索与点播
+在线检索：
+command:「始」searchOnline「末」,
+query:「始」周杰伦「末」,
+platform:「始」all/netease/qq/kuwo「末」
+
+本地曲库列表：
+command:「始」getLibrary「末」
+
+随便听听：
+command:「始」randomListen「末」,
+platform:「始」netease/qq/kuwo「末」,
+tag:「始」hot/new/soaring「末」 // 对应热歌/新歌/飙升，或分类标签如'华语'
+
+### 点播、追加与下载
+点播单/多曲：
+command:「始」playTrack「末」,
+tracks:「始」netease|60264|不要说我们是朋友|阿木;netease|60263|他一定很爱你|阿杜「末」, // DSL格式：平台|ID|歌名|歌手，多首用分号分隔。本地为：local|路径|歌名|歌手
+quality:「始」flac/320k/128k「末」
+
+追加稍后播放：
+command:「始」addTracksToQueue「末」,
+tracks:「始」netease|60264|不要说我们是朋友|阿木「末」,
+quality:「始」flac/320k/128k「末」
+
+批量下载（优先离线秒拷本地 Temp 缓存并重扫曲库）：
+command:「始」downloadTrack「末」,
+tracks:「始」netease|60264|不要说我们是朋友|阿木「末」,
+quality:「始」flac/320k/128k「末」
+
+### 自定义歌单管理
+command:「始」manageCustomPlaylist「末」,
+action:「始」query/create/delete/play/playSong/addSong/removeSong「末」, // query(查全部), create(建歌单), delete(删歌单), play(播整单)
+id:「始」歌单id「末」, // delete/play/playSong/addSong/removeSong 时必需
+name:「始」歌单名称「末」, // create 必需
+tracks:「始」netease|60264|不要说我们是朋友|阿木「末」, // addSong/removeSong 批量加/删歌曲，支持分号分隔
+songIndex:「始」0;2「末」, // playSong/removeSong 可选，支持分号分隔索引
+songTitle:「始」晴天;告白气球「末」, // playSong/removeSong 可选，支持分号分隔歌名匹配
+trackPath:「始」path1;path2「末」 // removeSong 可选，支持分号分隔物理路径匹配
 
 [===vcp_fold:0.6::desc:音频视频生成工具===]
 

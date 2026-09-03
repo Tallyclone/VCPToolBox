@@ -19,6 +19,7 @@
     "BRIDGE_MODEL": { "type": "string", "description": "默认模型名（下游未指定时使用）" },
     "BRIDGE_SYSTEM_PROMPT": { "type": "string", "description": "注入的 System Prompt（支持 .txt 文件名从插件目录加载）" },
     "BRIDGE_HIJACK_MODE": { "type": "string", "description": "劫持模式：replace（完全替换）/ prepend（前置追加）/ append（后置追加）/ off（不劫持）" },
-    "BRIDGE_MODEL_MAP": { "type": "string", "description": "模型名映射，格式：alias1:target1,alias2:target2" }
+    "BRIDGE_MODEL_MAP": { "type": "string", "description": "模型名映射，格式：alias1:target1,alias2:target2" },
+    "BRIDGE_DYNAMIC_TEMPLATE": { "type": "string", "description": "动态提示词解析引擎模板开关：on/off" }
   }
 }

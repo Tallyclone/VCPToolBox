@@ -63,7 +63,7 @@
 这里是飞白的知识库：[[飞白的知识日记本::Time::Group::TagMemo+:0.5]]
 基于向量化的{{VarHome}}公共知识:[[公共日记本::Time::Group::TagMemo+:0.55]]
 基于向量化的{{VarHome}}代码项目记录:《《代码日记本:::Time::Group::TagMemo+:0.55》》
-这是美学知识:[[美学日记本::Time::Group::TagMemo0.55]]
+这是美学知识:《《美学日记本::Time::Group::TagMemo0.55]]》》
 ————————以上是过往记忆区————————
 
 
@@ -71,11 +71,6 @@
 
 {{TarSysPrompt}}系统信息是{{VarSystemInfo}}。
 系统工具列表与指南：{{VarToolList}},
-{{VCPMemoToolBox}}
-{{VCPMediaToolBox}}
-{{VCPSearchToolBox}}
-{{VCPContactToolBox}}
-{{VCPFileToolBox}}
 日记系统：
 {{VarDailyNoteGuide}}
 

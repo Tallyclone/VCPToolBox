@@ -229,3 +229,25 @@ Plugin/XiaohongshuFetch/config.env
 pluginStoreSources.json
 tmp/
 Plugin/.backup/
+
+# ==== 运行时缓存 / 生成产物（不入库） ====
+# 文件挂载/上传缓存
+.file_cache/
+# 定时任务结果
+VCPTimedResults/
+# 动态工具目录的原子写入临时文件
+ToolConfigs/*.tmp
+# 图像生成插件输出目录
+image/gptimagegen/
+image/zimageturbogen/
+image/nanobananagen/
+
+# ==== 可执行二进制 ====
+# 默认忽略 exe，避免误提交大体积守护进程
+*.exe
+# 例外：仓库已随发行版分发的可执行文件
+!Plugin/CodeSearcher/CodeSearcher.exe
+!Plugin/DailyNoteSearcher/DailyNoteSearcher.exe
+!Plugin/PaperReader/bin/paperreader-cli.exe
+!Plugin/RhinoVCP/RhinoVCPDaemon.exe
+!vcp-installer-一键安装脚本.exe

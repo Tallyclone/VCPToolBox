@@ -1,0 +1,64 @@
+{
+  "mappings": [
+    {
+      "placeholder": "{{workspacePath}}",
+      "regex": "Your current workspace is at\\s+([^\\r\\n.]+)"
+    },
+    {
+      "placeholder": "{{projectName}}",
+      "regex": "\\*\\*Name\\*\\*:\\s+([^\\r\\n*]+)"
+    },
+    {
+      "placeholder": "{{projectVersion}}",
+      "regex": "\\*\\*Version\\*\\*:\\s+([^\\r\\n*]+)"
+    },
+    {
+      "placeholder": "{{projectPlatform}}",
+      "regex": "\\*\\*Platform\\*\\*:\\s+([^\\r\\n*]+)"
+    },
+    {
+      "placeholder": "{{shellType}}",
+      "regex": "Shell:\\s+([^\\r\\n(]+)"
+    },
+    {
+      "placeholder": "{{packagesXml}}",
+      "regex": "<available_packages>([\\s\\S]*?)<\\/available_packages>"
+    },
+    {
+      "placeholder": "{{availableNcf}}",
+      "regex": "<user_workspace>[\\s\\S]*?<available_ncf>([\\s\\S]*?)<\\/available_ncf>"
+    },
+    {
+      "placeholder": "{{availableType}}",
+      "regex": "<user_workspace>[\\s\\S]*?<available_type>([\\s\\S]*?)<\\/available_type>"
+    },
+    {
+      "placeholder": "{{activeFile}}",
+      "regex": "Active file:\\s+([^\\r\\n]+)"
+    },
+    {
+      "placeholder": "{{openTabs}}",
+      "regex": "Open tabs:\\s+\\[(.*?)\\]"
+    },
+    {
+      "placeholder": "{{selectedNodes}}",
+      "regex": "Selected nodes:\\s+\\[(.*?)\\]"
+    },
+    {
+      "placeholder": "{{viewportState}}",
+      "regex": "Viewport:\\s+([^\\r\\n]+)"
+    },
+    {
+      "placeholder": "{{graphRunning}}",
+      "regex": "Graph running:\\s+([^\\r\\n]+)"
+    },
+    {
+      "placeholder": "{{skillsText}}",
+      "regex": "## Skills\\s+Available project-specific skills loaded from the workspace\\.\\r?\\n([\\s\\S]*?)(?=\\r?\\n\\r?\\n## Editor State)"
+    },
+    {
+      "placeholder": "{{editorStateXml}}",
+      "regex": "<editor-state>([\\s\\S]*?)<\\/editor-state>"
+    }
+  ]
+}

@@ -2,6 +2,7 @@
 功能: 感知查询当前VCPdesktop桌面上的所有挂件(widget)和图标(shortcut icon)信息。
 返回内容包括：
 - widgets: 桌面上所有活跃挂件的ID列表。如果挂件已被收藏，还会显示收藏名称和对应的持久化目录路径（可配合FileOperator插件读写维护收藏的HTML内容）。
+- 对于内置挂件（如 nativeFileMount），还会额外返回：builtinType, contentType:"builtin", queryInfo（包含 mountPath, mode, currentPath 当前浏览目录, selectedItems 当前选中文件名列表）, source（原始推送配置文本，可用于 editBuiltinWidget）。
 - icons: 桌面上所有快捷方式图标的名称列表。
 
 此命令无需额外参数。

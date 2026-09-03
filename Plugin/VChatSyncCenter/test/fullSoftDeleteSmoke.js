@@ -420,6 +420,42 @@ function main() {
       .get("agent_config", mappedConfigId, "bootstrap");
     assert.strictEqual(Number(mappedConfig.deleted), 1);
 
+    const legacyConfigId = "Agents/legacy-item/config.json";
+    const legacyConfigCreate = processOperation(dbContext.db, {
+      operation_id: "legacy-config-create",
+      device_id: "device-1",
+      entity_type: "agent_config",
+      entity_id: legacyConfigId,
+      action: "create",
+      payload: configPayload(legacyConfigId, {
+        name: "legacy item",
+        systemPrompt: "legacy",
+      }),
+    });
+    assert.strictEqual(legacyConfigCreate.ok, true);
+    const legacyItemDelete = processOperation(dbContext.db, {
+      operation_id: "legacy-item-delete",
+      device_id: "device-1",
+      entity_type: "item",
+      action: "delete",
+      item_type: "agent",
+      item_id: "legacy-item",
+      entity_id: "legacy-item",
+      payload: { delete_config: true },
+    });
+    assert.strictEqual(legacyItemDelete.ok, true);
+    const legacyDeletedConfig = dbContext.db
+      .prepare(
+        "SELECT deleted FROM config_entities WHERE schema = ? AND entity_id = ? AND profile = ?"
+      )
+      .get("agent_config", legacyConfigId, "bootstrap");
+    assert.strictEqual(Number(legacyDeletedConfig.deleted), 1);
+    assert.ok(
+      !exportBaseline(runtime, { kind: "configs" }).baseline.configs.some(
+        (configEntry) => configEntry.entity_id === legacyConfigId
+      )
+    );
+
     const messageDeleteTombstone = dbContext.db
       .prepare(
         "SELECT retain_until FROM tombstones WHERE operation_id = ? AND entity_type = ?"

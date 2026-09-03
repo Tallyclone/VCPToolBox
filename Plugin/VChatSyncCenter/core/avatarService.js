@@ -54,7 +54,10 @@ function parseAvatarIdentity(relativePath) {
   match = /^AgentGroups\/([^/]+)\/avatar\.[^/]+$/i.exec(normalized);
   if (match)
     return { owner_type: "group", owner_id: decodeURIComponent(match[1]) };
-  if (/^user_avatar\.[^/]+$/i.test(normalized)) {
+  if (
+    /^user_avatar\.[^/]+$/i.test(normalized) ||
+    /^UserData\/user_avatar\.[^/]+$/i.test(normalized)
+  ) {
     return { owner_type: "user", owner_id: "user_avatar" };
   }
   if (/^avatarimage\/[^/]+\.(?:png|jpe?g|webp|gif)$/i.test(normalized)) {

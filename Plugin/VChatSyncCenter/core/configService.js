@@ -132,25 +132,29 @@ function deriveTopicsFromConfigDto(
     const safeTopic = normalizeDerivedTopic(topic);
     const topicId = safeTopic && safeTopic.id;
     if (!topicId || topicParentExists(db, owner, topicId)) return;
-    applyTopicUpsert(db, {
-      operation_id: `${operation.operation_id || "config"}.derived_topic.${
-        owner.item_type
-      }.${owner.item_id}.${topicId}`,
-      device_id: operation.device_id,
-      entity_type: "topic",
-      entity_id: topicId,
-      item_type: owner.item_type,
-      item_id: owner.item_id,
-      topic_id: topicId,
-      action: "upsert",
-      payload: {
-        topic: {
-          ...safeTopic,
-          order_rank: index * ORDER_RANK_STEP,
+    applyTopicUpsert(
+      db,
+      {
+        operation_id: `${operation.operation_id || "config"}.derived_topic.${
+          owner.item_type
+        }.${owner.item_id}.${topicId}`,
+        device_id: operation.device_id,
+        entity_type: "topic",
+        entity_id: topicId,
+        item_type: owner.item_type,
+        item_id: owner.item_id,
+        topic_id: topicId,
+        action: "upsert",
+        payload: {
+          topic: {
+            ...safeTopic,
+            order_rank: index * ORDER_RANK_STEP,
+          },
+          source,
         },
-        source,
       },
-    });
+      { trustInitialOrderRank: true }
+    );
     count += 1;
   });
   return count;

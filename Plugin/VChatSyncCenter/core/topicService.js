@@ -1,11 +1,24 @@
 const { appendChange } = require("./changeLog");
 
-const ORDER_RANK_STEP = 1000000;
+const ORDER_RANK_STEP = 1000000000;
 
 function normalizeMetadata(metadata) {
   return metadata && typeof metadata === "object" && !Array.isArray(metadata)
     ? metadata
     : {};
+}
+
+function stripTopicOrderFields(topic) {
+  const clean = { ...normalizeMetadata(topic) };
+  delete clean.order_rank;
+  delete clean.orderRank;
+  delete clean.order_version;
+  delete clean.orderVersion;
+  delete clean.order_updated_at;
+  delete clean.orderUpdatedAt;
+  delete clean.order_device_id;
+  delete clean.orderDeviceId;
+  return clean;
 }
 
 function topicIdOf(topic) {
@@ -51,7 +64,7 @@ function nextFrontRank(db, itemType, itemId) {
 }
 
 function ensureTopic(db, itemType, itemId, topicId, metadata = {}) {
-  const safeMetadata = normalizeMetadata(metadata);
+  const safeMetadata = stripTopicOrderFields(metadata);
   const topic = {
     ...safeMetadata,
     id: String(topicId),
@@ -139,7 +152,7 @@ function getTopicRow(db, identity) {
     .get(identity.item_type, identity.item_id, identity.topic_id);
 }
 
-function applyTopicUpsert(db, operation) {
+function applyTopicUpsert(db, operation, options = {}) {
   const identity = normalizeTopicOperation(operation);
   const current = getTopicRow(db, identity);
   if (current && Number(current.deleted || 0) === 1) {
@@ -148,9 +161,9 @@ function applyTopicUpsert(db, operation) {
     throw error;
   }
   const currentMeta = current
-    ? normalizeMetadata(JSON.parse(current.metadata_json || "{}"))
+    ? stripTopicOrderFields(JSON.parse(current.metadata_json || "{}"))
     : {};
-  const incoming = identity.topic;
+  const incoming = stripTopicOrderFields(identity.topic);
   const incomingNameSource =
     incoming.nameSource || incoming.name_source || null;
   const currentNameSource =
@@ -194,25 +207,24 @@ function applyTopicUpsert(db, operation) {
   const nextVersion = current ? Number(current.version || 0) + 1 : 1;
   const isNewOrder =
     !current || current.order_rank === null || current.order_rank === undefined;
+  const rawIncomingTopic = normalizeMetadata(identity.topic);
   const incomingOrderRankRaw =
-    incoming.order_rank !== undefined && incoming.order_rank !== null
-      ? incoming.order_rank
-      : incoming.orderRank;
+    rawIncomingTopic.order_rank !== undefined &&
+    rawIncomingTopic.order_rank !== null
+      ? rawIncomingTopic.order_rank
+      : rawIncomingTopic.orderRank;
   const incomingOrderRank = Number(incomingOrderRankRaw);
-  const hasIncomingOrderRank = Number.isFinite(incomingOrderRank);
+  const hasTrustedInitialOrderRank =
+    options.trustInitialOrderRank === true &&
+    Number.isFinite(incomingOrderRank);
   const orderRank = isNewOrder
-    ? hasIncomingOrderRank
+    ? hasTrustedInitialOrderRank
       ? incomingOrderRank
       : nextFrontRank(db, identity.item_type, identity.item_id)
     : Number(current.order_rank);
   const orderVersion = isNewOrder
     ? nextOrderVersion(db)
     : Number(current.order_version || 0);
-  nextTopic = {
-    ...nextTopic,
-    order_rank: orderRank,
-    order_version: orderVersion,
-  };
 
   db.prepare(
     `
@@ -264,6 +276,18 @@ WHERE topics.deleted = 0
       identity.topic_id
     );
   }
+
+  // 缺陷1修复: 新话题创建时自动追加 topic_order 事件，确保排序信息能广播到其他设备
+  if (isNewOrder) {
+    appendTopicOrderChange(db, operation, identity, true, {
+      order_rank: orderRank,
+      order_version: orderVersion,
+      order_updated_at: new Date().toISOString(),
+      source: "create",
+      mode: "move_to_front",
+    });
+  }
+
   return { ok: true, seq, version: nextVersion };
 }
 
@@ -323,12 +347,29 @@ function rebalanceOwnerRanks(db, itemType, itemId) {
        ORDER BY order_rank ASC, created_at ASC, id ASC`
     )
     .all(itemType, itemId);
+  const orderUpdatedAt = new Date().toISOString();
   const update = db.prepare(
-    `UPDATE topics SET order_rank = ?, order_updated_at = ${nowExpr()}, updated_at = ${nowExpr()}
+    `UPDATE topics SET order_rank = ?, order_version = ?, order_updated_at = ?, updated_at = ${nowExpr()}
      WHERE item_type = ? AND item_id = ? AND id = ? AND deleted = 0`
   );
+  // 缺陷2修复: rebalance 后为每个受影响话题递增 order_version 并追加 topic_order change_log
   rows.forEach((row, index) => {
-    update.run(index * ORDER_RANK_STEP, itemType, itemId, row.id);
+    const newRank = index * ORDER_RANK_STEP;
+    const newVersion = nextOrderVersion(db);
+    update.run(newRank, newVersion, orderUpdatedAt, itemType, itemId, row.id);
+    appendTopicOrderChange(
+      db,
+      { device_id: null },
+      { item_type: itemType, item_id: itemId, topic_id: row.id },
+      true,
+      {
+        order_rank: newRank,
+        order_version: newVersion,
+        order_updated_at: orderUpdatedAt,
+        source: "rebalance",
+        mode: "rebalance",
+      }
+    );
   });
 }
 
@@ -401,8 +442,16 @@ function appendTopicOrderChange(
   applied,
   orderResult = {}
 ) {
+  let opId = operation.operation_id;
+  if (!opId) {
+    opId = `auto.topic_order.${identity.item_type}.${identity.item_id}.${identity.topic_id || "all"}.${Date.now()}.${Math.random().toString(36).slice(2, 7)}`;
+  } else if (operation.entity_type !== "topic_order") {
+    opId = `${opId}.auto_order`;
+  }
+
   return appendChange(db, {
     ...operation,
+    operation_id: opId,
     item_type: identity.item_type,
     item_id: identity.item_id,
     topic_id: identity.topic_id || null,
