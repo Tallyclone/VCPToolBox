@@ -20,14 +20,61 @@ class ToolCallParser {
   };
 
   /**
+   * 从可见正文中剥离模型思考块。
+   *
+   * 支持：
+   * - <think>...</think> 与 <thinking>...</thinking>
+   * - 大小写、标签空白和属性变体
+   * - 同类或混合标签嵌套
+   * - 未闭合开始标签：保守丢弃该标签之后的全部内容
+   *
+   * 未配对的结束标签只移除标签本身，不会吞掉其后的可见正文。
+   *
+   * @param {string} content
+   * @returns {string}
+   */
+  static stripReasoningBlocks(content) {
+    if (!content || typeof content !== 'string') return '';
+
+    const tagRegex = /<\s*(\/?)\s*(think(?:ing)?)\b[^>]*>/gi;
+    const chunks = [];
+    let cursor = 0;
+    let depth = 0;
+    let match;
+
+    while ((match = tagRegex.exec(content)) !== null) {
+      if (depth === 0) {
+        chunks.push(content.slice(cursor, match.index));
+      }
+
+      const isClosingTag = match[1] === '/';
+      if (isClosingTag) {
+        if (depth > 0) depth -= 1;
+      } else {
+        depth += 1;
+      }
+
+      cursor = tagRegex.lastIndex;
+    }
+
+    // depth > 0 表示思考标签未闭合。为避免潜藏的工具调用被执行，
+    // 故意不保留最后一个开始标签之后的任何内容。
+    if (depth === 0) {
+      chunks.push(content.slice(cursor));
+    }
+
+    return chunks.join('');
+  }
+
+  /**
    * 解析AI响应中的所有工具调用
    * @param {string} content - AI响应内容
-   * @returns {Array<{name: string, args: object, archery: boolean}>}
+   * @returns {Array<{name: string, args: object, archery: boolean, archeryNoReply?: boolean}>}
    */
   static parse(content) {
     if (!content || typeof content !== 'string') return [];
 
-    const contentWithoutThink = content.replace(/<think>[\s\S]*?<\/think>/g, '');
+    const contentWithoutThink = this.stripReasoningBlocks(content);
     const toolCalls = [];
     let searchOffset = 0;
 
@@ -55,25 +102,25 @@ class ToolCallParser {
   static extractNextToolBlock(content, fromIndex = 0) {
     if (!content || typeof content !== 'string') return null;
 
-    const startIndex = content.indexOf(this.MARKERS.START, fromIndex);
-    if (startIndex === -1) return null;
+    const startMatch = toolMarkerFuzzyMatcher.findBlockStartMarker(content, fromIndex);
+    if (!startMatch) return null;
 
-    const blockStart = startIndex + this.MARKERS.START.length;
-    const endIndex = this._findBlockEnd(content, blockStart);
-    if (endIndex === -1) return null;
+    const blockStart = startMatch.index + startMatch.marker.length;
+    const endMatch = this._findBlockEnd(content, blockStart);
+    if (!endMatch) return null;
 
     return {
-      blockContent: content.substring(blockStart, endIndex).trim(),
-      startIndex,
-      endIndex,
-      nextOffset: endIndex + this.MARKERS.END.length
+      blockContent: content.substring(blockStart, endMatch.index).trim(),
+      startIndex: startMatch.index,
+      endIndex: endMatch.index,
+      nextOffset: endMatch.index + endMatch.marker.length
     };
   }
 
   /**
    * 解析单个工具调用块，可供其他入口（如人类直调工具）复用
    * @param {string} blockContent
-   * @returns {{name: string, args: object, archery: boolean, markHistory: boolean, river: string|null, vref: string|null}|null}
+   * @returns {{name: string, args: object, archery: boolean, archeryNoReply: boolean, markHistory: boolean, river: string|null, vref: string|null}|null}
    */
   static parseBlock(blockContent) {
     if (!blockContent || typeof blockContent !== 'string') return null;
@@ -84,6 +131,7 @@ class ToolCallParser {
     const args = {};
     let toolName = null;
     let isArchery = false;
+    let archeryNoReply = false;
     let markHistory = false;
     let river = null;
     let vref = null;
@@ -95,6 +143,7 @@ class ToolCallParser {
         toolName = trimmedValue;
       } else if (field.key === 'archery') {
         isArchery = trimmedValue === 'true' || trimmedValue === 'no_reply';
+        archeryNoReply = trimmedValue === 'no_reply';
       } else if (field.key === 'ink') {
         markHistory = trimmedValue === 'mark_history';
       } else if (field.key === 'river') {
@@ -106,7 +155,13 @@ class ToolCallParser {
       }
     }
 
-    return toolName ? { name: toolName, args, archery: isArchery, markHistory, river, vref } : null;
+    // 兼容中性署名字段 valet：现有工具链统一读取 args.maid，
+    // 因此当 valet 存在且 maid 未显式提供时，镜像一份到 maid。
+    if (args.valet && !args.maid) {
+      args.maid = args.valet;
+    }
+
+    return toolName ? { name: toolName, args, archery: isArchery, archeryNoReply, markHistory, river, vref } : null;
   }
 
   static _findBlockEnd(content, fromIndex) {
@@ -119,25 +174,25 @@ class ToolCallParser {
       const startMatch = escapeStartRegex.exec(remaining);
       const nextEscapeStart = startMatch ? cursor + startMatch.index : -1;
       
-      const nextBlockEnd = content.indexOf(this.MARKERS.END, cursor);
+      const endMatch = toolMarkerFuzzyMatcher.findBlockEndMarker(content, cursor);
 
-      if (nextBlockEnd === -1) return -1;
-      if (nextEscapeStart === -1 || nextBlockEnd < nextEscapeStart) {
-        return nextBlockEnd;
+      if (!endMatch) return null;
+      if (nextEscapeStart === -1 || endMatch.index < nextEscapeStart) {
+        return endMatch;
       }
 
       const searchStartFrom = nextEscapeStart + startMatch[0].length;
-      const endMatch = escapeEndRegex.exec(content.slice(searchStartFrom));
+      const escapeEndMatch = escapeEndRegex.exec(content.slice(searchStartFrom));
 
-      if (!endMatch) {
-        return -1;
+      if (!escapeEndMatch) {
+        return null;
       }
 
-      const escapedEnd = searchStartFrom + endMatch.index;
-      cursor = escapedEnd + endMatch[0].length;
+      const escapedEnd = searchStartFrom + escapeEndMatch.index;
+      cursor = escapedEnd + escapeEndMatch[0].length;
     }
 
-    return -1;
+    return null;
   }
 
   static _scanFields(blockContent) {

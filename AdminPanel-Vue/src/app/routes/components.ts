@@ -11,6 +11,10 @@ export const APP_ROUTE_COMPONENTS = {
   "vcptavern-editor": () => import("@/views/VcptavernEditor.vue"),
   "agent-files-editor": () => import("@/views/AgentFilesEditor.vue"),
   "agent-assistant-config": () => import("@/views/AgentAssistantConfig.vue"),
+  "onering-manager": () => import("@/views/OneRingManager.vue"),
+  "agent-timeline-manager": () => import("@/views/AgentTimeLineManager.vue"),
+  "claw-mail-manager": () => import("@/views/ClawMailManager.vue"),
+  "agent-emotion-manager": () => import("@/views/AgentEmotionManager.vue"),
   "forum-assistant-config": () => import("@/views/ForumAssistantConfig.vue"),
   "agent-scores": () => import("@/views/AgentScores.vue"),
   "toolbox-manager": () => import("@/views/ToolboxManager.vue"),
@@ -21,6 +25,8 @@ export const APP_ROUTE_COMPONENTS = {
   "preprocessor-order-manager": () =>
     import("@/views/PreprocessorOrderManager.vue"),
   "tool-approval-manager": () => import("@/views/ToolApprovalManager.vue"),
+  "tool-call-records-manager": () =>
+    import("@/views/ToolCallRecordsManager.vue"),
   "thinking-chains-editor": () => import("@/views/ThinkingChainsEditor.vue"),
   "rag-tuning": () => import("@/views/RagTuning.vue"),
   "schedule-manager": () => import("@/views/ScheduleManager.vue"),
@@ -29,8 +35,11 @@ export const APP_ROUTE_COMPONENTS = {
   "semantic-model-router-editor": () =>
     import("@/views/SemanticModelRouterEditor.vue"),
   "final-context-viewer": () => import("@/views/FinalContextViewer.vue"),
+  "bridge-hijack-config": () => import("@/views/BridgeHijackConfig.vue"),
   "theme-editor": () => import("@/views/ThemeEditor.vue"),
   "placeholder-viewer": () => import("@/views/PlaceholderViewer.vue"),
+  "placeholder-explorer-manager": () =>
+    import("@/views/PlaceholderExplorerManager.vue"),
   plugins: () => import("@/views/PluginsHub.vue"),
   "plugin-store": () => import("@/views/PluginStore.vue"),
   "plugin-config": () => import("@/views/PluginConfig.vue"),

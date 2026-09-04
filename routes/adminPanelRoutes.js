@@ -20,7 +20,8 @@ module.exports = function (
   semanticModelRouter,
   modelRedirectHandler,
   apiUrl,
-  apiKey
+  apiKey,
+  tdbKnowledgeManager
 ) {
   if (!agentDirPath || typeof agentDirPath !== "string") {
     throw new Error(
@@ -54,6 +55,7 @@ module.exports = function (
     modelRedirectHandler,
     apiUrl,
     apiKey,
+    tdbKnowledgeManager,
   };
 
   /**
@@ -91,9 +93,12 @@ module.exports = function (
   mount("/", "agents"); // Handles /agents/*
   mount("/", "tvs"); // Handles /tvsvars/*
   mount("/", "placeholders"); // Handles /placeholders
+  mount("/", "placeholderExplorer"); // Handles /placeholder-explorer/*
   mount("/", "schedules"); // Handles /schedules/*
   mount("/", "rag"); // Handles /rag-tags, /rag-params, /available-clusters, etc.
   mount("/", "agentAssistant"); // Handles /agent-assistant/*
+  mount("/", "aiChat"); // Handles /ai/*
+  mount("/", "openHerPersona"); // Handles /openher-persona/*
   mount("/", "taskAssistant"); // Handles /task-assistant/*
   mount("/", "toolListEditor"); // Handles /tool-list/*
   mount("/", "dynamicTools"); // Handles /dynamic-tools/*
@@ -104,6 +109,11 @@ module.exports = function (
   mount("/", "sarPrompts"); // Handles /sarprompts/*
   mount("/", "emojis"); // Handles /emojis/*
   mount("/", "pluginStore"); // Handles /plugin-store/*
+  mount("/", "bridgeProfiles"); // Handles /bridge-profiles/*
+  mount("/", "multimodalConfig"); // Handles /multimodal-config (JSON 真相源 + 热更新)
+  mount("/", "clawMail"); // Handles /claw-mail/*
+  mount("/", "tarotDivination"); // Handles /tarot-divination/*
+  mount("/", "toolCallRecords"); // Handles /tool-call-records/*
 
   return adminApiRouter;
 };

@@ -9,9 +9,15 @@ use serde_json::json;
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
+use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    mpsc, Arc,
+};
+use std::thread;
+use std::time::Duration;
 
 const MAX_FILE_SIZE: u64 = 1024 * 1024; // 1MB
 const DEFAULT_MAX_RESULTS: usize = 200;
@@ -96,6 +102,79 @@ where
     deserializer.deserialize_any(UsizeVisitor)
 }
 
+fn deserialize_option_usize_from_string_or_number<'de, D>(
+    deserializer: D,
+) -> Result<Option<usize>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct OptionalUsizeVisitor;
+    impl<'de> de::Visitor<'de> for OptionalUsizeVisitor {
+        type Value = Option<usize>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+            formatter.write_str(
+                "null, an unsigned integer, or a string representing an unsigned integer",
+            )
+        }
+
+        fn visit_none<E>(self) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            Ok(None)
+        }
+
+        fn visit_unit<E>(self) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            Ok(None)
+        }
+
+        fn visit_some<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+        where
+            D: Deserializer<'de>,
+        {
+            deserialize_usize_from_string_or_number(deserializer).map(Some)
+        }
+
+        fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            Ok(Some(value as usize))
+        }
+
+        fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            if value >= 0 {
+                Ok(Some(value as usize))
+            } else {
+                Err(de::Error::custom("negative integer not allowed for usize"))
+            }
+        }
+
+        fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            let trimmed = value.trim();
+            if trimmed.is_empty() {
+                return Ok(None);
+            }
+
+            trimmed.parse::<usize>().map(Some).map_err(|_| {
+                de::Error::invalid_value(Unexpected::Str(value), &"an unsigned integer string")
+            })
+        }
+    }
+
+    deserializer.deserialize_option(OptionalUsizeVisitor)
+}
+
 #[derive(Deserialize, Debug)]
 struct InputArgs {
     #[serde(default)]
@@ -126,7 +205,15 @@ struct InputArgs {
     root_path: Option<String>,
     ignored_folders: Option<String>,
     allowed_extensions: Option<String>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_option_usize_from_string_or_number"
+    )]
     max_results: Option<usize>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_option_usize_from_string_or_number"
+    )]
     bm25_limit: Option<usize>,
     bm25_search_mode: Option<String>,
     query_tokens: Option<Vec<String>>,
@@ -257,41 +344,43 @@ fn find_project_root() -> PathBuf {
 }
 
 fn main() {
+    if env::args().any(|arg| arg == "--serve") {
+        start_http_server();
+        return;
+    }
+
     let mut buffer = String::new();
     if let Err(e) = io::stdin().read_to_string(&mut buffer) {
         print_error(format!("Failed to read stdin: {}", e));
         return;
     }
 
-    let args: InputArgs = match serde_json::from_str(&buffer) {
-        Ok(args) => args,
-        Err(e) => {
-            print_error(format!("Invalid JSON: {}", e));
-            return;
-        }
-    };
+    match handle_json_request(&buffer) {
+        Ok(output) => print_output(output),
+        Err(message) => print_error(message),
+    }
+}
+
+fn handle_json_request(buffer: &str) -> Result<Output, String> {
+    let args: InputArgs =
+        serde_json::from_str(buffer).map_err(|e| format!("Invalid JSON: {}", e))?;
 
     let config = AppConfig::new(&args);
 
     // 检查根目录是否存在
     if !config.root_path.exists() {
-        print_error(format!(
+        return Err(format!(
             "Daily note root path does not exist: {:?}",
             config.root_path
         ));
-        return;
     }
 
+    handle_args(&config, &args)
+}
+
+fn handle_args(config: &AppConfig, args: &InputArgs) -> Result<Output, String> {
     if args.mode.as_deref() == Some("bm25") {
-        match search_bm25(&config, &args) {
-            Ok(output) => {
-                if let Ok(json) = serde_json::to_string(&output) {
-                    println!("{}", json);
-                }
-            }
-            Err(e) => print_error(format!("BM25 search failed: {}", e)),
-        }
-        return;
+        return search_bm25(config, args).map_err(|e| format!("BM25 search failed: {}", e));
     }
 
     // 编译所有正则表达式。API 侧可通过 queries 传入多关键词，由 Rust 内部执行 AND 匹配，
@@ -300,22 +389,14 @@ fn main() {
     let mut regexes = Vec::new();
     if let Some(queries) = &args.queries {
         for query in queries {
-            match build_single_regex(query, &args) {
-                Ok(re) => regexes.push(re),
-                Err(e) => {
-                    print_error(format!("Invalid regex in queries: {}", e));
-                    return;
-                }
-            }
+            let re = build_single_regex(query, args)
+                .map_err(|e| format!("Invalid regex in queries: {}", e))?;
+            regexes.push(re);
         }
     } else {
-        match build_single_regex(&args.query, &args) {
-            Ok(re) => regexes.push(re),
-            Err(e) => {
-                print_error(format!("Invalid regex: {}", e));
-                return;
-            }
-        }
+        let re =
+            build_single_regex(&args.query, args).map_err(|e| format!("Invalid regex: {}", e))?;
+        regexes.push(re);
     }
 
     // 确定搜索子目录
@@ -324,42 +405,292 @@ fn main() {
             let sub_path = config.root_path.join(f);
             // 安全检查：防止路径穿越
             if !is_path_safe(&sub_path, &config.root_path) {
-                print_error("Path traversal detected in folder parameter".to_string());
-                return;
+                return Err("Path traversal detected in folder parameter".to_string());
             }
             sub_path
         }
         None => config.root_path.clone(),
     };
 
-    match search_in_directory(&search_root, &regexes, &config, &args) {
-        Ok((mut results, total, limited)) => {
-            // 按最后修改时间倒序排序
-            results.sort_by(|a, b| b.last_modified.cmp(&a.last_modified));
+    let (mut results, total, limited) = search_in_directory(&search_root, &regexes, config, args)
+        .map_err(|e| format!("Search failed: {}", e))?;
 
-            let output_content = build_output_content(&results, total, limited);
-            let result_payload = json!({
-                "notes": results,
-                "total": total,
-                "limited": limited,
-                "content": output_content
-            });
+    // 按最后修改时间倒序排序
+    results.sort_by(|a, b| b.last_modified.cmp(&a.last_modified));
 
-            let output = Output {
-                status: "success".to_string(),
-                result: Some(result_payload),
-                notes: None,
-                total,
-                limited,
-                content: None,
-                error: None,
-            };
-            if let Ok(json) = serde_json::to_string(&output) {
-                println!("{}", json);
+    let output_content = build_output_content(&results, total, limited);
+    let result_payload = json!({
+        "notes": results,
+        "total": total,
+        "limited": limited,
+        "content": output_content
+    });
+
+    Ok(Output {
+        status: "success".to_string(),
+        result: Some(result_payload),
+        notes: None,
+        total,
+        limited,
+        content: None,
+        error: None,
+    })
+}
+
+fn print_output(output: Output) {
+    if let Ok(json) = serde_json::to_string(&output) {
+        println!("{}", json);
+    }
+}
+
+#[derive(Clone)]
+struct ServerControl {
+    instance_id: String,
+    shutdown_token: String,
+    shutdown_requested: Arc<AtomicBool>,
+}
+
+fn start_http_server() {
+    let host = env::var("DAILY_NOTE_SEARCHER_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
+    let port = env::var("DAILY_NOTE_SEARCHER_PORT").unwrap_or_else(|_| "38765".to_string());
+    let instance_id = env::var("DAILY_NOTE_SEARCHER_INSTANCE_ID")
+        .unwrap_or_else(|_| format!("standalone-{}", std::process::id()));
+    let shutdown_token = env::var("DAILY_NOTE_SEARCHER_SHUTDOWN_TOKEN").unwrap_or_default();
+    let address = format!("{}:{}", host, port);
+    let shutdown_requested = Arc::new(AtomicBool::new(false));
+    let control = ServerControl {
+        instance_id,
+        shutdown_token,
+        shutdown_requested: Arc::clone(&shutdown_requested),
+    };
+
+    let listener = match TcpListener::bind(&address) {
+        Ok(listener) => listener,
+        Err(e) => {
+            eprintln!(
+                "[DailyNoteSearcher] Failed to bind HTTP server at {}: {}",
+                address, e
+            );
+            std::process::exit(1);
+        }
+    };
+    if let Err(e) = listener.set_nonblocking(true) {
+        eprintln!(
+            "[DailyNoteSearcher] Failed to configure non-blocking listener: {}",
+            e
+        );
+        std::process::exit(1);
+    }
+
+    // The Node bridge deliberately keeps the child's stdin pipe open. An EOF
+    // means the parent exited or was force-killed before it could call /shutdown.
+    let parent_liveness = Arc::clone(&shutdown_requested);
+    thread::spawn(move || {
+        let mut stdin = io::stdin();
+        let mut buffer = [0_u8; 1];
+        loop {
+            match stdin.read(&mut buffer) {
+                Ok(0) | Err(_) => {
+                    parent_liveness.store(true, Ordering::SeqCst);
+                    break;
+                }
+                Ok(_) => {}
             }
         }
-        Err(e) => print_error(format!("Search failed: {}", e)),
+    });
+
+    eprintln!(
+        "[DailyNoteSearcher] HTTP server listening on http://{} (pid={}, instance={})",
+        address,
+        std::process::id(),
+        control.instance_id
+    );
+
+    while !shutdown_requested.load(Ordering::SeqCst) {
+        match listener.accept() {
+            Ok((stream, _)) => {
+                let connection_control = control.clone();
+                thread::spawn(move || {
+                    if let Err(e) = handle_http_connection(stream, connection_control) {
+                        eprintln!("[DailyNoteSearcher] HTTP request failed: {}", e);
+                    }
+                });
+            }
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(50));
+            }
+            Err(e) => {
+                eprintln!("[DailyNoteSearcher] HTTP connection error: {}", e);
+                thread::sleep(Duration::from_millis(100));
+            }
+        }
     }
+
+    eprintln!("[DailyNoteSearcher] HTTP server stopped gracefully.");
+}
+
+fn handle_http_connection(mut stream: TcpStream, control: ServerControl) -> Result<(), String> {
+    let mut buffer = Vec::new();
+    let mut temp = [0_u8; 4096];
+    let mut headers_end = None;
+    let mut content_length = 0_usize;
+
+    loop {
+        let read_count = stream.read(&mut temp).map_err(|e| e.to_string())?;
+        if read_count == 0 {
+            break;
+        }
+        buffer.extend_from_slice(&temp[..read_count]);
+
+        if headers_end.is_none() {
+            if let Some(pos) = find_header_end(&buffer) {
+                headers_end = Some(pos);
+                let headers = String::from_utf8_lossy(&buffer[..pos]);
+                content_length = parse_content_length(&headers).unwrap_or(0);
+            }
+        }
+
+        if let Some(pos) = headers_end {
+            if buffer.len() >= pos + 4 + content_length {
+                break;
+            }
+        }
+
+        if buffer.len() > 128 * 1024 * 1024 {
+            return Err("HTTP request exceeded 128MB".to_string());
+        }
+    }
+
+    let headers_end =
+        headers_end.ok_or_else(|| "Invalid HTTP request: missing headers".to_string())?;
+    let request_line_end = buffer[..headers_end]
+        .windows(2)
+        .position(|window| window == b"\r\n")
+        .unwrap_or(headers_end);
+    let request_line = String::from_utf8_lossy(&buffer[..request_line_end]);
+    let request_path = request_line.split_whitespace().nth(1).unwrap_or("");
+
+    if !request_line.starts_with("POST ") {
+        write_http_json(
+            &mut stream,
+            405,
+            r#"{"status":"error","error":"Only POST is supported"}"#,
+        )?;
+        return Ok(());
+    }
+
+    if request_path == "/health" {
+        let response = json!({
+            "status": "success",
+            "pid": std::process::id(),
+            "instance_id": control.instance_id
+        });
+        write_http_json(&mut stream, 200, &response.to_string())?;
+        return Ok(());
+    }
+
+    let body_start = headers_end + 4;
+    let body_end = body_start + content_length;
+    let body = String::from_utf8_lossy(&buffer[body_start..body_end]).to_string();
+
+    if request_path == "/shutdown" {
+        let request: serde_json::Value =
+            serde_json::from_str(&body).map_err(|e| format!("Invalid shutdown JSON: {}", e))?;
+        let token_matches = !control.shutdown_token.is_empty()
+            && request.get("token").and_then(|value| value.as_str())
+                == Some(control.shutdown_token.as_str());
+        let instance_matches = request.get("instance_id").and_then(|value| value.as_str())
+            == Some(control.instance_id.as_str());
+
+        if !token_matches || !instance_matches {
+            write_http_json(
+                &mut stream,
+                403,
+                r#"{"status":"error","error":"Invalid shutdown credentials"}"#,
+            )?;
+            return Ok(());
+        }
+
+        write_http_json(
+            &mut stream,
+            200,
+            r#"{"status":"success","message":"shutdown accepted"}"#,
+        )?;
+        control.shutdown_requested.store(true, Ordering::SeqCst);
+        return Ok(());
+    }
+
+    if request_path != "/search" && request_path != "/" {
+        write_http_json(
+            &mut stream,
+            404,
+            r#"{"status":"error","error":"Not found"}"#,
+        )?;
+        return Ok(());
+    }
+
+    let (status_code, response_body) = match handle_json_request(&body) {
+        Ok(output) => (
+            200,
+            serde_json::to_string(&output).unwrap_or_else(|_| {
+                r#"{"status":"error","error":"serialization failed"}"#.to_string()
+            }),
+        ),
+        Err(message) => {
+            let output = Output {
+                status: "error".to_string(),
+                result: None,
+                notes: None,
+                total: 0,
+                limited: false,
+                content: None,
+                error: Some(message),
+            };
+            (
+                200,
+                serde_json::to_string(&output).unwrap_or_else(|_| {
+                    r#"{"status":"error","error":"serialization failed"}"#.to_string()
+                }),
+            )
+        }
+    };
+
+    write_http_json(&mut stream, status_code, &response_body)
+}
+
+fn find_header_end(buffer: &[u8]) -> Option<usize> {
+    buffer.windows(4).position(|window| window == b"\r\n\r\n")
+}
+
+fn parse_content_length(headers: &str) -> Option<usize> {
+    headers.lines().find_map(|line| {
+        let (key, value) = line.split_once(':')?;
+        if key.trim().eq_ignore_ascii_case("content-length") {
+            value.trim().parse::<usize>().ok()
+        } else {
+            None
+        }
+    })
+}
+
+fn write_http_json(stream: &mut TcpStream, status_code: u16, body: &str) -> Result<(), String> {
+    let reason = match status_code {
+        200 => "OK",
+        403 => "Forbidden",
+        404 => "Not Found",
+        405 => "Method Not Allowed",
+        _ => "OK",
+    };
+    let response = format!(
+        "HTTP/1.1 {} {}\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        status_code,
+        reason,
+        body.as_bytes().len(),
+        body
+    );
+    stream
+        .write_all(response.as_bytes())
+        .map_err(|e| e.to_string())
 }
 
 fn is_path_safe(target: &Path, root: &Path) -> bool {
@@ -611,6 +942,10 @@ struct BM25Note {
     score: f64,
 }
 
+fn is_bm25_token_char(ch: char) -> bool {
+    ch.is_ascii_alphanumeric() || ch == '_' || ('\u{4e00}'..='\u{9fff}').contains(&ch)
+}
+
 fn tokenize_for_bm25(text: &str, blacklist: &HashSet<String>) -> Vec<String> {
     let mut tokens = Vec::new();
     let mut current = String::new();
@@ -624,7 +959,7 @@ fn tokenize_for_bm25(text: &str, blacklist: &HashSet<String>) -> Vec<String> {
     .collect();
 
     for ch in text.to_lowercase().chars() {
-        if ch.is_ascii_alphanumeric() || ch == '_' || ('\u{4e00}'..='\u{9fff}').contains(&ch) {
+        if is_bm25_token_char(ch) {
             current.push(ch);
         } else if !current.is_empty() {
             if !stop_words.contains(current.as_str()) && !blacklist.contains(&current) {
@@ -813,6 +1148,7 @@ fn search_bm25(config: &AppConfig, args: &InputArgs) -> Result<Output, io::Error
         for query_token in &query_tokens {
             let normalized_query_token = query_token.to_lowercase();
             if !normalized_query_token.is_empty()
+                && normalized_query_token.chars().any(is_bm25_token_char)
                 && normalized_match_text.contains(&normalized_query_token)
             {
                 tokens.push(query_token.clone());

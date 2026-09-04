@@ -1,8 +1,11 @@
 {
   "enabled": false,
-  "approveAll": false,
   "timeoutMinutes": 5,
+  "approveAll": false,
   "fuzzyToolMatching": true,
+  "privacyProtection": {
+    "enabled": false
+  },
   "approvalList": [
     "PowerShellExecutor",
     "ServerPowerShellExecutor",

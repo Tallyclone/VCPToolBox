@@ -2,6 +2,12 @@
 const { StringDecoder } = require('string_decoder');
 const vcpInfoHandler = require('../../vcpInfoHandler.js');
 const roleDivider = require('../roleDivider.js');
+const {
+  extractReasoningText,
+  removeReasoningFields,
+  normalizeReasoningTag,
+  shouldConvertReasoningForModel
+} = require('../reasoningContentAdapter.js');
 
 class StreamHandler {
   constructor(context) {
@@ -16,7 +22,6 @@ class StreamHandler {
       pluginManager,
       writeDebugLog,
       writeChatLog,
-      handleDiaryFromAIResponse,
       webSocketServer,
       DEBUG_MODE,
       SHOW_VCP_OUTPUT,
@@ -38,20 +43,83 @@ class StreamHandler {
       _refreshRagBlocksIfNeeded,
       fetchWithRetry,
       vcpToolUseForbidden,
+      apiConnectionTimeoutMs,
       semanticModelFallbackCandidates,
-      oneRingResponseMeta
+      oneRingResponseMeta,
+      shouldProcessMedia,
+      shouldProcessMediaPlus,
+      isTextOnlyForceTranslateModel,
+      requestPreprocessorConfig,
+      reasoningToContentEnabled: reasoningToContentGloballyEnabled,
+      reasoningToContentTag,
+      reasoningToContentModels
     } = this.context;
 
     const shouldShowVCP = SHOW_VCP_OUTPUT || this.context.forceShowVCP;
+    const reasoningToContentEnabled = shouldConvertReasoningForModel(
+      originalBody.model,
+      reasoningToContentGloballyEnabled,
+      reasoningToContentModels
+    );
+    const reasoningTag = normalizeReasoningTag(reasoningToContentTag);
     const id = originalBody.requestId || originalBody.messageId;
 
     let currentMessagesForLoop = originalBody.messages ? JSON.parse(JSON.stringify(originalBody.messages)) : [];
     let recursionDepth = 0;
     const maxRecursion = maxVCPLoopStream || 5;
     let currentAIContentForLoop = '';
-    let currentAIRawDataForDiary = '';
     let chatLogs = [];
     let oneRingAssistantTurnParts = [];
+
+    const containsImageUrlPart = (content) => Array.isArray(content) &&
+      content.some(part => part?.type === 'image_url' && part.image_url && typeof part.image_url.url === 'string');
+
+    const maybeTranslateToolPayloadMedia = async (content) => {
+      if (!containsImageUrlPart(content)) return content;
+
+      const shouldTranslateToolMedia = shouldProcessMedia || isTextOnlyForceTranslateModel;
+      if (!shouldTranslateToolMedia) return content;
+
+      const processorName = pluginManager.messagePreprocessors.has('MultiModalProcessor')
+        ? 'MultiModalProcessor'
+        : 'ImageProcessor';
+      if (!pluginManager.messagePreprocessors.has(processorName)) {
+        if (DEBUG_MODE) console.warn(`[VCP Stream Loop] Tool payload contains image_url, but ${processorName} is unavailable. Forwarding original payload.`);
+        return content;
+      }
+
+      const originalImageParts = content.filter(part => part?.type === 'image_url' && part.image_url && typeof part.image_url.url === 'string');
+      const payloadMessage = { role: 'user', content: JSON.parse(JSON.stringify(content)) };
+
+      if (DEBUG_MODE) {
+        console.log(`[VCP Stream Loop] Translating tool-returned image_url content via ${processorName}. textOnly=${!!isTextOnlyForceTranslateModel}, plus=${!!shouldProcessMediaPlus}`);
+      }
+
+      let translatedMessages;
+      try {
+        translatedMessages = await pluginManager.executeMessagePreprocessor(
+          processorName,
+          [payloadMessage],
+          requestPreprocessorConfig || {}
+        );
+      } catch (pluginError) {
+        console.error(`[VCP Stream Loop] Error translating tool-returned media via ${processorName}:`, pluginError);
+        return content;
+      }
+
+      const translatedContent = translatedMessages?.[0]?.content;
+      if (!Array.isArray(translatedContent)) return content;
+
+      if (shouldProcessMediaPlus && !isTextOnlyForceTranslateModel) {
+        const translatedWithoutImages = translatedContent.filter(part => part?.type !== 'image_url');
+        return [
+          ...translatedWithoutImages,
+          ...JSON.parse(JSON.stringify(originalImageParts))
+        ];
+      }
+
+      return translatedContent;
+    };
 
     const recordOneRingAIResponse = (aiText, phaseLabel) => {
       const oneRingModule = pluginManager?.messagePreprocessors?.get?.('OneRing');
@@ -75,25 +143,97 @@ class StreamHandler {
       return new Promise((resolve, reject) => {
         const decoder = new StringDecoder('utf8');
         let collectedContentThisTurn = '';
-        let rawResponseDataThisTurn = '';
         let sseLineBuffer = '';
         let streamAborted = false;
         let keepAliveTimer = null;
         let chunkIdleTimer = null;
         const CHUNK_IDLE_TIMEOUT = 90000; // 90 秒无新 chunk 则判定上游流冻结
         let message = { content: '', reasoning_content: '' };
+        let clientReasoningBlockOpen = false;
+        let clientReasoningEndsWithNewline = false;
 
         const appendDelta = (delta) => {
           if (delta && delta.content) {
             collectedContentThisTurn += delta.content;
             message.content += delta.content;
           }
-          if (delta && delta.reasoning_content) {
-            // P0 安全修复：reasoning_content 只保留在日志 message.reasoning_content 中，
-            // 绝不混入 collectedContentThisTurn。该变量会进入 VCP 循环与 OneRing 入库，
-            // 一旦混入推理链会造成明文持久化与后续上下文污染。
-            message.reasoning_content += delta.reasoning_content;
+
+          const reasoningText = extractReasoningText(delta);
+          if (reasoningText) {
+            // 推理内容只保留在日志字段中，绝不混入 collectedContentThisTurn。
+            // 客户端展示转换在独立副本上进行，避免进入 VCP Loop、OneRing 和日记。
+            message.reasoning_content += reasoningText;
           }
+        };
+
+        const transformParsedDataForClient = (parsedData) => {
+          if (!reasoningToContentEnabled || !parsedData || typeof parsedData !== 'object') {
+            return parsedData;
+          }
+
+          const transformed = JSON.parse(JSON.stringify(parsedData));
+          const choice = transformed.choices?.[0];
+          const delta = choice?.delta;
+          if (!delta || typeof delta !== 'object') return transformed;
+
+          const reasoningText = extractReasoningText(delta);
+          const visibleContent = typeof delta.content === 'string' ? delta.content : '';
+          let clientContent = '';
+
+          if (reasoningText) {
+            if (!clientReasoningBlockOpen) {
+              clientContent += `<${reasoningTag}>\n`;
+              clientReasoningBlockOpen = true;
+            }
+            clientContent += reasoningText;
+            clientReasoningEndsWithNewline = /(?:\r\n|\r|\n)$/.test(reasoningText);
+          }
+
+          // 正文与推理同 chunk 出现时，先规范闭合思考块，再输出正文。
+          if (visibleContent && clientReasoningBlockOpen) {
+            clientContent += `${clientReasoningEndsWithNewline ? '' : '\n'}</${reasoningTag}>\n`;
+            clientReasoningBlockOpen = false;
+            clientReasoningEndsWithNewline = false;
+          }
+          clientContent += visibleContent;
+
+          // 上游明确结束但没有正文时，也必须规范补齐闭合标签。
+          if (choice.finish_reason && clientReasoningBlockOpen) {
+            clientContent += `${clientReasoningEndsWithNewline ? '' : '\n'}</${reasoningTag}>\n`;
+            clientReasoningBlockOpen = false;
+            clientReasoningEndsWithNewline = false;
+          }
+
+          removeReasoningFields(delta);
+          if (clientContent) {
+            delta.content = clientContent;
+          } else if (Object.prototype.hasOwnProperty.call(delta, 'content')) {
+            delete delta.content;
+          }
+
+          return transformed;
+        };
+
+        const writeClientReasoningCloseChunk = () => {
+          if (!reasoningToContentEnabled || !clientReasoningBlockOpen || res.writableEnded || res.destroyed) {
+            return;
+          }
+
+          const closePrefix = clientReasoningEndsWithNewline ? '' : '\n';
+          clientReasoningBlockOpen = false;
+          clientReasoningEndsWithNewline = false;
+          const closePayload = {
+            id: `chatcmpl-VCP-reasoning-close-${Date.now()}`,
+            object: 'chat.completion.chunk',
+            created: Math.floor(Date.now() / 1000),
+            model: originalBody.model || 'unknown',
+            choices: [{
+              index: 0,
+              delta: { content: `${closePrefix}</${reasoningTag}>\n` },
+              finish_reason: null
+            }]
+          };
+          res.write(`data: ${JSON.stringify(closePayload)}\n\n`);
         };
         // 🌟 核心修复：注入 SSE 幽灵心跳保活，防止上游卡顿时浏览器假死
         keepAliveTimer = setInterval(() => {
@@ -134,7 +274,7 @@ class StreamHandler {
             }
             if (keepAliveTimer) clearInterval(keepAliveTimer);
             if (abortController?.signal) abortController.signal.removeEventListener('abort', abortHandler);
-            resolve({ content: collectedContentThisTurn, raw: rawResponseDataThisTurn, message: message });
+            resolve({ content: collectedContentThisTurn, message: message });
           }, CHUNK_IDLE_TIMEOUT);
         };
         resetChunkIdleTimer(); // 启动首次空闲计时
@@ -144,7 +284,7 @@ class StreamHandler {
           if (DEBUG_MODE) console.log('[Stream Abort] Abort signal received, stopping stream processing.');
           if (abortController?.signal) abortController.signal.removeEventListener('abort', abortHandler);
           if (aiResponse.body && !aiResponse.body.destroyed) aiResponse.body.destroy();
-          resolve({ content: collectedContentThisTurn, raw: rawResponseDataThisTurn, message: message });
+          resolve({ content: collectedContentThisTurn, message: message });
         };
 
         if (abortController?.signal) {
@@ -156,7 +296,6 @@ class StreamHandler {
           resetChunkIdleTimer(); // 每收到一个 chunk 就重置空闲计时器
 
           const chunkString = decoder.write(chunk);
-          rawResponseDataThisTurn += chunkString;
           sseLineBuffer += chunkString;
 
           // 按行处理：既保证了转发的实时性，又解决了 [DONE] 跨包截断的问题
@@ -166,30 +305,34 @@ class StreamHandler {
 
           for (const line of lines) {
             const trimmedLine = line.trim();
+            const isDoneLine = trimmedLine === 'data: [DONE]' || trimmedLine === 'data:[DONE]';
+            let parsedData = null;
 
-            // 1. 转发逻辑：只要不是 [DONE] 就立即转发
-            if (!res.writableEnded && !res.destroyed) {
-              // 必须保留空行，因为 SSE 依靠空行 (\n\n) 来分隔消息块
-              // 如果丢失空行，多个 data: 块会被合并，导致前端解析 JSON 失败
-              if (trimmedLine !== 'data: [DONE]' && trimmedLine !== 'data:[DONE]') {
+            if (trimmedLine.startsWith('data:')) {
+              const jsonData = trimmedLine.substring(5).trim();
+              if (jsonData && jsonData !== '[DONE]') {
                 try {
-                  // 统一使用 \n 作为换行符转发，确保前端解析正常
-                  res.write(line + '\n');
-                } catch (writeError) {
-                  streamAborted = true;
-                }
+                  parsedData = JSON.parse(jsonData);
+                  // 后台始终收集未经展示转换的原始 delta。
+                  appendDelta(parsedData.choices?.[0]?.delta);
+                } catch (e) { }
               }
             }
 
-            // 2. 后台解析逻辑：收集内容用于 VCP 循环
-            if (trimmedLine.startsWith('data: ')) {
-              const jsonData = trimmedLine.substring(6).trim();
-              if (jsonData && jsonData !== '[DONE]') {
-                try {
-                  const parsedData = JSON.parse(jsonData);
-                  const delta = parsedData.choices?.[0]?.delta;
-                  appendDelta(delta);
-                } catch (e) { }
+            // 转发时才将 reasoning 字段改写成标签化正文；内部处理仍使用原始 parsedData。
+            if (!res.writableEnded && !res.destroyed) {
+              try {
+                if (isDoneLine) {
+                  writeClientReasoningCloseChunk();
+                } else if (reasoningToContentEnabled && parsedData) {
+                  const transformedData = transformParsedDataForClient(parsedData);
+                  res.write(`data: ${JSON.stringify(transformedData)}\n`);
+                } else {
+                  // 保留空行，因为 SSE 依靠空行分隔消息块。
+                  res.write(line + '\n');
+                }
+              } catch (writeError) {
+                streamAborted = true;
               }
             }
           }
@@ -200,33 +343,41 @@ class StreamHandler {
           if (chunkIdleTimer) clearTimeout(chunkIdleTimer);
           const remainingString = decoder.end();
           if (remainingString) {
-            rawResponseDataThisTurn += remainingString;
             sseLineBuffer += remainingString;
           }
 
-          // 处理最后剩余的 buffer 并转发
+          // 处理最后剩余的 buffer并转发
           if (sseLineBuffer.length > 0) {
             const trimmedLine = sseLineBuffer.trim();
-            if (!res.writableEnded && !res.destroyed && trimmedLine !== 'data: [DONE]' && trimmedLine !== 'data:[DONE]') {
-              try {
-                res.write(sseLineBuffer + '\n');
-              } catch (e) { }
-            }
+            const isDoneLine = trimmedLine === 'data: [DONE]' || trimmedLine === 'data:[DONE]';
+            let parsedData = null;
 
-            if (trimmedLine.startsWith('data: ')) {
-              const jsonData = trimmedLine.substring(6).trim();
+            if (trimmedLine.startsWith('data:')) {
+              const jsonData = trimmedLine.substring(5).trim();
               if (jsonData && jsonData !== '[DONE]') {
                 try {
-                  const parsedData = JSON.parse(jsonData);
-                  const delta = parsedData.choices?.[0]?.delta;
-                  appendDelta(delta);
+                  parsedData = JSON.parse(jsonData);
+                  appendDelta(parsedData.choices?.[0]?.delta);
                 } catch (e) { }
               }
             }
+
+            if (!res.writableEnded && !res.destroyed) {
+              try {
+                if (isDoneLine) {
+                  writeClientReasoningCloseChunk();
+                } else if (reasoningToContentEnabled && parsedData) {
+                  res.write(`data: ${JSON.stringify(transformParsedDataForClient(parsedData))}\n`);
+                } else {
+                  res.write(sseLineBuffer + '\n');
+                }
+              } catch (e) { }
+            }
           }
 
+          writeClientReasoningCloseChunk();
           if (abortController?.signal) abortController.signal.removeEventListener('abort', abortHandler);
-          resolve({ content: collectedContentThisTurn, raw: rawResponseDataThisTurn, message: message });
+          resolve({ content: collectedContentThisTurn, message: message });
         });
 
         aiResponse.body.on('error', streamError => {
@@ -253,14 +404,10 @@ class StreamHandler {
     if (DEBUG_MODE) console.log('[VCP Stream Loop] Processing initial AI call.');
     let initialAIResponseData = await processAIResponseStreamHelper(firstAiAPIResponse, true);
     currentAIContentForLoop = initialAIResponseData.content;
-    currentAIRawDataForDiary = initialAIResponseData.raw;
     if (writeChatLog) chatLogs.push({ request: originalBody, response: initialAIResponseData.message });
     if (currentAIContentForLoop && currentAIContentForLoop.trim()) {
       oneRingAssistantTurnParts.push(currentAIContentForLoop);
     }
-    handleDiaryFromAIResponse(currentAIRawDataForDiary).catch(e =>
-      console.error('[VCP Stream Loop] Error in initial diary handling:', e),
-    );
 
     // --- VCP 循环 ---
     while (recursionDepth < maxRecursion) {
@@ -306,6 +453,7 @@ class StreamHandler {
 
       const { normal: normalCalls, archery: archeryCalls } = ToolCallParser.separate(toolCalls);
       const archeryErrorContents = [];
+      const archeryStatusSummaryItems = [];
 
       // 执行 Archery 调用
       const archeryLogs = await Promise.all(archeryCalls.map(async toolCall => {
@@ -314,6 +462,7 @@ class StreamHandler {
           const isError = !result.success || (result.raw && this.context.isToolResultError(result.raw));
 
           if (isError) {
+            archeryStatusSummaryItems.push(`${toolCall.name} 调用失败${result.recordId ? ` (记录ID: ${result.recordId})` : ''}`);
             archeryErrorContents.push({
               type: 'text',
               text: `[异步工具 "${toolCall.name}" 返回了错误，请注意]:\n${result.content[0].text}`
@@ -338,6 +487,27 @@ class StreamHandler {
 
         if (!res.writableEnded && !res.destroyed) {
           try {
+            if (archeryStatusSummaryItems.length > 0) {
+              if (enableRoleDivider) {
+                res.write(`data: ${JSON.stringify({
+                  id: `chatcmpl-vcp-start-${Date.now()}`,
+                  object: "chat.completion.chunk",
+                  choices: [{ index: 0, delta: { content: "\n<<<[ROLE_DIVIDE_USER]>>>\n" }, finish_reason: null }]
+                })}\n\n`);
+              }
+              res.write(`data: ${JSON.stringify({
+                id: `chatcmpl-vcp-summary-${Date.now()}`,
+                object: "chat.completion.chunk",
+                choices: [{ index: 0, delta: { content: `\n[本轮工具调用摘要:]\n${archeryStatusSummaryItems.join('；')}。\n[本轮工具调用摘要结束]\n` }, finish_reason: null }]
+              })}\n\n`);
+              if (enableRoleDivider) {
+                res.write(`data: ${JSON.stringify({
+                  id: `chatcmpl-vcp-end-${Date.now()}`,
+                  object: "chat.completion.chunk",
+                  choices: [{ index: 0, delta: { content: "\n<<<[END_ROLE_DIVIDE_USER]>>>\n" }, finish_reason: null }]
+                })}\n\n`);
+              }
+            }
             res.write(`data: ${JSON.stringify({
               id: `chatcmpl-VCP-separator-${Date.now()}`,
               object: 'chat.completion.chunk',
@@ -360,7 +530,7 @@ class StreamHandler {
             body: JSON.stringify({ ...originalBody, messages: currentMessagesForLoop, stream: true }),
             signal: abortController.signal,
           },
-          { retries: apiRetries, delay: apiRetryDelay, debugMode: DEBUG_MODE, modelFallbackCandidates: semanticModelFallbackCandidates }
+          { retries: apiRetries, delay: apiRetryDelay, debugMode: DEBUG_MODE, connectionTimeout: apiConnectionTimeoutMs, modelFallbackCandidates: semanticModelFallbackCandidates }
         );
 
         if (nextAiAPIResponse.ok) {
@@ -414,10 +584,28 @@ class StreamHandler {
 
       // VCP 信息展示 - 批量包裹为单个 USER 角色
       let hasStartedUserBlock = false;
+      const toolStatusSummaryItems = [...archeryStatusSummaryItems];
       for (let i = 0; i < normalCalls.length; i++) {
         const toolCall = normalCalls[i];
         const result = toolResults[i];
         const forceThisOne = !shouldShowVCP && toolCall.markHistory;
+        const isError = !result?.success || (result?.raw && this.context.isToolResultError(result.raw));
+        const rawObject = result?.raw && typeof result.raw === 'object' ? result.raw : null;
+        const errorText = isError ? [
+          result?.error,
+          result?.raw,
+          ...(Array.isArray(result?.content) ? result.content.map(item => item?.text) : [])
+        ].filter(Boolean).map(item => typeof item === 'string' ? item : JSON.stringify(item)).join('\n') : '';
+
+        // 摘要状态顺序：先由 isError/结构化 success 确定成败；只有失败时才进一步细分“拒绝”，最后再判超时。
+        const isRejected = isError && (
+          rawObject?.rejected_by_user === true ||
+          rawObject?.error_type === 'approval_rejected' ||
+          /manual\s*approval\s*was\s*rejected|rejected\s*by\s*user|approval\s*rejected|用户拒绝|人工审核.*拒绝/i.test(errorText)
+        );
+        const isTimeout = isError && !isRejected && /超时|timeout|timed\s*out|DIRECT_TOOL_TIMEOUT|TIMEOUT/i.test(errorText);
+        const statusText = isRejected ? '调用拒绝' : (isTimeout ? '调用超时' : (isError ? '调用失败' : '调用成功'));
+        toolStatusSummaryItems.push(`${toolCall.name} ${statusText}${result?.recordId ? ` (记录ID: ${result.recordId})` : ''}`);
 
         if ((shouldShowVCP || forceThisOne) && !res.writableEnded && !res.destroyed) {
           if (!hasStartedUserBlock && enableRoleDivider) {
@@ -433,6 +621,25 @@ class StreamHandler {
           }
           vcpInfoHandler.streamVcpInfo(res, originalBody.model, toolCall.name, result.success ? 'success' : 'error', result.raw || result.error, abortController);
         }
+      }
+
+      if (toolStatusSummaryItems.length > 0 && !res.writableEnded && !res.destroyed) {
+        try {
+          if (!hasStartedUserBlock && enableRoleDivider) {
+            res.write(`data: ${JSON.stringify({
+              id: `chatcmpl-vcp-start-${Date.now()}`,
+              object: "chat.completion.chunk",
+              choices: [{ index: 0, delta: { content: "\n<<<[ROLE_DIVIDE_USER]>>>\n" }, finish_reason: null }]
+            })}\n\n`);
+            hasStartedUserBlock = true;
+          }
+
+          res.write(`data: ${JSON.stringify({
+            id: `chatcmpl-vcp-summary-${Date.now()}`,
+            object: "chat.completion.chunk",
+            choices: [{ index: 0, delta: { content: `\n[本轮工具调用摘要:]\n${toolStatusSummaryItems.join('；')}。\n[本轮工具调用摘要结束]\n` }, finish_reason: null }]
+          })}\n\n`);
+        } catch (e) {}
       }
       
       if (hasStartedUserBlock && !res.writableEnded && !res.destroyed && enableRoleDivider) {
@@ -459,8 +666,14 @@ class StreamHandler {
       }
 
       const hasImage = combinedToolResultsForAI.some(item => item.type === 'image_url');
+      const translatedToolResultsForAI = hasImage
+        ? await maybeTranslateToolPayloadMedia([
+          { type: 'text', text: `<!-- VCP_TOOL_PAYLOAD -->\nResults:` },
+          ...combinedToolResultsForAI
+        ])
+        : null;
       const finalToolPayloadForAI = hasImage
-        ? [{ type: 'text', text: `<!-- VCP_TOOL_PAYLOAD -->\nResults:` }, ...combinedToolResultsForAI]
+        ? translatedToolResultsForAI
         : `<!-- VCP_TOOL_PAYLOAD -->\n${toolResultsTextForRAG}`;
 
       currentMessagesForLoop.push({ role: 'user', content: finalToolPayloadForAI });
@@ -487,7 +700,7 @@ class StreamHandler {
           body: JSON.stringify({ ...originalBody, messages: currentMessagesForLoop, stream: true }),
           signal: abortController.signal,
         },
-        { retries: apiRetries, delay: apiRetryDelay, debugMode: DEBUG_MODE, modelFallbackCandidates: semanticModelFallbackCandidates }
+        { retries: apiRetries, delay: apiRetryDelay, debugMode: DEBUG_MODE, connectionTimeout: apiConnectionTimeoutMs, modelFallbackCandidates: semanticModelFallbackCandidates }
       );
 
       if (!nextAiAPIResponse.ok) break;
@@ -504,11 +717,6 @@ class StreamHandler {
           response: nextAIResponseData.message,
         });
       }
-
-      // 记录日志
-      handleDiaryFromAIResponse(nextAIResponseData.raw).catch(e =>
-        console.error(`[VCP Stream Loop] Error in diary handling for depth ${recursionDepth}:`, e),
-      );
 
       recursionDepth++;
     } // toolcall loop end

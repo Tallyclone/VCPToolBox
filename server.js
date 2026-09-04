@@ -118,6 +118,7 @@ const taskScheduler = require('./routes/taskScheduler.js');
 const webSocketServer = require('./WebSocketServer.js'); // 新增 WebSocketServer 引入
 const FileFetcherServer = require('./FileFetcherServer.js'); // 引入新的 FileFetcherServer 模块
 const vcpInfoHandler = require('./vcpInfoHandler.js'); // 引入新的 VCP 信息处理器
+const toolCallRecordStore = require('./modules/toolCallRecordStore.js'); // 工具调用记录独立 SQLite 存储
 const basicAuth = require('basic-auth');
 const cors = require('cors'); // 引入 cors 模块
 
@@ -370,7 +371,15 @@ const DEBUG_MODE = (process.env.DebugMode || "False").toLowerCase() === "true";
 const CHAT_LOG_ENABLED = (process.env.CHAT_LOG_ENABLED || "false").toLowerCase() === "true";
 const VCPToolCode = (process.env.VCPToolCode || "false").toLowerCase() === "true"; // 新增：读取VCP工具调用验证码开关
 const SHOW_VCP_OUTPUT = (process.env.ShowVCP || "False").toLowerCase() === "true"; // 读取 ShowVCP 环境变量
-const RAG_MEMO_REFRESH = (process.env.RAGMemoRefresh || "false").toLowerCase() === "true"; // 新增：RAG日记刷新开关
+const REASONING_TO_CONTENT_ENABLED = (process.env.ReasoningToContentEnabled || "false").toLowerCase() === "true";
+const REASONING_TO_CONTENT_TAG = String(process.env.ReasoningToContentTag || "think").trim().toLowerCase() === "thinking"
+    ? "thinking"
+    : "think";
+const REASONING_TO_CONTENT_MODELS = String(process.env.ReasoningToContentModel || "")
+    .split(',')
+    .map(model => model.trim().toLowerCase())
+    .filter(Boolean);
+const RAG_MEMO_REFRESH = (process.env.RAGMemoRefresh || "false").toLowerCase() === "true"; // 新增：传递RAG日记刷新开关
 const ENABLE_ROLE_DIVIDER = (process.env.EnableRoleDivider || "false").toLowerCase() === "true"; // 新增：角色分割开关
 const ENABLE_ROLE_DIVIDER_IN_LOOP = (process.env.EnableRoleDividerInLoop || "false").toLowerCase() === "true"; // 新增：循环栈角色分割开关
 const ROLE_DIVIDER_SYSTEM = (process.env.RoleDividerSystem || "true").toLowerCase() === "true"; // 新增：System角色分割开关
@@ -396,6 +405,37 @@ try {
     console.error("Failed to parse ChinaModel1:", e);
 }
 const CHINA_MODEL_1_COT = (process.env.ChinaModel1Cot || "false").toLowerCase() === "true";
+
+// 多模态配置 JSON 真相源（multimodal-config.json）：优先级高于 config.env，支持热更新
+// 在初始化阶段先确保文件存在并加载内存配置；运行时由 chatCompletionHandler / image-processor 直接调用 store。
+const multiModalConfigStore = require('./modules/multiModalConfigStore.js');
+try {
+    multiModalConfigStore.init();
+    console.log('[Server] multimodal-config.json 配置真相源已加载，路径：', multiModalConfigStore.CONFIG_PATH);
+} catch (multiModalInitErr) {
+    console.error('[Server] 初始化 multimodal-config.json 失败：', multiModalInitErr);
+}
+
+// 纯文本模型强制翻译多模态：tag 列表，命中即无视 {{TransBase64}}/{{TransBase64+}} 占位符
+// 用于配合模型动态路由（VCPModelAuto/SemanticModelRouter），避免把 base64 多模态传给纯文本模型
+// 仅作为启动快照保留；运行时 chatCompletionHandler 会从 multiModalConfigStore 拉取最新值
+let MULTIMODAL_FORCE_TRANSLATE_MODELS = [];
+try {
+    const storeTags = multiModalConfigStore.getForceTranslateModels();
+    if (Array.isArray(storeTags) && storeTags.length > 0) {
+        MULTIMODAL_FORCE_TRANSLATE_MODELS = storeTags;
+    } else {
+        MULTIMODAL_FORCE_TRANSLATE_MODELS = (process.env.MultiModalForceTranslateModels || "")
+            .split(',')
+            .map(tag => tag.trim().toLowerCase())
+            .filter(tag => tag !== "");
+    }
+    if (MULTIMODAL_FORCE_TRANSLATE_MODELS.length > 0) {
+        console.log(`[Server] MultiModalForceTranslateModels 启动快照已加载 ${MULTIMODAL_FORCE_TRANSLATE_MODELS.length} 个 tag: [${MULTIMODAL_FORCE_TRANSLATE_MODELS.join(', ')}]`);
+    }
+} catch (e) {
+    console.error("Failed to parse MultiModalForceTranslateModels:", e);
+}
 
 // 新增：模型重定向功能
 const ModelRedirectHandler = require('./modelRedirectHandler.js');
@@ -1136,10 +1176,12 @@ const chatCompletionHandler = new ChatCompletionHandler({
     activeRequests,
     writeDebugLog,
     writeChatLog,
-    handleDiaryFromAIResponse,
     webSocketServer,
     DEBUG_MODE,
     SHOW_VCP_OUTPUT,
+    reasoningToContentEnabled: REASONING_TO_CONTENT_ENABLED,
+    reasoningToContentTag: REASONING_TO_CONTENT_TAG,
+    reasoningToContentModels: REASONING_TO_CONTENT_MODELS,
     VCPToolCode, // 新增：传递VCP工具调用验证码开关
     RAGMemoRefresh: RAG_MEMO_REFRESH, // 新增：传递RAG日记刷新开关
     enableRoleDivider: ENABLE_ROLE_DIVIDER, // 新增：传递角色分割开关
@@ -1160,12 +1202,14 @@ const chatCompletionHandler = new ChatCompletionHandler({
     maxVCPLoopNonStream: parseInt(process.env.MaxVCPLoopNonStream),
     apiRetries: parseInt(process.env.ApiRetries) || 3, // 新增：API重试次数
     apiRetryDelay: parseInt(process.env.ApiRetryDelay) || 1000, // 新增：API重试延迟
+    apiConnectionTimeoutMs: parseInt(process.env.ApiConnectionTimeoutMs) || 900000, // 单次上游连接/首包超时，默认15分钟
     cachedEmojiLists,
     detectors,
     superDetectors,
     chinaModel1: CHINA_MODEL_1,
     chinaModel1Cot: CHINA_MODEL_1_COT,
-    semanticModelRouter
+    semanticModelRouter,
+    multiModalForceTranslateModels: MULTIMODAL_FORCE_TRANSLATE_MODELS // 纯文本模型 tag 命中后强制翻译多模态
 });
 
 // Route for standard chat completions. VCP info is shown based on the .env config.
@@ -1255,122 +1299,6 @@ app.post('/v1/human/tool', async (req, res) => {
 });
 
 
-async function handleDiaryFromAIResponse(responseText) {
-    let fullAiResponseTextForDiary = '';
-    let successfullyParsedForDiary = false;
-    if (!responseText || typeof responseText !== 'string' || responseText.trim() === "") {
-        return;
-    }
-    const lines = responseText.trim().split('\n');
-    const looksLikeSSEForDiary = lines.some(line => line.startsWith('data: '));
-    if (looksLikeSSEForDiary) {
-        let sseContent = '';
-        for (const line of lines) {
-            if (line.startsWith('data: ')) {
-                const jsonData = line.substring(5).trim();
-                if (jsonData === '[DONE]') continue;
-                try {
-                    const parsedData = JSON.parse(jsonData);
-                    const contentChunk = parsedData.choices?.[0]?.delta?.content || parsedData.choices?.[0]?.message?.content || '';
-                    if (contentChunk) sseContent += contentChunk;
-                } catch (e) { /* ignore */ }
-            }
-        }
-        if (sseContent) {
-            fullAiResponseTextForDiary = sseContent;
-            successfullyParsedForDiary = true;
-        }
-    }
-    if (!successfullyParsedForDiary) {
-        try {
-            const parsedJson = JSON.parse(responseText);
-            const jsonContent = parsedJson.choices?.[0]?.message?.content;
-            if (jsonContent && typeof jsonContent === 'string') {
-                fullAiResponseTextForDiary = jsonContent;
-                successfullyParsedForDiary = true;
-            }
-        } catch (e) { /* ignore */ }
-    }
-    if (!successfullyParsedForDiary && !looksLikeSSEForDiary) {
-        fullAiResponseTextForDiary = responseText;
-    }
-
-    if (fullAiResponseTextForDiary.trim()) {
-        const dailyNoteRegex = /<<<DailyNoteStart>>>(.*?)<<<DailyNoteEnd>>>/s;
-        const match = fullAiResponseTextForDiary.match(dailyNoteRegex);
-        if (match && match[1]) {
-            const noteBlockContent = match[1].trim();
-            if (DEBUG_MODE) console.log('[handleDiaryFromAIResponse] Found structured daily note block.');
-
-            const maidMatch = noteBlockContent.match(/^\s*Maid:\s*(.+?)$/m);
-            const dateMatch = noteBlockContent.match(/^\s*Date:\s*(.+?)$/m);
-
-            const maidName = maidMatch ? maidMatch[1].trim() : null;
-            const dateString = dateMatch ? dateMatch[1].trim() : null;
-
-            let contentText = null;
-            const contentMatch = noteBlockContent.match(/^\s*Content:\s*([\s\S]*)$/m);
-            if (contentMatch) {
-                contentText = contentMatch[1].trim();
-            }
-
-            if (maidName && dateString && contentText) {
-                const diaryPayload = { maidName, dateString, contentText };
-                try {
-                    if (DEBUG_MODE) console.log('[handleDiaryFromAIResponse] Calling DailyNoteWrite plugin with payload:', diaryPayload);
-                    // pluginManager.executePlugin is expected to handle JSON stringification if the plugin expects a string
-                    // and to parse the JSON response from the plugin.
-                    // The third argument to executePlugin in Plugin.js is inputData, which can be a string or object.
-                    // For stdio, it's better to stringify here.
-                    const pluginResult = await pluginManager.executePlugin("DailyNoteWrite", JSON.stringify(diaryPayload));
-                    // pluginResult is the direct parsed JSON object from the DailyNoteWrite plugin's stdout.
-                    // Example success: { status: "success", message: "Diary saved to /path/to/your/file.txt" }
-                    // Example error:   { status: "error", message: "Error details" }
-
-                    if (pluginResult && pluginResult.status === "success" && pluginResult.message) {
-                        const dailyNoteWriteResponse = pluginResult; // Use pluginResult directly
-
-                        if (DEBUG_MODE) console.log(`[handleDiaryFromAIResponse] DailyNoteWrite plugin reported success: ${dailyNoteWriteResponse.message}`);
-
-                        let filePath = '';
-                        const successMessage = dailyNoteWriteResponse.message; // e.g., "Diary saved to /path/to/file.txt"
-                        const pathMatchMsg = /Diary saved to (.*)/;
-                        const matchedPath = successMessage.match(pathMatchMsg);
-                        if (matchedPath && matchedPath[1]) {
-                            filePath = matchedPath[1];
-                        }
-
-                        const notification = {
-                            type: 'daily_note_created',
-                            data: {
-                                maidName: diaryPayload.maidName,
-                                dateString: diaryPayload.dateString,
-                                filePath: filePath,
-                                status: 'success',
-                                message: `日记 '${filePath || '未知路径'}' 已为 '${diaryPayload.maidName}' (${diaryPayload.dateString}) 创建成功。`
-                            }
-                        };
-                        webSocketServer.broadcast(notification, 'VCPLog');
-                        if (DEBUG_MODE) console.log('[handleDiaryFromAIResponse] Broadcasted daily_note_created notification:', notification);
-
-                    } else if (pluginResult && pluginResult.status === "error") {
-                        // Handle errors reported by the plugin's JSON response
-                        console.error(`[handleDiaryFromAIResponse] DailyNoteWrite plugin reported an error:`, pluginResult.message || pluginResult);
-                    } else {
-                        // Handle cases where pluginResult is null, or status is not "success"/"error", or message is missing on success.
-                        console.error(`[handleDiaryFromAIResponse] DailyNoteWrite plugin returned an unexpected response structure or failed:`, pluginResult);
-                    }
-                } catch (pluginError) {
-                    // This catches errors from pluginManager.executePlugin itself (e.g., process spawn error, timeout)
-                    console.error('[handleDiaryFromAIResponse] Error executing DailyNoteWrite plugin:', pluginError.message, pluginError.stack);
-                }
-            } else {
-                console.error('[handleDiaryFromAIResponse] Could not extract Maid, Date, or Content from daily note block:', { maidName, dateString, contentText: contentText?.substring(0, 50) });
-            }
-        }
-    }
-}
-
 // --- Admin API Router (Moved to routes/adminPanelRoutes.js) ---
 
 // Define dailyNoteRootPath here as it's needed by the adminPanelRoutes module
@@ -1403,7 +1331,8 @@ const adminPanelRoutes = require('./routes/adminPanelRoutes')(
     semanticModelRouter,
     modelRedirectHandler,
     apiUrl,
-    apiKey
+    apiKey,
+    tdbKnowledgeManager
 );
 
 // 新增：引入 VCP 论坛 API 路由
@@ -1470,6 +1399,10 @@ app.post('/plugin-callback/:pluginName/:taskId', async (req, res) => {
 
 
 async function initialize() {
+    console.log('开始初始化工具调用记录存储...');
+    toolCallRecordStore.initialize();
+    console.log('工具调用记录存储初始化完成。');
+
     console.log('开始初始化向量数据库...');
     await knowledgeBaseManager.initialize(); // 在加载插件之前启动，确保服务就绪
     console.log('向量数据库初始化完成。');
@@ -1575,6 +1508,10 @@ async function initialize() {
     }
     if (DEBUG_MODE) console.log('表情包列表缓存加载完成。');
 
+    // 所有插件运行时、服务路由和静态任务就绪后再启动清单监听，
+    // 避免启动阶段的文件写入触发多余重载。
+    pluginManager.startPluginWatcher();
+
     // 初始化通用任务调度器
     taskScheduler.initialize(pluginManager, webSocketServer, DEBUG_MODE);
 }
@@ -1656,7 +1593,14 @@ async function startServer() {
         // Initialize the new WebSocketServer
         if (DEBUG_MODE) console.log('[Server] Initializing WebSocketServer...');
         const vcpKeyValue = pluginManager.getResolvedPluginConfigValue('VCPLog', 'VCP_Key') || process.env.VCP_Key;
-        webSocketServer.initialize(server, { debugMode: DEBUG_MODE, vcpKey: vcpKeyValue });
+        const distributedMusicPlaylistSyncEnabled = (process.env.DISTRIBUTED_MUSIC_PLAYLIST_SYNC_ENABLED || 'false').toLowerCase() === 'true';
+        const webSocketHeartbeatEnabled = (process.env.WEBSOCKET_HEARTBEAT_ENABLED || 'false').toLowerCase() === 'true';
+        webSocketServer.initialize(server, {
+            debugMode: DEBUG_MODE,
+            vcpKey: vcpKeyValue,
+            distributedMusicPlaylistSyncEnabled,
+            heartbeatEnabled: webSocketHeartbeatEnabled
+        });
 
         // --- 注入依赖 ---
         webSocketServer.setPluginManager(pluginManager);
@@ -1750,6 +1694,12 @@ async function gracefulShutdown(exitCode = 0, reason = 'signal') {
                 console.log(`[Server][ShutdownTrace] Phase 8/10 - pluginManager.shutdownAllPlugins done`);
             } else {
                 console.log(`[Server][ShutdownTrace] Phase 8/10 - pluginManager shutdown skipped`);
+            }
+
+            if (toolCallRecordStore) {
+                console.log(`[Server][ShutdownTrace] Phase 8/10 - toolCallRecordStore.shutdown start`);
+                toolCallRecordStore.shutdown();
+                console.log(`[Server][ShutdownTrace] Phase 8/10 - toolCallRecordStore.shutdown done`);
             }
 
             if (tdbKnowledgeManager) {

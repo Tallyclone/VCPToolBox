@@ -4,6 +4,7 @@ const path = require('path');
 const crypto = require('crypto');
 const { pathToFileURL } = require('url');
 const { getEmbeddingsBatch, cosineSimilarity } = require('../../EmbeddingUtils');
+const toolCallRecordStore = require('../toolCallRecordStore');
 
 const VCP_TIMED_CONTACTS_DIR = path.join(__dirname, '..', '..', 'VCPTimedContacts');
 
@@ -189,7 +190,7 @@ class ToolExecutor {
    * @returns {Promise<{success: boolean, content: Array, error?: string, raw?: any}>}
    */
   async execute(toolCall, clientIp, contextMessages = []) {
-    const { name, args, river, vref } = toolCall;
+    const { name, args, river, vref, archeryNoReply } = toolCall;
 
     // === river 上下文注入 ===
     // river 协议允许 AI 在工具调用时携带对话上下文，支持四种模式：
@@ -318,34 +319,74 @@ class ToolExecutor {
       }
     }
 
+    const recordHandle = toolCallRecordStore.beginRecord({
+      toolName: name,
+      args,
+      requestIp: clientIp,
+      sourceNode: 'post'
+    });
+
     // 通用未来任务拦截：
     // 任意工具只要携带 timely_contact，就先写入 VCPTimedContacts 由任务调度器到点执行。
     // 到点执行时由 TaskScheduler 注入 __vcp_timed_call 标准元信息；
     // 插件可基于该字段判断原始发起时间、计划触发时间与实际触发时间。
     if (args && Object.prototype.hasOwnProperty.call(args, 'timely_contact')) {
-      return await this._scheduleTimedToolCall(toolCall);
+      const scheduledResult = await this._scheduleTimedToolCall(toolCall);
+      toolCallRecordStore.finishRecord(recordHandle, {
+        success: scheduledResult.success,
+        result: scheduledResult.raw || scheduledResult.content,
+        error: scheduledResult.success ? null : scheduledResult.error
+      });
+      return this._attachRecordIdToResult(scheduledResult, recordHandle);
     }
 
     // 验证码校验
     if (this.vcpToolCode) {
       const authResult = await this._verifyAuth(args);
       if (!authResult.valid) {
-        return this._createErrorResult(name, authResult.message);
+        const errorResult = this._createErrorResult(name, authResult.message);
+        toolCallRecordStore.finishRecord(recordHandle, {
+          success: false,
+          result: errorResult.content,
+          error: authResult.message
+        });
+        return this._attachRecordIdToResult(errorResult, recordHandle);
       }
     }
 
     // 检查插件是否存在
     if (!this.pluginManager.getPlugin(name)) {
-      return this._createErrorResult(name, `未找到名为 "${name}" 的插件`);
+      const message = `未找到名为 "${name}" 的插件`;
+      const errorResult = this._createErrorResult(name, message);
+      toolCallRecordStore.finishRecord(recordHandle, {
+        success: false,
+        result: errorResult.content,
+        error: message
+      });
+      return this._attachRecordIdToResult(errorResult, recordHandle);
     }
 
     // 执行插件
     try {
       if (this.debugMode) console.log(`[ToolExecutor] Calling processToolCall for ${name} with args keys: ${Object.keys(args).join(', ')}`);
-      const result = await this.pluginManager.processToolCall(name, args, clientIp, 'post');
-      return this._processResult(name, result);
+      const result = await this.pluginManager.processToolCall(name, args, clientIp, 'post', {
+        archeryNoReply: !!archeryNoReply,
+        toolCallRecordHandle: recordHandle
+      });
+      const processedResult = this._processResult(name, result);
+      toolCallRecordStore.finishRecord(recordHandle, {
+        success: true,
+        result
+      });
+      return this._attachRecordIdToResult(processedResult, recordHandle);
     } catch (error) {
-      return this._createErrorResult(name, `执行错误: ${error.message}`);
+      const errorResult = this._createErrorResult(name, `执行错误: ${error.message}`);
+      toolCallRecordStore.finishRecord(recordHandle, {
+        success: false,
+        result: errorResult.content,
+        error
+      });
+      return this._attachRecordIdToResult(errorResult, recordHandle);
     }
   }
 
@@ -358,11 +399,44 @@ class ToolExecutor {
     );
   }
 
+  _attachRecordIdToResult(result, recordHandle) {
+    if (!recordHandle || !recordHandle.id || !result || typeof result !== 'object') {
+      return result;
+    }
+    result.recordId = recordHandle.id;
+    if (result.raw && typeof result.raw === 'object' && !result.raw.tool_call_record_id) {
+      result.raw.tool_call_record_id = recordHandle.id;
+    }
+    return result;
+  }
+
   _processResult(toolName, result) {
     const formatted = this._formatResult(result);
     
-    // WebSocket广播
+    // WebSocket广播：即使是 archery no-reply 静默结果，也保留 VCPLog 可见性。
     this._broadcast(toolName, 'success', formatted.text);
+
+    // archery no-reply 的“静默”只表示不回灌给 AI / 不触发二次 loop；
+    // 用户侧仍应通过 VCPInfo WS 看到工具已被接收，后续真实进度由插件自己的 VCPLog/VCPInfo 继续推送。
+    if (result && typeof result === 'object' && result.__vcpArcheryNoReplySilent) {
+      try {
+        const vcpLogFunctions = this.pluginManager?.getVCPLogFunctions?.();
+        if (vcpLogFunctions && typeof vcpLogFunctions.pushVcpInfo === 'function') {
+          vcpLogFunctions.pushVcpInfo({
+            type: 'TOOL_NO_REPLY_ACCEPTED',
+            toolName,
+            status: 'success',
+            noReply: true,
+            message: result.message || `Async no-reply tool "${toolName}" accepted silently.`,
+            timestamp: new Date().toISOString()
+          });
+        }
+      } catch (broadcastError) {
+        if (this.debugMode) {
+          console.warn(`[ToolExecutor] Failed to broadcast no-reply VCPInfo for ${toolName}: ${broadcastError.message}`);
+        }
+      }
+    }
     
     return {
       success: true,
