@@ -17,6 +17,8 @@ const INTERNAL_TOOLS = new Set(["internal_request_file"]);
 const LOCALHOST_ADDRESSES = new Set(["127.0.0.1", "::1", "localhost"]);
 const DEVICE_ALIASES_PATH = path.join(__dirname, "device-aliases.json");
 const SHADOW_PLACEHOLDER = "{{VCPShadowDistributedRouter}}";
+const SOURCE_SERVER_NAME_HEADER = "x-vcp-source-server-name";
+const ROUTING_ERROR_CODE = "SHADOW_DISTRIBUTED_ROUTING_ERROR";
 
 let installed = false;
 
@@ -44,6 +46,7 @@ class ShadowDistributedRouter {
 
     const patchedHandle = this.patchHandleDistributedServerMessage(wss);
     const patchedProcess = this.patchProcessToolCall(this.pluginManager);
+    const patchedChatHandler = this.patchChatCompletionHandler();
     const patchedDistributedExecute = this.patchExecuteDistributedTool(wss);
     const patchedToolExecutor = this.patchToolExecutorExecute();
     this.patchUnregisterDistributedTools(this.pluginManager);
@@ -51,6 +54,7 @@ class ShadowDistributedRouter {
     if (
       !patchedHandle ||
       !patchedProcess ||
+      !patchedChatHandler ||
       !patchedDistributedExecute ||
       !patchedToolExecutor
     ) {
@@ -194,6 +198,72 @@ class ShadowDistributedRouter {
     return true;
   }
 
+  patchChatCompletionHandler() {
+    let ChatCompletionHandler;
+    try {
+      ChatCompletionHandler = require("../../modules/chatCompletionHandler");
+    } catch (err) {
+      console.warn(
+        "[ShadowDistributedRouter] failed to require ChatCompletionHandler:",
+        err.message
+      );
+      return false;
+    }
+
+    if (
+      !ChatCompletionHandler?.prototype ||
+      typeof ChatCompletionHandler.prototype.handle !== "function"
+    ) {
+      console.warn(
+        "[ShadowDistributedRouter] ChatCompletionHandler.prototype.handle not found, skip patch."
+      );
+      return false;
+    }
+
+    if (ChatCompletionHandler.prototype.handle[PATCH_FLAG]) {
+      this.adoptExistingPatch(ChatCompletionHandler.prototype, "handle");
+      console.log(
+        "[ShadowDistributedRouter] ChatCompletionHandler.handle already patched, adopted."
+      );
+      return true;
+    }
+
+    const original = ChatCompletionHandler.prototype.handle;
+    const patched = async function patchedChatCompletionHandle(
+      req,
+      res,
+      forceShowVCP = false
+    ) {
+      const parentStore = requestContext.getStore() || {};
+      const sourceServerName = readSourceServerNameHeader(req);
+      return requestContext.run(
+        {
+          ...parentStore,
+          sourceServerName:
+            sourceServerName || parentStore.sourceServerName || null,
+          requestIp: req?.ip || parentStore.requestIp,
+          sourceNode: sourceServerName
+            ? "vchat-http"
+            : parentStore.sourceNode || "http",
+        },
+        async () => original.call(this, req, res, forceShowVCP)
+      );
+    };
+
+    markPatched(patched, original);
+    ChatCompletionHandler.prototype.handle = patched;
+    this.patchRecords.push({
+      target: ChatCompletionHandler.prototype,
+      method: "handle",
+      original,
+      patched,
+    });
+    console.log(
+      "[ShadowDistributedRouter] patched ChatCompletionHandler.handle"
+    );
+    return true;
+  }
+
   patchUnregisterDistributedTools(pluginManager) {
     if (
       !pluginManager ||
@@ -314,7 +384,10 @@ class ShadowDistributedRouter {
         }
       } catch (err) {
         const store = requestContext.getStore();
-        if (store?.routeContext?.explicitAlias) {
+        if (
+          err?.code === ROUTING_ERROR_CODE ||
+          store?.routeContext?.explicitAlias
+        ) {
           throw err;
         }
         console.warn(
@@ -458,49 +531,53 @@ class ShadowDistributedRouter {
       if (explicitTarget) return explicitTarget;
     }
 
-    const requestIp = store?.requestIp;
-    if (!requestIp) return originalServerId;
-
-    const directSourceServerId = findServerIdByReportedIp(requestIp);
-    if (directSourceServerId) {
-      if (instances.has(directSourceServerId)) {
-        return directSourceServerId;
-      }
-
-      console.log(
-        `[ShadowDistributedRouter] fallback ${toolName}: requestIp=${requestIp} directly matched ${directSourceServerId}, but it has no shadow instance`
+    const sourceServerName = String(store?.sourceServerName || "").trim();
+    if (sourceServerName) {
+      const normalizedSourceName =
+        normalizeAliasForExactMatch(sourceServerName);
+      const candidates = Array.from(instances.entries()).filter(
+        ([, record]) =>
+          normalizeAliasForExactMatch(record?.serverName) ===
+          normalizedSourceName
       );
-      return originalServerId;
-    }
 
-    if (typeof wss.findServerByIp === "function") {
-      const sourceServerIdOrName = wss.findServerByIp(requestIp);
-      if (sourceServerIdOrName) {
-        const sourceServerId = resolveServerAlias(sourceServerIdOrName);
-        if (instances.has(sourceServerId)) {
-          return sourceServerId;
-        }
-
+      if (candidates.length === 1) {
+        const targetServerId = candidates[0][0];
         console.log(
-          `[ShadowDistributedRouter] fallback ${toolName}: source server ${sourceServerIdOrName} resolved as ${sourceServerId}, but it has no shadow instance`
+          `[ShadowDistributedRouter] source route ${toolName}: source=${sourceServerName} target=${targetServerId} routingMode=source-server-name`
         );
-        return originalServerId;
+        return targetServerId;
       }
-    }
 
-    if (isLocalhostAddress(requestIp)) {
-      return resolveLocalhostTargetServerId(
-        toolName,
-        instances,
-        originalServerId,
-        requestIp
+      if (candidates.length > 1) {
+        throw createRoutingError(
+          `当前有多个在线 VChat 使用相同 ServerName“${sourceServerName}”，无法确定不带 # 的本机执行目标。请为每台 VChat 配置唯一的 ServerName。候选 serverId：${candidates
+            .map(([serverId]) => serverId)
+            .join("、")}`
+        );
+      }
+
+      throw createRoutingError(
+        `来源设备“${sourceServerName}”当前离线，或未注册工具“${toolName}”。为防止执行漂移，本次调用已拒绝。`
       );
     }
 
-    console.log(
-      `[ShadowDistributedRouter] fallback ${toolName}: no server matched requestIp=${requestIp}`
+    if (instances.size === 1) {
+      const targetServerId = instances.keys().next().value;
+      console.log(
+        `[ShadowDistributedRouter] unique-instance route ${toolName}: target=${targetServerId} routingMode=no-source-single-instance`
+      );
+      return targetServerId;
+    }
+
+    const onlineDevices = Array.from(instances.entries()).map(
+      ([serverId, record]) => `${record?.serverName || "未命名"}(${serverId})`
     );
-    return originalServerId;
+    throw createRoutingError(
+      `工具“${toolName}”当前存在多个在线分布式实例，但本次请求没有来源设备身份。请使用“${toolName}#设备名”明确指定目标。在线设备：${onlineDevices.join(
+        "、"
+      )}`
+    );
   }
 
   isDistributedTool(rawToolName) {
@@ -762,8 +839,8 @@ class ShadowDistributedRouter {
       "tool_name:「始」插件名#设备别名「末」",
       "",
       "示例：",
-      "tool_name:「始」FileOperator#盛世国际电脑「末」",
-      "tool_name:「始」PowerShellExecutor#家里主机「末」",
+      "tool_name:「始」FileOperator#盛世国际「末」",
+      "tool_name:「始」PowerShellExecutor#服务器「末」",
       "",
       "规则：",
       "1. # 后必须使用下方在线设备列表中的“设备别名”。",
@@ -791,13 +868,35 @@ class ShadowDistributedRouter {
       lines.push(`- ${displayName}`);
       lines.push(`  系统：${getDeviceOsSummary(device)}`);
       lines.push(`  主机名：${device.hostName || device.serverName || "未知"}`);
-      lines.push(`  IP：${formatDeviceIps(device.lastKnownIPs)}`);
       if (device.note) lines.push(`  说明：${device.note}`);
       lines.push("  状态：在线");
       lines.push(`  更新时间：${formatTimestamp(device.updatedAt)}`);
     }
 
     return lines.join("\n");
+  }
+}
+
+function createRoutingError(message) {
+  const error = new Error(message);
+  error.code = ROUTING_ERROR_CODE;
+  return error;
+}
+
+function readSourceServerNameHeader(req) {
+  let rawValue = req?.get?.(SOURCE_SERVER_NAME_HEADER);
+  if (rawValue === undefined) {
+    rawValue = req?.headers?.[SOURCE_SERVER_NAME_HEADER];
+  }
+  if (Array.isArray(rawValue)) rawValue = rawValue[0];
+
+  const encoded = String(rawValue || "").trim();
+  if (!encoded) return null;
+
+  try {
+    return decodeURIComponent(encoded).trim() || null;
+  } catch (_error) {
+    throw createRoutingError("X-VCP-Source-Server-Name 请求头编码无效。");
   }
 }
 
