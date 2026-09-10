@@ -172,7 +172,8 @@ class ShadowDistributedRouter {
       toolName,
       toolArgs,
       requestIp = null,
-      sourceNode = null
+      sourceNode = null,
+      executionOptions = {}
     ) {
       const parentStore = requestContext.getStore() || {};
       return requestContext.run(
@@ -182,7 +183,14 @@ class ShadowDistributedRouter {
           sourceNode: sourceNode || parentStore.sourceNode,
         },
         async () =>
-          original.call(this, toolName, toolArgs, requestIp, sourceNode)
+          original.call(
+            this,
+            toolName,
+            toolArgs,
+            requestIp,
+            sourceNode,
+            executionOptions
+          )
       );
     };
 
@@ -556,12 +564,44 @@ class ShadowDistributedRouter {
             .join("、")}`
         );
       }
+    }
 
-      throw createRoutingError(
-        `来源设备“${sourceServerName}”当前离线，或未注册工具“${toolName}”。为防止执行漂移，本次调用已拒绝。`
+    const requestIp = normalizeIp(store?.requestIp);
+    if (requestIp) {
+      const ipMatchedServerId = findServerIdByReportedIp(requestIp);
+      if (ipMatchedServerId && instances.has(ipMatchedServerId)) {
+        console.log(
+          `[ShadowDistributedRouter] ip route ${toolName}: requestIp=${requestIp} target=${ipMatchedServerId} routingMode=request-ip`
+        );
+        return ipMatchedServerId;
+      }
+
+      // 保留旧版按 WebSocketServer IP 查找的兼容路径。
+      if (typeof wss?.findServerByIp === "function") {
+        const legacyServerIdOrName = wss.findServerByIp(requestIp);
+        if (legacyServerIdOrName) {
+          const legacyServerId = resolveServerAlias(legacyServerIdOrName);
+          if (instances.has(legacyServerId)) {
+            console.log(
+              `[ShadowDistributedRouter] legacy ip route ${toolName}: requestIp=${requestIp} target=${legacyServerId}`
+            );
+            return legacyServerId;
+          }
+        }
+      }
+    }
+
+    // 没有 ServerName、IP 也无法唯一定位时，保留旧版 localhost 判断。
+    if (!sourceServerName && isLocalhostAddress(requestIp)) {
+      return resolveLocalhostTargetServerId(
+        toolName,
+        instances,
+        originalServerId,
+        requestIp
       );
     }
 
+    // 单实例仍可安全路由；其余情况交还原始调用方，恢复旧路由行为。
     if (instances.size === 1) {
       const targetServerId = instances.keys().next().value;
       console.log(
@@ -570,14 +610,12 @@ class ShadowDistributedRouter {
       return targetServerId;
     }
 
-    const onlineDevices = Array.from(instances.entries()).map(
-      ([serverId, record]) => `${record?.serverName || "未命名"}(${serverId})`
+    console.warn(
+      `[ShadowDistributedRouter] fallback to legacy route: tool=${toolName}, sourceServerName=${
+        sourceServerName || "none"
+      }, requestIp=${requestIp || "unknown"}`
     );
-    throw createRoutingError(
-      `工具“${toolName}”当前存在多个在线分布式实例，但本次请求没有来源设备身份。请使用“${toolName}#设备名”明确指定目标。在线设备：${onlineDevices.join(
-        "、"
-      )}`
-    );
+    return originalServerId;
   }
 
   isDistributedTool(rawToolName) {
