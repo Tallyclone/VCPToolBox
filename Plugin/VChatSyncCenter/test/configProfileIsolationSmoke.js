@@ -106,10 +106,10 @@ function main() {
     ),
     ["bootstrap:Agents/a/config.json", "runtime:Agents/a/config.json"]
   );
-  assert.deepStrictEqual(
-    exported.baseline.configs[0].safe_projection_json,
-    bootstrapDto
-  );
+  assert.deepStrictEqual(exported.baseline.configs[0].safe_projection_json, {
+    ...bootstrapDto,
+    topics: [],
+  });
   assert.deepStrictEqual(
     exported.baseline.configs[1].safe_projection_json,
     runtimeDto

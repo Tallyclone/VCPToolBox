@@ -107,6 +107,26 @@ function main() {
     const exported = exportBaseline(runtime, { kind: "configs" });
     assert.strictEqual(exported.baseline.configs.length, 0);
 
+    dbContext.db
+      .prepare(
+        "INSERT INTO items(item_type, item_id, title, metadata_json) VALUES (?, ?, ?, ?)"
+      )
+      .run("agent", "agent-soft-delete", "agent", "{}");
+
+    processOperation(dbContext.db, {
+      operation_id: "topic-create",
+      device_id: "device-1",
+      entity_type: "topic",
+      action: "upsert",
+      item_type: "agent",
+      item_id: "agent-soft-delete",
+      topic_id: "topic-1",
+      entity_id: "topic-1",
+      payload: {
+        topic: { id: "topic-1", title: "topic" },
+      },
+    });
+
     processOperation(dbContext.db, {
       operation_id: "message-create",
       device_id: "device-1",
@@ -257,6 +277,25 @@ function main() {
     assert.strictEqual(deletedTopicNewMessage.deleted, true);
     assert.strictEqual(deletedTopicNewMessage.resolution, "delete_wins");
 
+    dbContext.db
+      .prepare(
+        "INSERT INTO items(item_type, item_id, title, metadata_json) VALUES (?, ?, ?, ?)"
+      )
+      .run("agent", "agent-parent-delete", "parent", "{}");
+    processOperation(dbContext.db, {
+      operation_id: "item-parent-seed-topic",
+      device_id: "device-1",
+      entity_type: "topic",
+      action: "upsert",
+      item_type: "agent",
+      item_id: "agent-parent-delete",
+      topic_id: "topic-parent-delete",
+      entity_id: "topic-parent-delete",
+      payload: {
+        topic: { id: "topic-parent-delete", title: "parent topic" },
+      },
+    });
+
     processOperation(dbContext.db, {
       operation_id: "item-parent-seed-message",
       device_id: "device-1",
@@ -368,8 +407,25 @@ function main() {
     assert.strictEqual(multiProfileRecreate.resolution, "delete_wins");
 
     const mappedConfigId = "Agents/mapped/config.json";
+    dbContext.db
+      .prepare(
+        "INSERT INTO items(item_type, item_id, title, metadata_json) VALUES (?, ?, ?, ?)"
+      )
+      .run("agent", "mapped-item-id", "mapped", "{}");
     processOperation(dbContext.db, {
-      operation_id: "mapped-item-seed-message",
+      operation_id: "mapped-topic-seed",
+      device_id: "device-1",
+      entity_type: "topic",
+      action: "upsert",
+      item_type: "agent",
+      item_id: "mapped-item-id",
+      topic_id: "mapped-topic",
+      entity_id: "mapped-topic",
+      payload: { topic: { id: "mapped-topic", title: "mapped" } },
+    });
+
+    processOperation(dbContext.db, {
+      operation_id: "mapped-message",
       device_id: "device-1",
       entity_type: "message",
       action: "create",

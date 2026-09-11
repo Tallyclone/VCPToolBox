@@ -19,6 +19,8 @@ function main() {
     schema: "agent_config",
     entity_id: "Agents/a/config.json",
     safe_projection_json: dto,
+    deleted_fields: [],
+    profile: "bootstrap",
   });
 
   const normalized = normalizeConfigOperation({
@@ -64,6 +66,7 @@ function main() {
     entity_id: "global_prompt_warehouse.json",
     safe_projection_json: warehouseDto,
     projection_fields: ["$"],
+    deleted_fields: [],
   });
   const normalizedWarehouse = normalizeConfigOperation({
     operation_id: "op-warehouse",
@@ -77,6 +80,7 @@ function main() {
       entity_id: "global_prompt_warehouse.json",
       relative_path: "global_prompt_warehouse.json",
       projection_fields: ["$"],
+      deleted_fields: [],
       safe_projection_json: warehouseDto,
       checksum: warehouseChecksum,
     },
@@ -101,6 +105,7 @@ function main() {
       entity_id: "global_prompt_warehouse.json",
       profile: "runtime",
       projection_fields: ["$"],
+      deleted_fields: [],
       safe_projection_json: runtimeWarehouse,
     });
     const result = processOperation(dbContext.db, {

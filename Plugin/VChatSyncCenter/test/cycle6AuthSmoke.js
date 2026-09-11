@@ -25,7 +25,7 @@ function main() {
     query: { token: "super-secret-key" },
   });
   assert.strictEqual(queryOnly.ok, false);
-  assert.strictEqual(queryOnly.status, 403);
+  assert.strictEqual(queryOnly.status, 401);
 
   const disabled = validateSyncAuth(
     { config: { enabled: false, syncKey: "super-secret-key" } },
