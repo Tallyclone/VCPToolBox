@@ -1,11 +1,7 @@
 const { appendChange } = require("./changeLog");
 const { recordConflict } = require("./conflictService");
-const {
-  safeJsonParse,
-  safeJsonStringify,
-  stableJsonStringify,
-} = require("../utils/safeJson");
-const { sha256 } = require("../utils/checksum");
+const { safeJsonParse, safeJsonStringify } = require("../utils/safeJson");
+const { checksumConfigDto, configSnapshotFromRow } = require("./configSnapshot");
 
 function nowIso() {
   return new Date().toISOString();
@@ -36,10 +32,6 @@ function topicKey(itemType, itemId, topicId) {
 
 function groupMemberKey(groupId, memberId) {
   return `group:${groupId}:member:${memberId}`;
-}
-
-function checksumConfigSnapshot(value) {
-  return sha256(stableJsonStringify(value || {}));
 }
 
 function rowSnapshot(row) {
@@ -468,6 +460,27 @@ function appendCascadeDeleteChange(db, operation, input) {
   });
 }
 
+function groupConfigEntityIds(groupId, payload = {}) {
+  // Adapters identify a group config by its relative path; older clients used
+  // the bare group id. Match every spelling so the cumulative snapshot that
+  // new devices bootstrap from is always updated.
+  return Array.from(
+    new Set(
+      [
+        groupId,
+        `AgentGroups/${groupId}/config.json`,
+        configRelativePath("group_config", groupId),
+        payload.config_entity_id,
+        ...(Array.isArray(payload.config_entity_ids)
+          ? payload.config_entity_ids
+          : []),
+      ]
+        .filter(Boolean)
+        .map(String)
+    )
+  );
+}
+
 function applyGroupMemberDelete(db, operation) {
   const payload = operation.payload || {};
   const groupId = String(
@@ -489,11 +502,12 @@ function applyGroupMemberDelete(db, operation) {
 
   const deletedAt = payload.deleted_at || nowIso();
   const entityKey = groupMemberKey(groupId, memberId);
-  const rows = db
-    .prepare(
-      "SELECT * FROM config_entities WHERE schema = 'group_config' AND entity_id = ? AND deleted = 0"
-    )
-    .all(groupId);
+  const selectConfigs = db.prepare(
+    "SELECT * FROM config_entities WHERE schema = 'group_config' AND entity_id = ? AND deleted = 0"
+  );
+  const rows = groupConfigEntityIds(groupId, payload).flatMap((entityId) =>
+    selectConfigs.all(entityId)
+  );
   let updatedConfigs = 0;
   let removedMember = false;
 
@@ -506,24 +520,26 @@ WHERE schema = 'group_config' AND entity_id = ? AND profile = ?`
   for (const row of rows) {
     const snapshot = safeJsonParse(row.safe_projection_json, {});
     const members = Array.isArray(snapshot.members) ? snapshot.members : null;
-    if (!members || !members.map(String).includes(memberId)) continue;
-    const nextSnapshot = {
-      ...snapshot,
-      members: members.filter((id) => String(id) !== memberId),
-    };
-    if (
-      nextSnapshot.memberTags &&
-      typeof nextSnapshot.memberTags === "object" &&
-      !Array.isArray(nextSnapshot.memberTags)
-    ) {
-      nextSnapshot.memberTags = { ...nextSnapshot.memberTags };
+    const hasTag =
+      snapshot.memberTags &&
+      typeof snapshot.memberTags === "object" &&
+      !Array.isArray(snapshot.memberTags) &&
+      Object.prototype.hasOwnProperty.call(snapshot.memberTags, memberId);
+    const hasMember = Boolean(members && members.map(String).includes(memberId));
+    if (!hasMember && !hasTag) continue;
+    const nextSnapshot = { ...snapshot };
+    if (members) {
+      nextSnapshot.members = members.filter((id) => String(id) !== memberId);
+    }
+    if (hasTag) {
+      nextSnapshot.memberTags = { ...snapshot.memberTags };
       delete nextSnapshot.memberTags[memberId];
     }
     const nextVersion = Number(row.version || 0) + 1;
-    const checksum = checksumConfigSnapshot({
-      schema: "group_config",
-      entity_id: groupId,
-      profile: row.profile || "bootstrap",
+    // Same checksum algorithm as every other config write, so the snapshot a
+    // new device receives at bootstrap verifies against its own DTO checksum.
+    const checksum = checksumConfigDto({
+      ...configSnapshotFromRow(row),
       safe_projection_json: nextSnapshot,
     });
     updateConfig.run(
@@ -532,17 +548,17 @@ WHERE schema = 'group_config' AND entity_id = ? AND profile = ?`
       operation.operation_id,
       operation.device_id || null,
       nextVersion,
-      groupId,
+      row.entity_id,
       row.profile || "bootstrap"
     );
     updatedConfigs += 1;
     removedMember = true;
     appendCascadeDeleteChange(db, operation, {
       entity_type: "group_config",
-      entity_id: groupId,
+      entity_id: row.entity_id,
       entity_key: configKey(
         "group_config",
-        groupId,
+        row.entity_id,
         row.profile || "bootstrap"
       ),
       version: nextVersion,
@@ -552,7 +568,8 @@ WHERE schema = 'group_config' AND entity_id = ? AND profile = ?`
       parent_entity_id: memberId,
       payload: {
         schema: "group_config",
-        entity_id: groupId,
+        entity_id: row.entity_id,
+        relative_path: configRelativePath("group_config", row.entity_id),
         profile: row.profile || "bootstrap",
         removed_member_id: memberId,
       },

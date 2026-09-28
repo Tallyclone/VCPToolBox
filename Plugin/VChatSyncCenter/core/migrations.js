@@ -1,4 +1,6 @@
 const { sha256 } = require("../utils/checksum");
+const { rebuildConfigSnapshots } = require("./configSnapshot");
+const { ensureGeneration } = require("./centerMeta");
 
 const MIGRATIONS = [
   {
@@ -461,6 +463,26 @@ CREATE INDEX IF NOT EXISTS idx_topics_owner_topic ON topics(item_type, item_id, 
 ALTER TABLE topics ADD COLUMN order_device_id TEXT;
 `,
   },
+  {
+    version: 15,
+    name: "materialize_config_projection_snapshots",
+    sql: `
+ALTER TABLE config_entities ADD COLUMN deleted_fields_json TEXT NOT NULL DEFAULT '[]';
+`,
+    migrate: rebuildConfigSnapshots,
+  },
+  {
+    version: 16,
+    name: "add_center_meta_generation",
+    sql: `
+CREATE TABLE IF NOT EXISTS center_meta (
+  key TEXT PRIMARY KEY,
+  value TEXT NOT NULL,
+  updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+`,
+    migrate: ensureGeneration,
+  },
 ];
 
 function ensureSchemaMigrationsTable(db) {
@@ -480,7 +502,10 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
 function prepareMigrations() {
   return MIGRATIONS.map((migration) => ({
     ...migration,
-    checksum: sha256(`${migration.version}:${migration.name}:${migration.sql}`),
+    checksum: sha256(
+      `${migration.version}:${migration.name}:${migration.sql}` +
+      (migration.migrate ? `\n${migration.migrate.toString().replace(/\r\n?/g, "\n")}` : "")
+    ),
   }));
 }
 
@@ -566,6 +591,7 @@ function runMigrations(db, logger) {
     const startedAt = Date.now();
     const transaction = db.transaction(() => {
       executeMigrationSql(db, migration.sql);
+      if (migration.migrate) migration.migrate(db);
       db.prepare(
         `
 INSERT INTO schema_migrations(version, name, checksum, applied_at, duration_ms, success, error_message)

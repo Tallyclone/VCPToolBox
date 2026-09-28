@@ -11,7 +11,15 @@ const {
   upsertThemeAssetMetadata,
 } = require("./themeService");
 const { validateSyncAuth } = require("./auth");
+const { getGeneration } = require("./centerMeta");
 const { safeJsonParse, safeJsonStringify } = require("../utils/safeJson");
+const { configSnapshotFromRow, checksumConfigDto } = require("./configSnapshot");
+const {
+  PAGES,
+  parseBootstrapCursor,
+  loadBootstrapPage,
+  buildPageInfo,
+} = require("./bootstrapPagination");
 
 function parseJson(value, fallback) {
   return safeJsonParse(value, fallback);
@@ -118,20 +126,6 @@ function updateBootstrapSession(
   );
 }
 
-function parseCursor(value) {
-  const parsed = Number.parseInt(value || "0", 10);
-  return Number.isFinite(parsed) && parsed >= 0 ? parsed : 0;
-}
-
-function buildPageInfo(kind, cursor, limit, rows) {
-  return {
-    kind,
-    cursor,
-    limit,
-    has_more: rows.length > limit,
-    next_cursor: rows.length > limit ? cursor + limit : null,
-  };
-}
 function takePage(rows, limit) {
   return rows.length > limit ? rows.slice(0, limit) : rows;
 }
@@ -155,19 +149,38 @@ function normalizeBootstrapThemeAssets(themeEntry, theme) {
   }));
 }
 
-function loadThemeAssetsForExport(db, themeId) {
-  return listThemeAssets(db, themeId).map((asset) => ({
-    asset_hash: asset.asset_hash,
-    asset_type: asset.asset_type,
-    slot: asset.slot,
-    filename: asset.filename,
-    mime_type: asset.mime_type,
-    size_bytes: asset.size_bytes,
-    checksum: asset.checksum,
-    relative_path: asset.relative_path || null,
-    download_url: asset.download_url,
-    binary_strategy: "download_by_hash",
-  }));
+function loadThemeAssetsForExport(db, themeId, config) {
+  const fs = require("fs");
+  const { getThemeAsset } = require("./themeService");
+  return listThemeAssets(db, themeId).map((asset) => {
+    let binaryAvailable = false;
+    try {
+      const storedAsset = getThemeAsset(db, config, asset.asset_hash);
+      if (
+        storedAsset && storedAsset.binary_available === true &&
+        storedAsset.absolute_path && fs.statSync(storedAsset.absolute_path).isFile()
+      ) {
+        fs.accessSync(storedAsset.absolute_path, fs.constants.R_OK);
+        binaryAvailable = true;
+      }
+    } catch (_) {
+      // Keep missing, unreadable, or invalid storage entries pending. The
+      // download endpoint verifies the blob's hash when it is read.
+    }
+    return {
+      asset_hash: asset.asset_hash,
+      asset_type: asset.asset_type,
+      slot: asset.slot,
+      filename: asset.filename,
+      mime_type: asset.mime_type,
+      size_bytes: asset.size_bytes,
+      checksum: asset.checksum,
+      relative_path: asset.relative_path || null,
+      download_url: asset.download_url,
+      binary_available: binaryAvailable,
+      binary_strategy: "download_by_hash",
+    };
+  });
 }
 
 function configOwnerIdentity(configPayload = {}) {
@@ -180,7 +193,7 @@ function configOwnerIdentity(configPayload = {}) {
   if (!match) return null;
   return {
     item_type: match[1].toLowerCase() === "agentgroups" ? "group" : "agent",
-    item_id: match[2],
+    item_id: decodeURIComponent(match[2]),
   };
 }
 
@@ -194,47 +207,41 @@ function loadTopicsForConfigExport(db, owner) {
     )
     .all(owner.item_type, owner.item_id)
     .map((row) => {
-      const metadata = parseJson(row.metadata_json, {});
-      return {
+      const metadata = parseJson(row.metadata_json, {}) || {};
+      const topic = {
         id: row.id,
-        topic_id: row.id,
-        title: row.title,
-        name: metadata.name || metadata.title || row.title || row.id,
-        metadata,
-        order_rank:
-          row.order_rank === undefined || row.order_rank === null
-            ? null
-            : Number(row.order_rank),
-        order_version:
-          row.order_version === undefined || row.order_version === null
-            ? 0
-            : Number(row.order_version),
-        msg_count:
-          row.msg_count === undefined || row.msg_count === null
-            ? undefined
-            : Number(row.msg_count),
-        created_at: row.created_at,
-        updated_at: row.updated_at,
-        content_updated_at: row.content_updated_at,
-        order_updated_at: row.order_updated_at,
-        order_device_id: row.order_device_id,
+        name: metadata.name ?? metadata.title ?? row.title ?? row.id,
+        createdAt:
+          metadata.createdAt ?? metadata.created_at ?? metadata.timestamp ?? row.created_at,
       };
+      for (const key of ["locked", "unread", "creatorSource"]) {
+        if (Object.prototype.hasOwnProperty.call(metadata, key)) {
+          topic[key] = metadata[key];
+        }
+      }
+      return topic;
     });
 }
 
 function backfillConfigTopicsForExport(db, config) {
   const profile = config.profile || "bootstrap";
-  if (profile === "runtime") return config;
+  if (profile === "runtime" && !config.projection_fields?.includes("topics")) return config;
+  if (config.deleted_fields?.includes("topics")) return config;
   const owner = configOwnerIdentity(config);
   if (!owner) return config;
   const topics = loadTopicsForConfigExport(db, owner);
-  return {
+  const result = {
     ...config,
+    projection_fields: Array.isArray(config.projection_fields)
+      ? [...new Set([...config.projection_fields, "topics"])]
+      : config.projection_fields,
     safe_projection_json: {
       ...(config.safe_projection_json || {}),
       topics,
     },
   };
+  result.checksum = checksumConfigDto(result);
+  return result;
 }
 
 function deriveBootstrapTopicsFromConfigs(db, configs, deviceId) {
@@ -247,10 +254,10 @@ function deriveBootstrapTopicsFromConfigs(db, configs, deviceId) {
       payload.safe_projection_json || payload.dto || payload.config || {};
     const topics = Array.isArray(dto.topics) ? dto.topics : [];
     if (topics.length === 0) continue;
-    ensureItem(db, owner.item_type, owner.item_id, {
+    if (!ensureItem(db, owner.item_type, owner.item_id, {
       title: dto.name || owner.item_id,
       source: "bootstrap_config_topics",
-    });
+    })) continue;
     topics.forEach((topic, index) => {
       const topicId = topic && (topic.id || topic.topic_id || topic.topicId);
       if (!topicId) return;
@@ -288,28 +295,77 @@ function buildAuthoritativeConfigSnapshots(db, configs) {
   return (Array.isArray(configs) ? configs : [])
     .map((config) => config.payload || config)
     .filter((payload) => payload && typeof payload === "object")
-    .map((payload) =>
-      backfillConfigTopicsForExport(db, {
-        ...payload,
-        safe_projection_json: parseJson(
-          payload.safe_projection_json,
-          payload.safe_projection_json || {}
-        ),
-        projection_fields: parseJson(
-          payload.projection_fields,
-          payload.projection_fields || []
-        ),
-        profile: payload.profile || "bootstrap",
-      })
-    );
+    .map((payload) => db.prepare(
+      "SELECT * FROM config_entities WHERE schema = ? AND entity_id = ? AND profile = ? AND deleted = 0"
+    ).get(payload.schema, payload.entity_id || payload.relative_path, payload.profile || "bootstrap"))
+    .filter(Boolean)
+    .map((row) => backfillConfigTopicsForExport(db, configSnapshotFromRow(row)));
+}
+
+function getBootstrapSession(db, sessionId) {
+  if (!sessionId) return null;
+  const row = db
+    .prepare("SELECT * FROM bootstrap_sessions WHERE id = ?")
+    .get(String(sessionId));
+  if (!row) return null;
+  return {
+    ...row,
+    checkpoint: safeJsonParse(row.checkpoint_json, {}) || {},
+    audit: safeJsonParse(row.audit_json, {}) || {},
+  };
+}
+
+// A client whose import succeeded but whose HTTP response was lost retries
+// with the same session_id. Return the stored result instead of refusing
+// because the Center is no longer empty.
+function completedImportResult(session, db) {
+  const checkpoint = session.checkpoint || {};
+  const imported = checkpoint.imported || {};
+  const audit = session.audit || {};
+  return {
+    ok: true,
+    idempotent: true,
+    mode: session.mode,
+    session_id: session.id,
+    imported: {
+      messages: Number(imported.messages || 0),
+      configs: Number(imported.configs || 0),
+      attachments: Number(imported.attachments || 0),
+      avatars: Number(imported.avatars || 0),
+      themes: Number(imported.themes || 0),
+      conflicts: Number(imported.conflicts || 0),
+    },
+    latest_seq: Number(checkpoint.latest_seq || 0),
+    generation: getGeneration(db),
+    authoritative_configs: Array.isArray(checkpoint.authoritative_configs)
+      ? checkpoint.authoritative_configs
+      : [],
+    completed_at: audit.updated_at || session.updated_at || null,
+  };
 }
 
 function importBootstrap(runtime, manifest = {}) {
   const db = runtime.dbContext.db;
   const deviceId = manifest.device_id || manifest.deviceId || null;
   const mode = manifest.mode || "bootstrap_primary";
+  const requestedSessionId = manifest.session_id || manifest.sessionId || null;
+  if (requestedSessionId) {
+    const existing = getBootstrapSession(db, requestedSessionId);
+    if (existing && existing.status === "completed") {
+      audit(runtime, "import replay", {
+        mode: existing.mode,
+        session_id: existing.id,
+        device_id: existing.device_id,
+        latest_seq: existing.checkpoint && existing.checkpoint.latest_seq,
+      });
+      return completedImportResult(existing, db);
+    }
+  }
   if (mode === "bootstrap_primary" && !centerIsEmpty(db)) {
-    throw new Error("center is not empty; bootstrap_primary refused");
+    const error = new Error("center is not empty; bootstrap_primary refused");
+    error.code = "BOOTSTRAP_CENTER_NOT_EMPTY";
+    error.statusCode = 409;
+    throw error;
   }
   const messages = Array.isArray(manifest.messages) ? manifest.messages : [];
   const configs = Array.isArray(manifest.configs) ? manifest.configs : [];
@@ -344,8 +400,11 @@ function importBootstrap(runtime, manifest = {}) {
       applyConfigOperation(db, {
         operation_id:
           payload.operation_id ||
+          config.operation_id ||
           `bootstrap.config.${deviceId || "unknown"}.${payload.schema}.${
-            payload.entity_id
+            payload.profile || "bootstrap"
+          }.${
+            payload.entity_id || payload.relative_path
           }`,
         device_id: deviceId,
         entity_type: payload.schema,
@@ -509,8 +568,10 @@ ON CONFLICT(hash) DO UPDATE SET
   });
 
   let latestSeq = 0;
+  let authoritativeConfigs = [];
   try {
     latestSeq = tx();
+    authoritativeConfigs = buildAuthoritativeConfigSnapshots(db, configs);
     updateBootstrapSession(
       db,
       sessionId,
@@ -526,6 +587,9 @@ ON CONFLICT(hash) DO UPDATE SET
           themes: themes.length,
           conflicts: conflicts.length,
         },
+        // Persisted so a retry after a lost response can return the exact
+        // result the client needs to finish its local baseline.
+        authoritative_configs: authoritativeConfigs,
       },
       { mode, device_id: deviceId }
     );
@@ -539,7 +603,6 @@ ON CONFLICT(hash) DO UPDATE SET
     );
     throw error;
   }
-  const authoritativeConfigs = buildAuthoritativeConfigSnapshots(db, configs);
   audit(runtime, "import", {
     mode,
     session_id: sessionId,
@@ -566,20 +629,25 @@ ON CONFLICT(hash) DO UPDATE SET
       conflicts: conflicts.length,
     },
     latest_seq: latestSeq,
+    generation: getGeneration(db),
     authoritative_configs: authoritativeConfigs,
   };
 }
 
-function exportBaseline(runtime, options = {}) {
+function exportBaselinePage(runtime, options = {}) {
   const db = runtime.dbContext.db;
   const afterSeq = Math.max(Number(options.after_seq || 0) || 0, 0);
   const limit = Math.min(
-    Math.max(Number(options.limit || 5000) || 5000, 1),
+    Math.max(Math.trunc(Number(options.limit || 5000) || 5000), 1),
     runtime.config.maxLimit || 5000
   );
-  const kind = String(options.kind || "all").toLowerCase();
-  const cursor = parseCursor(options.cursor);
-  const pageLimit = limit + 1;
+  const requestedKind = String(options.kind || "all").toLowerCase();
+  const kind = requestedKind === "messageattachments" ? "message_attachments" : requestedKind;
+  if (kind !== "all" && !Object.prototype.hasOwnProperty.call(PAGES, kind)) {
+    throw new Error(`unsupported bootstrap kind: ${kind}`);
+  }
+  const latestSeq = getLatestSeq(db);
+  const cursor = parseBootstrapCursor(options.cursor, kind, latestSeq);
 
   const loadMessages = kind === "all" || kind === "messages";
   const loadTopics = kind === "all" || kind === "topics";
@@ -592,13 +660,7 @@ function exportBaseline(runtime, options = {}) {
   const loadAvatars = kind === "all" || kind === "avatars";
   const loadThemes = kind === "all" || kind === "themes";
 
-  const topicRows = loadTopics
-    ? db
-        .prepare(
-          `SELECT * FROM topics WHERE deleted = 0 ORDER BY item_type, item_id, CASE WHEN order_rank IS NULL THEN 1 ELSE 0 END ASC, order_rank ASC, created_at ASC, id ASC LIMIT ? OFFSET ?`
-        )
-        .all(pageLimit, cursor)
-    : [];
+  const topicRows = loadTopics ? loadBootstrapPage(db, "topics", cursor, limit) : [];
   const topics = takePage(topicRows, limit).map((row) => {
     const metadata = parseJson(row.metadata_json, {});
     return {
@@ -632,13 +694,7 @@ function exportBaseline(runtime, options = {}) {
     };
   });
 
-  const messageRows = loadMessages
-    ? db
-        .prepare(
-          `SELECT * FROM messages WHERE deleted = 0 ORDER BY item_type, item_id, topic_id, COALESCE(local_order, 2147483647), server_seq, id LIMIT ? OFFSET ?`
-        )
-        .all(pageLimit, cursor)
-    : [];
+  const messageRows = loadMessages ? loadBootstrapPage(db, "messages", cursor, limit) : [];
   const messages = takePage(messageRows, limit).map((row) => ({
     item_type: row.item_type,
     item_id: row.item_id,
@@ -647,35 +703,17 @@ function exportBaseline(runtime, options = {}) {
     version: row.version,
     message: parseJson(row.raw_json, null),
     checksum: row.checksum,
+    server_seq: row.server_seq,
     local_order:
       row.local_order === undefined || row.local_order === null
         ? null
         : Number(row.local_order),
   }));
-  const configRows = loadConfigs
-    ? db
-        .prepare(
-          `SELECT * FROM config_entities WHERE deleted = 0 AND COALESCE(profile, 'bootstrap') IN ('bootstrap', 'runtime') ORDER BY schema, entity_id, COALESCE(profile, 'bootstrap') LIMIT ? OFFSET ?`
-        )
-        .all(pageLimit, cursor)
-    : [];
+  const configRows = loadConfigs ? loadBootstrapPage(db, "configs", cursor, limit) : [];
   const configs = takePage(configRows, limit).map((row) =>
-    backfillConfigTopicsForExport(db, {
-      schema: row.schema,
-      entity_id: row.entity_id,
-      dto_version: row.dto_version,
-      safe_projection_json: parseJson(row.safe_projection_json, {}),
-      profile: row.profile || "bootstrap",
-      projection_fields: parseJson(row.projection_fields_json, []),
-      checksum: row.checksum,
-      version: row.version,
-    })
+    backfillConfigTopicsForExport(db, configSnapshotFromRow(row))
   );
-  const attachmentRows = loadAttachments
-    ? db
-        .prepare(`SELECT * FROM attachments ORDER BY hash LIMIT ? OFFSET ?`)
-        .all(pageLimit, cursor)
-    : [];
+  const attachmentRows = loadAttachments ? loadBootstrapPage(db, "attachments", cursor, limit) : [];
 
   const attachments = takePage(attachmentRows, limit).map((row) => ({
     hash: row.hash,
@@ -686,13 +724,7 @@ function exportBaseline(runtime, options = {}) {
     storage_path: row.storage_path,
     metadata: parseJson(row.metadata_json, {}),
   }));
-  const messageAttachmentRows = loadMessageAttachments
-    ? db
-        .prepare(
-          `SELECT * FROM message_attachments ORDER BY item_type, item_id, topic_id, message_id, sort_order, attachment_hash LIMIT ? OFFSET ?`
-        )
-        .all(pageLimit, cursor)
-    : [];
+  const messageAttachmentRows = loadMessageAttachments ? loadBootstrapPage(db, "message_attachments", cursor, limit) : [];
   const message_attachments = takePage(messageAttachmentRows, limit).map(
     (row) => ({
       item_type: row.item_type,
@@ -708,13 +740,7 @@ function exportBaseline(runtime, options = {}) {
       created_at: row.created_at,
     })
   );
-  const avatarRows = loadAvatars
-    ? db
-        .prepare(
-          `SELECT * FROM avatars WHERE deleted = 0 ORDER BY owner_type, owner_id LIMIT ? OFFSET ?`
-        )
-        .all(pageLimit, cursor)
-    : [];
+  const avatarRows = loadAvatars ? loadBootstrapPage(db, "avatars", cursor, limit) : [];
   const avatars = takePage(avatarRows, limit).map((row) => ({
     owner_type: row.owner_type,
     owner_id: row.owner_id,
@@ -725,15 +751,9 @@ function exportBaseline(runtime, options = {}) {
     metadata: parseJson(row.metadata_json, {}),
     version: row.version,
   }));
-  const themeRows = loadThemes
-    ? db
-        .prepare(
-          `SELECT * FROM theme_packages WHERE deleted = 0 ORDER BY updated_at DESC, theme_id LIMIT ? OFFSET ?`
-        )
-        .all(pageLimit, cursor)
-    : [];
+  const themeRows = loadThemes ? loadBootstrapPage(db, "themes", cursor, limit) : [];
   const themes = takePage(themeRows, limit).map((row) => {
-    const assets = loadThemeAssetsForExport(db, row.theme_id);
+    const assets = loadThemeAssetsForExport(db, row.theme_id, runtime.config);
     return {
       theme_id: row.theme_id,
       display_name: row.display_name,
@@ -759,7 +779,10 @@ function exportBaseline(runtime, options = {}) {
   return {
     ok: true,
     exported_at: new Date().toISOString(),
-    latest_seq: getLatestSeq(db),
+    generation: getGeneration(db),
+    latest_seq: latestSeq,
+    baseline_seq: cursor.baseline_seq,
+    pagination: "keyset-v1",
     after_seq: afterSeq,
     changes,
     has_more_changes:
@@ -795,9 +818,16 @@ function exportBaseline(runtime, options = {}) {
   };
 }
 
+function exportBaseline(runtime, options = {}) {
+  // Pin all tables and the first replay cursor to one read transaction. Later
+  // keyset pages may see newer rows; clients replay changes after baseline_seq.
+  return runtime.dbContext.db.transaction(() => exportBaselinePage(runtime, options))();
+}
+
 module.exports = {
   requireBootstrapAuth,
   centerIsEmpty,
   importBootstrap,
   exportBaseline,
+  getBootstrapSession,
 };

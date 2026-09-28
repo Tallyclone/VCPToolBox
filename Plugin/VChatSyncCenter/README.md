@@ -35,11 +35,16 @@ VChatSyncCenter/
    - `ensureDatabase()` 初始化 SQLite 数据库并运行 migrations。
    - 默认数据库路径为 `./Plugin/VChatSyncCenter/data/vchat_data.db`。
    - 当前 `config_entities` 以 `(schema, entity_id, profile)` 为主键，确保 `bootstrap` 与 `runtime` 配置互不覆盖。
+   - migration 15 增加 `deleted_fields_json`，并从已有变更日志恢复累计配置快照及显式删除字段；原有版本号、时间戳、删除行和变更日志保持不变。升级在 Center 下次启动时自动执行。
+   - migration 16 增加 `center_meta` 表并生成 change_log 代际标识 `generation`。`/status`、`/changes`、`/bootstrap/export` 与 `/bootstrap/import` 都会返回它。
 
 2. **统一 Operation 写入口**
 
    - 桌面端、移动端应通过 `POST /operations` 提交结构化 operation。
    - 聊天历史同步以 `message create/update/delete` 等 message-level/entity-level 事件为准。
+   - operation ID 标识一次修改，不能只按内容生成；同一次请求重试使用原 ID。消息、话题和所属 item 的删除标记优先于迟到更新，幂等重试同样返回删除优先结果。
+   - 同 ID 但内容不同的消息 create 会被永久拒绝：响应 `ok:false`、`code:MESSAGE_CREATE_CONFLICT`、HTTP 409，并携带当前 `version`；同一 ID 重放返回同样结果。客户端应改用新 ID、以该 version 为 base 提交 update。
+   - 删除群成员会同时更新 `config_entities` 中的群配置累计快照（entity_id 为 `AgentGroups/<id>/config.json` 或裸 id 都能匹配），checksum 与配置 DTO 算法一致，新设备 bootstrap 不会再读到已删成员。
    - 禁止把 `history.json` 当作文件镜像或 JSON Patch 同步对象。
 
 3. **可靠增量拉取**
@@ -51,8 +56,9 @@ VChatSyncCenter/
 4. **设备注册与鉴权**
 
    - `POST /devices/register` 注册客户端设备。
-   - API 通过同步密钥鉴权。
-   - 同步密钥由 `VCHAT_SYNC_KEY` 配置，默认 `change-me` 仅用于占位，实际部署必须修改。
+   - 同步 API 先通过宿主 `server.js` 原有的全局 `Key` Bearer 鉴权，再由插件校验 `VCHAT_SYNC_KEY`。
+   - Center 与 Adapter 的 `VCHAT_SYNC_KEY` 必须都与宿主 `config.env` 中的 `Key` 相同；默认 `change-me` 仅用于占位，不能用于实际部署。
+   - 请求缺失或使用错误密钥、宿主与同步密钥不一致、同步密钥为空或占位值时都会被拒绝；禁用或未加载的同步插件不会提供同步接口。
 
 5. **配置同步存储隔离**
 
@@ -62,6 +68,7 @@ VChatSyncCenter/
    - Center 会递归校验 `safe_projection_json`，拒绝敏感 key，并拒绝未声明字段。
    - `deleted_fields` 用于表达显式字段删除：字段必须已声明在 `projection_fields` 中，并且同样必须属于 bootstrap allowlist，不能命中敏感 key。
    - Bootstrap 导出包含 `profile='bootstrap'` 与 `profile='runtime'` 的配置行，确保新设备加入后不会跳过历史 runtime 配置。
+   - Runtime 行累计保存已声明字段的更新与显式删除；change_log 保留每次提交的原始局部投影。缺失而未显式删除的字段不会覆盖前次结果。
 
 6. **附件同步**
 
@@ -72,19 +79,25 @@ VChatSyncCenter/
 7. **备份、恢复与完整性检查**
 
    - `/backup/list`、`/backup/create`、`/backup/verify`、`/backup/restore` 提供中心库备份与恢复能力。
+   - 插件启用后按 `VCHAT_BACKUP_INTERVAL`（如 `6h`、`90m`、`1d`；`0`/`off` 关闭）自动备份到 `VCHAT_BACKUP_DIR`，每次备份后按 `VCHAT_BACKUP_RETENTION_DAYS` 清理过期备份；最新一份和 `pre-restore` 备份永不自动删除。`/status` 的 `backup.enabled` 只在调度器实际运行时为 true，并给出下次/上次运行时间与失败信息。
+   - `/backup/restore` 会轮换 change_log 代际 `generation`（无论序号是否回退），响应 `clients_must_rebootstrap:true`。所有 Adapter 检测到代际变化后会停止拉取并进入 `recovering`，需重新 `join_existing`/`merge_existing`，避免恢复后复用的序号被跳过。
    - `/status` 返回数据库 WAL、完整性、迁移状态、表计数、备份状态和限制参数。
 
 8. **Bootstrap 支持**
 
-   - `/bootstrap/import` 用于初始导入本地基线。
+   - `/bootstrap/import` 用于初始导入本地基线。客户端传入 `session_id` 时，同一会话已完成的重复导入会直接返回原结果（`idempotent:true`），不再因"中心非空"拒绝；未带会话或新会话在非空中心上仍返回 `BOOTSTRAP_CENTER_NOT_EMPTY`（HTTP 409）。
    - `/bootstrap/export` 用于客户端加入或合并时导出中心基线。
-   - Bootstrap 接口同样需要高权限鉴权。
+   - 导出返回 `pagination=keyset-v1` 和首批 `baseline_seq`。各类别通过不可变主键及不透明 `next_cursor` 翻页，客户端原样传回游标；旧的非零 OFFSET 游标需要重新开始导出。
+   - 后续页面可能包含较新状态。客户端必须从首批 `baseline_seq` 回放到所有导出页面的最大 `latest_seq`，完成后再启动正常同步，不能直接跳到末页序号。
+   - Bootstrap 接口同样须通过宿主全局 `Key` 与插件 `VCHAT_SYNC_KEY` 的校验，并记录审计日志。
 
 9. **主题资源库同步**
    - `theme_package` 表示主题 manifest、变量、extra_css 与 asset 引用关系，同步的是“主题资源库”，不是当前应用状态。
    - `theme_package` 可以通过 `POST /operations` 或 `POST /themes` 提交，`upsert` 会作为 change_log action 原样保留。
    - `theme_asset` 是二进制图片资源，只通过 `POST /themes/assets` 上传；`POST /operations` 不接收 `theme_asset`。
    - 主题资源下载使用 `GET /themes/assets/:hash`，客户端必须校验 hash 后落盘。
+   - Center 在主题 manifest 中保留 `css.filename`、`css.relative_path` 等原文件信息。Adapter 按受限的原 CSS 路径投影并保留 `theme_id`，使用本地内容基线避免主题在两端重复上传和复制。
+   - 每次新的主题包修改使用新的 operation ID；同一次请求失败后的重试使用相同 ID。Adapter 会持久化待提交 ID，因此恢复旧 CSS 内容可以作为新修改同步，响应丢失也不会产生重复操作。
 
 ## 主要 API
 
@@ -116,6 +129,8 @@ VChatSyncCenter/
 Authorization: Bearer <VCHAT_SYNC_KEY>
 ```
 
+Adapter 默认发送上面的 Bearer 请求头，其值须同时匹配宿主 `Key` 与 Center 的 `VCHAT_SYNC_KEY`。宿主保持原有全局鉴权；只发送 `x-vchat-sync-key` 无法通过宿主的 Bearer 校验。
+
 ## 关键配置
 
 配置项来自 `plugin-manifest.json` 的 `configSchema`：
@@ -124,14 +139,14 @@ Authorization: Bearer <VCHAT_SYNC_KEY>
 | ----------------------------------- | ------------------------------------------------- | ---------------------------------- |
 | `VCHAT_SYNC_ENABLED`                | `false`                                           | 是否启用同步中心                   |
 | `VCHAT_SYNC_HOST`                   | `127.0.0.1`                                       | 同步服务主机标识                   |
-| `VCHAT_SYNC_KEY`                    | `change-me`                                       | 同步 API 鉴权密钥，部署时必须修改  |
+| `VCHAT_SYNC_KEY`                    | `change-me`                                       | 须与宿主 `Key` 及 Adapter 密钥一致 |
 | `VCHAT_SYNC_REQUIRE_DEVICE_BINDING` | `true`                                            | 是否要求设备绑定                   |
 | `VCHAT_SYNC_WS_ENABLED`             | `false`                                           | 是否启用 latest_seq WebSocket 通知 |
 | `VCHAT_DB_PATH`                     | `./Plugin/VChatSyncCenter/data/vchat_data.db`     | SQLite 中心库路径                  |
 | `VCHAT_ATTACHMENT_DIR`              | `./Plugin/VChatSyncCenter/data/vchat_attachments` | 附件对象存储目录                   |
 | `VCHAT_BACKUP_DIR`                  | `./Plugin/VChatSyncCenter/data/backups`           | 备份目录                           |
-| `VCHAT_BACKUP_INTERVAL`             | `6h`                                              | 自动备份周期                       |
-| `VCHAT_BACKUP_RETENTION_DAYS`       | `30`                                              | 备份保留天数                       |
+| `VCHAT_BACKUP_INTERVAL`             | `6h`                                              | 自动备份周期（`ms`/`s`/`m`/`h`/`d`，`0`/`off` 关闭） |
+| `VCHAT_BACKUP_RETENTION_DAYS`       | `30`                                              | 备份保留天数（`0` 不清理）         |
 | `VCHAT_RELEASE_MODE`                | `mvp-local-only`                                  | 发布/能力分层标记                  |
 | `VCHAT_SYNC_MAX_LIMIT`              | `5000`                                            | changes/export 最大分页限制        |
 | `VCHAT_SYNC_MAX_ATTACHMENT_MB`      | `512`                                             | 附件大小限制                       |
@@ -182,9 +197,9 @@ PRIMARY KEY (schema, entity_id, profile)
 
 ## 快速联调建议
 
-1. 在 VCPToolBox 中启用本插件，并将 `VCHAT_SYNC_KEY` 改为高强度随机字符串。
+1. 在 VCPToolBox 中启用本插件，确认宿主 `config.env` 中的 `Key` 已配置为有效密钥，并将 Center 的 `VCHAT_SYNC_KEY` 设为相同值。
 2. 确认 `/api/plugins/VChatSyncCenter/status` 返回 `ok: true`。
-3. 在 VCPChat 的 `VChatSyncAdapter/config.env` 中配置相同的 `VCHAT_SYNC_KEY` 和正确的 `VCHAT_SYNC_CENTER_URL`。
+3. 在 VCPChat 的 `VChatSyncAdapter/config.env` 中配置与宿主和 Center 相同的 `VCHAT_SYNC_KEY`，以及正确的 `VCHAT_SYNC_CENTER_URL`。
 4. 先通过 Adapter 的 bootstrap 流程初始化设备，再启用正常扫描、上传、拉取与投影。
 5. 使用 `/changes?after_seq=0&limit=20` 查看中心是否收到变更。
 
@@ -192,5 +207,5 @@ PRIMARY KEY (schema, entity_id, profile)
 
 - WebSocket 传输层主要依赖宿主广播，REST 轮询仍是可靠兜底。
 - 高频写入场景下可继续优化 latest_seq 查询和内部缓存。
-- 备份恢复前建议暂停所有 Adapter，恢复后再逐台检查状态。
+- 备份恢复前建议暂停所有 Adapter；恢复会轮换 `generation`，恢复后每台 Adapter 都需要重新 `join_existing`/`merge_existing`。
 - 不建议直接修改中心 SQLite 数据库；优先通过 API 与正常同步流程处理。

@@ -2,6 +2,7 @@ const path = require("path");
 const { requireSyncAuth } = require("../core/auth");
 const { getDbStatus } = require("../core/db");
 const { getLatestSeq, getCompactedChanges } = require("../core/changeLog");
+const { getGeneration } = require("../core/centerMeta");
 const { runIntegrityCheck } = require("../core/integrityService");
 const {
   getBackupStatus,
@@ -301,6 +302,7 @@ function createSyncRoutes(router, runtime) {
     return res.json({
       ok: integrity === "ok",
       enabled: runtime.config.enabled,
+      generation: getGeneration(db),
       latest_seq: latestSeq,
       initialized_at: runtime.initializedAt,
       db: {
@@ -311,7 +313,7 @@ function createSyncRoutes(router, runtime) {
       },
       schema: dbStatus.migrations,
       table_counts: dbStatus.table_counts,
-      backup: getBackupStatus(runtime.config),
+      backup: getBackupStatus(runtime),
       limits: {
         max_limit: runtime.config.maxLimit,
         max_attachment_mb: runtime.config.maxAttachmentMb,
@@ -399,6 +401,7 @@ function createSyncRoutes(router, runtime) {
       events.length > 0 ? events[events.length - 1].seq : afterSeq;
     return res.json({
       ok: true,
+      generation: getGeneration(db),
       latest_seq: latestSeq,
       checkpoint_seq: checkpointSeq,
       events,
@@ -485,6 +488,7 @@ function createSyncRoutes(router, runtime) {
       notifyLatestSeq(runtime, result.restored.latest_seq, {
         entity_type: "database",
         action: "restore",
+        generation: result.generation,
       });
       return res.json(result);
     } catch (error) {
@@ -504,14 +508,21 @@ function createSyncRoutes(router, runtime) {
         ip: req.ip,
       });
       const result = importBootstrap(runtime, req.body || {});
+      if (result && result.latest_seq !== undefined && !result.idempotent) {
+        notifyLatestSeq(runtime, result.latest_seq, {
+          entity_type: "bootstrap",
+          action: "import",
+        });
+      }
       return res.json(result);
     } catch (error) {
       runtime.logger.warn("bootstrap import rejected", {
         error: error.message,
+        code: error.code,
       });
       return res
         .status(error.statusCode || 400)
-        .json({ ok: false, error: error.message });
+        .json({ ok: false, code: error.code, error: error.message });
     }
   });
 

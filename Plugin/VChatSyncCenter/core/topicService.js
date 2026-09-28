@@ -1,4 +1,7 @@
 const { appendChange } = require("./changeLog");
+const { recordConflict } = require("./conflictService");
+const { getTombstone, rowSnapshot, topicKey } = require("./deleteService");
+const { ensureItem, getItemDeletion } = require("./itemService");
 
 const ORDER_RANK_STEP = 1000000000;
 
@@ -152,14 +155,91 @@ function getTopicRow(db, identity) {
     .get(identity.item_type, identity.item_id, identity.topic_id);
 }
 
+function getTopicDeletion(db, identity, current) {
+  const entityKey = topicKey(
+    identity.item_type,
+    identity.item_id,
+    identity.topic_id
+  );
+  if (current && Number(current.deleted || 0) === 1) {
+    return {
+      entity_type: "topic",
+      entity_key: entityKey,
+      reason: "topic_deleted",
+      deleted_at: current.deleted_at,
+    };
+  }
+  const tombstone = getTombstone(db, "topic", entityKey);
+  if (tombstone) {
+    return {
+      entity_type: "topic",
+      entity_key: entityKey,
+      reason: "topic_tombstone",
+      deleted_at: tombstone.deleted_at,
+    };
+  }
+  return getItemDeletion(db, identity.item_type, identity.item_id);
+}
+
+function rejectDeletedTopicChange(db, operation, identity, current, deletion) {
+  recordConflict(db, {
+    operation_id: operation.operation_id,
+    device_id: operation.device_id,
+    entity_type: "topic",
+    entity_key: topicKey(
+      identity.item_type,
+      identity.item_id,
+      identity.topic_id
+    ),
+    base_version: operation.base_version,
+    incoming: identity.topic,
+    current: rowSnapshot(current),
+    resolution: "delete_wins",
+  });
+  const version = current ? Number(current.version || 0) : null;
+  const seq = appendChange(db, {
+    ...operation,
+    item_type: identity.item_type,
+    item_id: identity.item_id,
+    topic_id: identity.topic_id,
+    entity_type: "topic",
+    entity_id: identity.topic_id,
+    action: `${operation.action || "upsert"}_rejected_deleted`,
+    version,
+    payload: {
+      topic: identity.topic,
+      conflict: true,
+      deleted: true,
+      resolution: "delete_wins",
+      reason: deletion.reason,
+      deleted_at: deletion.deleted_at,
+      parent: deletion.entity_type === "item" ? deletion : undefined,
+    },
+  });
+  return {
+    ok: true,
+    seq,
+    version,
+    conflict: true,
+    deleted: true,
+    resolution: "delete_wins",
+    reason: deletion.reason,
+  };
+}
+
 function applyTopicUpsert(db, operation, options = {}) {
   const identity = normalizeTopicOperation(operation);
   const current = getTopicRow(db, identity);
-  if (current && Number(current.deleted || 0) === 1) {
-    const error = new Error("topic upsert target is deleted");
-    error.code = "TOPIC_DELETED";
-    throw error;
+  const deletion = getTopicDeletion(db, identity, current);
+  if (deletion) {
+    return rejectDeletedTopicChange(db, operation, identity, current, deletion);
   }
+  ensureItem(
+    db,
+    identity.item_type,
+    identity.item_id,
+    operation.payload && operation.payload.item
+  );
   const currentMeta = current
     ? stripTopicOrderFields(JSON.parse(current.metadata_json || "{}"))
     : {};

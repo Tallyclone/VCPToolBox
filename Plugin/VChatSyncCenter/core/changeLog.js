@@ -18,19 +18,32 @@ function getOperationResult(db, operationId) {
 
   const payload = safeJsonParse(row.payload_json, {});
   const isRejectedCreate = row.action === "create_conflict";
+  const conflict = !!(payload && payload.conflict);
+  const deleted = !!(payload && payload.deleted) || row.action === "delete";
   return {
     ok: !isRejectedCreate,
+    ...(isRejectedCreate ? { code: "MESSAGE_CREATE_CONFLICT" } : {}),
     seq: Number(row.seq),
     operation_id: row.operation_id,
     idempotent: true,
-    conflict: !!(payload && payload.conflict),
+    conflict,
+    deleted,
+    resolution:
+      (payload && payload.resolution) ||
+      (conflict && deleted ? "delete_wins" : undefined),
+    reason: payload && payload.reason,
     error: isRejectedCreate
       ? "message already exists with different checksum"
       : undefined,
     entity_type: row.entity_type,
     entity_id: row.entity_id,
     action: row.action,
+    // For a rejected create this is the version the client must base an
+    // update on; it was the current version when the conflict was recorded.
     version: row.version,
+    ...(isRejectedCreate && payload && payload.existing_checksum
+      ? { existing_checksum: payload.existing_checksum }
+      : {}),
     payload,
   };
 }

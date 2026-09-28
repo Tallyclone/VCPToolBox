@@ -3,6 +3,10 @@ const { createLogger } = require("./utils/logger");
 const { buildRuntimeConfig } = require("./core/config");
 const { ensureDatabase, closeDatabase } = require("./core/db");
 const { validateSyncAuth } = require("./core/auth");
+const {
+  startBackupScheduler,
+  stopBackupScheduler,
+} = require("./core/backupService");
 
 let runtime = null;
 
@@ -32,6 +36,7 @@ async function initialize(pluginConfig = {}, dependencies = {}) {
       dbPath: config.dbPath,
       attachmentDir: config.attachmentDir,
     });
+    if (config.enabled) startBackupScheduler(runtime);
   } catch (error) {
     runtime.initError = error;
     logger.error("VChatSyncCenter initialization failed", {
@@ -63,6 +68,7 @@ function registerApiRoutes(
     };
     try {
       runtime.dbContext = ensureDatabase(config, logger);
+      if (config.enabled) startBackupScheduler(runtime);
     } catch (error) {
       runtime.initError = error;
       logger.error("VChatSyncCenter lazy initialization failed", {
@@ -93,6 +99,7 @@ function registerApiRoutes(
 }
 
 async function shutdown() {
+  if (runtime) stopBackupScheduler(runtime);
   if (runtime && runtime.dbContext) {
     closeDatabase(runtime.dbContext);
   }

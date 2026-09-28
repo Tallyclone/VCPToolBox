@@ -5,62 +5,21 @@ const {
   getTombstone,
   configKey,
 } = require("./deleteService");
-const { ensureItem } = require("./itemService");
+const { ensureItem, getItemDeletion } = require("./itemService");
 const { applyTopicUpsert, ORDER_RANK_STEP } = require("./topicService");
-const { safeJsonStringify, stableJsonStringify } = require("../utils/safeJson");
-const { sha256 } = require("../utils/checksum");
+const { safeJsonStringify } = require("../utils/safeJson");
+const {
+  buildConfigChecksumSource,
+  checksumConfigDto,
+  materializeConfigSnapshot,
+  configSnapshotFromRow,
+} = require("./configSnapshot");
 const {
   SENSITIVE_KEY_PATTERN,
   scanNoSensitiveKeys,
   validateSafeConfigDto,
   validateDeletedFields,
 } = require("./configSchema");
-
-function buildConfigChecksumSource({
-  dto_version,
-  schema,
-  entity_id,
-  safe_projection_json,
-  projection_fields,
-  deleted_fields,
-  profile,
-}) {
-  return {
-    dto_version: Number(dto_version || 1),
-    schema,
-    entity_id,
-    safe_projection_json,
-    projection_fields: Array.isArray(projection_fields)
-      ? projection_fields
-      : undefined,
-    deleted_fields: Array.isArray(deleted_fields) ? deleted_fields : undefined,
-    profile: profile || "bootstrap",
-  };
-}
-
-function checksumConfigDto({
-  dto_version,
-  schema,
-  entity_id,
-  safe_projection_json,
-  projection_fields,
-  deleted_fields,
-  profile,
-}) {
-  return sha256(
-    stableJsonStringify(
-      buildConfigChecksumSource({
-        dto_version,
-        schema,
-        entity_id,
-        safe_projection_json,
-        projection_fields,
-        deleted_fields,
-        profile,
-      })
-    )
-  );
-}
 
 function configOwnerIdentity(configPayload = {}) {
   const schema = configPayload.schema;
@@ -72,7 +31,7 @@ function configOwnerIdentity(configPayload = {}) {
   if (!match) return null;
   return {
     item_type: match[1].toLowerCase() === "agentgroups" ? "group" : "agent",
-    item_id: match[2],
+    item_id: decodeURIComponent(match[2]),
   };
 }
 
@@ -122,17 +81,16 @@ function deriveTopicsFromConfigDto(
   if (!owner) return 0;
   const dto = normalized.dto || {};
   const topics = Array.isArray(dto.topics) ? dto.topics : [];
-  if (topics.length === 0) return 0;
-  ensureItem(db, owner.item_type, owner.item_id, {
+  if (!ensureItem(db, owner.item_type, owner.item_id, {
     title: dto.name || owner.item_id,
     source,
-  });
+  })) return 0;
   let count = 0;
   topics.forEach((topic, index) => {
     const safeTopic = normalizeDerivedTopic(topic);
     const topicId = safeTopic && safeTopic.id;
     if (!topicId || topicParentExists(db, owner, topicId)) return;
-    applyTopicUpsert(
+    const result = applyTopicUpsert(
       db,
       {
         operation_id: `${operation.operation_id || "config"}.derived_topic.${
@@ -155,7 +113,7 @@ function deriveTopicsFromConfigDto(
       },
       { trustInitialOrderRank: true }
     );
-    count += 1;
+    if (!result.deleted) count += 1;
   });
   return count;
 }
@@ -227,6 +185,10 @@ function applyConfigOperation(db, operation) {
       "SELECT * FROM config_entities WHERE schema = ? AND entity_id = ? AND profile = ?"
     )
     .get(normalized.schema, normalized.entity_id, normalized.profile);
+  const owner = configOwnerIdentity(normalized);
+  if (owner && getItemDeletion(db, owner.item_type, owner.item_id)) {
+    return rejectDeletedConfigChange(db, operation, current, normalized.profile);
+  }
   if (current && Number(current.deleted || 0) === 1) {
     return rejectDeletedConfigChange(
       db,
@@ -264,13 +226,24 @@ function applyConfigOperation(db, operation) {
       );
     }
   }
+  if (owner) {
+    ensureItem(db, owner.item_type, owner.item_id, {
+      title: normalized.dto.name || owner.item_id,
+      source: `${normalized.profile}_config`,
+    });
+  }
   const nextVersion = current ? Number(current.version || 0) + 1 : 1;
+  const snapshot = materializeConfigSnapshot(
+    current ? configSnapshotFromRow(current) : null,
+    { ...normalized, safe_projection_json: normalized.dto }
+  );
   db.prepare(
     `
-INSERT INTO config_entities(schema, entity_id, profile, projection_fields_json, dto_version, safe_projection_json, checksum, operation_id, device_id, version, deleted, updated_at)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+INSERT INTO config_entities(schema, entity_id, profile, projection_fields_json, deleted_fields_json, dto_version, safe_projection_json, checksum, operation_id, device_id, version, deleted, updated_at)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 ON CONFLICT(schema, entity_id, profile) DO UPDATE SET
   projection_fields_json = excluded.projection_fields_json,
+  deleted_fields_json = excluded.deleted_fields_json,
   dto_version = excluded.dto_version,
   safe_projection_json = excluded.safe_projection_json,
   checksum = excluded.checksum,
@@ -284,24 +257,19 @@ ON CONFLICT(schema, entity_id, profile) DO UPDATE SET
     normalized.schema,
     normalized.entity_id,
     normalized.profile,
-    safeJsonStringify(normalized.projection_fields || []),
+    safeJsonStringify(snapshot.projection_fields ?? null),
+    safeJsonStringify(snapshot.deleted_fields),
     normalized.dto_version,
-    normalized.safe_projection_json,
-    normalized.checksum,
+    safeJsonStringify(snapshot.safe_projection_json),
+    snapshot.checksum,
     operation.operation_id,
     operation.device_id || null,
     nextVersion
   );
 
-  const derivedTopics =
-    normalized.profile === "runtime"
-      ? deriveTopicsFromConfigDto(
-          db,
-          normalized,
-          operation,
-          "runtime_config_topics"
-        )
-      : 0;
+  const derivedTopics = normalized.profile === "runtime"
+    ? deriveTopicsFromConfigDto(db, normalized, operation, "runtime_config_topics")
+    : 0;
 
   const seq = appendChange(db, {
     ...operation,

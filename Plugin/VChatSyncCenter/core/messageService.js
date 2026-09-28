@@ -253,7 +253,7 @@ function requireActiveTopic(db, identity) {
   return topic;
 }
 
-function rejectDeletedMessageCreate(
+function rejectDeletedMessageChange(
   db,
   operation,
   identity,
@@ -266,6 +266,7 @@ function rejectDeletedMessageCreate(
     device_id: operation.device_id,
     entity_type: "message",
     entity_key: entityKey,
+    base_version: operation.base_version,
     incoming: identity.message,
     current: rowToMessage(current),
     resolution: "delete_wins",
@@ -277,12 +278,13 @@ function rejectDeletedMessageCreate(
     topic_id: identity.topic_id,
     entity_type: "message",
     entity_id: identity.id,
-    action: "create_rejected_deleted",
+    action: `${operation.action || "create"}_rejected_deleted`,
     version: current ? current.version : null,
     payload: {
       message: identity.message,
       conflict: true,
       deleted: true,
+      resolution: "delete_wins",
       reason,
     },
   });
@@ -292,6 +294,8 @@ function rejectDeletedMessageCreate(
     conflict: true,
     deleted: true,
     resolution: "delete_wins",
+    reason,
+    version: current ? Number(current.version || 0) : null,
   };
 }
 
@@ -386,7 +390,7 @@ function applyCreate(db, operation) {
 
   if (existing) {
     if (Number(existing.deleted || 0) === 1) {
-      return rejectDeletedMessageCreate(
+      return rejectDeletedMessageChange(
         db,
         operation,
         identity,
@@ -442,18 +446,30 @@ function applyCreate(db, operation) {
       entity_id: identity.id,
       action: "create_conflict",
       version: existing.version,
-      payload: { message: identity.message, conflict: true, rejected: true },
+      payload: {
+        message: identity.message,
+        conflict: true,
+        rejected: true,
+        existing_version: Number(existing.version || 0),
+        existing_checksum: existing.checksum,
+      },
     });
+    // Permanent: the same operation_id can never succeed. Tell the client
+    // which version it must base an update on if it still wants its content.
     return {
       ok: false,
+      code: "MESSAGE_CREATE_CONFLICT",
       seq,
       conflict: true,
+      deleted: false,
+      version: Number(existing.version || 0),
+      existing_checksum: existing.checksum,
       error: "message already exists with different checksum",
     };
   }
 
   if (getTombstone(db, "message", entityKey)) {
-    return rejectDeletedMessageCreate(
+    return rejectDeletedMessageChange(
       db,
       operation,
       identity,
@@ -464,7 +480,7 @@ function applyCreate(db, operation) {
   }
   const deletedParent = getDeletedParent(db, identity);
   if (deletedParent) {
-    return rejectDeletedMessageCreate(
+    return rejectDeletedMessageChange(
       db,
       operation,
       identity,
@@ -544,36 +560,28 @@ function applyUpdate(db, operation) {
   identity = normalizeAndSanitizeMessage(identity);
   const current = getMessage(db, identity);
   const entityKey = messageKey(identity);
+  const deletedMessage = current && Number(current.deleted || 0) === 1;
+  const messageTombstone = getTombstone(db, "message", entityKey);
+  const deletedParent = getDeletedParent(db, identity);
+  if (deletedMessage || messageTombstone || deletedParent) {
+    return rejectDeletedMessageChange(
+      db,
+      { ...operation, action: "update" },
+      identity,
+      entityKey,
+      current,
+      deletedMessage
+        ? "message_deleted"
+        : messageTombstone
+        ? "message_tombstone"
+        : `${deletedParent.entity_type}_deleted`
+    );
+  }
   requireActiveTopic(db, identity);
   if (!current) {
     const error = new Error("message update target does not exist");
     error.code = "MESSAGE_UPDATE_TARGET_MISSING";
     throw error;
-  }
-
-  if (Number(current.deleted || 0) === 1) {
-    recordConflict(db, {
-      operation_id: operation.operation_id,
-      device_id: operation.device_id,
-      entity_type: "message",
-      entity_key: entityKey,
-      base_version: operation.base_version,
-      incoming: identity.message,
-      current: rowToMessage(current),
-      resolution: "delete_wins",
-    });
-    const seq = appendChange(db, {
-      ...operation,
-      item_type: identity.item_type,
-      item_id: identity.item_id,
-      topic_id: identity.topic_id,
-      entity_type: "message",
-      entity_id: identity.id,
-      action: "update_rejected_deleted",
-      version: current.version,
-      payload: { message: identity.message, conflict: true, deleted: true },
-    });
-    return { ok: true, seq, conflict: true, deleted: true };
   }
 
   const baseVersion =
