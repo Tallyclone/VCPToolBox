@@ -54,6 +54,7 @@ class RAGDiaryPlugin {
         this.vectorDBManager = null;
         this.ragConfig = {};
         this.rerankConfig = {};
+        this.jevClient = null;
         this.pushVcpInfo = null;
         this.enhancedVectorCache = {};
         this.timeParser = new TimeExpressionParser('zh-CN', DEFAULT_TIMEZONE);
@@ -105,6 +106,19 @@ class RAGDiaryPlugin {
         const envPath = path.join(__dirname, 'config.env');
         dotenv.config({ path: envPath });
 
+        // 元思考扩散构链配置仅属于本插件，不修改全局 rag_params。
+        const riverNumber = (name, fallback, min, max) => {
+            const raw = process.env[name];
+            const value = raw === undefined || raw.trim() === '' ? NaN : Number(raw);
+            return Number.isFinite(value) ? Math.max(min, Math.min(max, value)) : fallback;
+        };
+        this.riverThinkingConfig = Object.freeze({
+            enabled: String(process.env.RAG_RIVER_THINKING_ENABLED || 'false').trim().toLowerCase() === 'true',
+            candidateK: Math.floor(riverNumber('RAG_RIVER_THINKING_CANDIDATE_K', 48, 1, 256)),
+            maxTransitionRecords: Math.floor(riverNumber('RAG_RIVER_THINKING_MAX_TRANSITIONS', 8000, 1, 16000)),
+            minClosure: riverNumber('RAG_RIVER_THINKING_MIN_CLOSURE', 0.2, 0, 1)
+        });
+
         // 🌟 初始化缓存系统
         this.queryCacheEnabled = (process.env.RAG_QUERY_CACHE_ENABLED || 'true').toLowerCase() === 'true';
         this.contextVectorAllowApi = (process.env.CONTEXT_VECTOR_ALLOW_API_HISTORY || 'false').toLowerCase() === 'true';
@@ -137,6 +151,17 @@ class RAGDiaryPlugin {
         const rerankMaxConcurrentRequests = Number.isFinite(configuredRerankConcurrency)
             ? Math.max(1, Math.min(10, configuredRerankConcurrency))
             : 3;
+        const jevAdvancedRerank = String(
+            process.env.JevAdvancedRerank || 'false'
+        ).toLowerCase() === 'true';
+        const configuredJevMaxChoices = parseInt(
+            process.env.JevRerankMaxChoices,
+            10
+        );
+        const configuredJevMaxDocumentChars = parseInt(
+            process.env.JevRerankMaxDocumentChars,
+            10
+        );
         this.rerankConfig = {
             url: process.env.RerankUrl || '',
             apiKey: process.env.RerankApi || '',
@@ -144,10 +169,29 @@ class RAGDiaryPlugin {
             multiplier: parseFloat(process.env.RerankMultiplier) || 2.0,
             maxTokens: parseInt(process.env.RerankMaxTokensPerBatch) || 30000,
             maxDocumentsPerRequest: rerankMaxDocuments,
-            maxConcurrentRequests: rerankMaxConcurrentRequests
+            maxConcurrentRequests: rerankMaxConcurrentRequests,
+            useJev: jevAdvancedRerank,
+            jevPrompt: process.env.JevRerankPrompt
+                || '请选择最值得用于回答当前查询的记忆。请从逻辑关联、记忆叙事连续性、信息解释力三个层面综合判断；优先保留能直接解释当前问题、补足关键背景或维持人物与事件连续性的内容，压低仅有表面词汇重合、重复、跑题或缺乏上下文价值的内容。',
+            jevMaxChoices: Number.isFinite(configuredJevMaxChoices)
+                ? Math.max(2, Math.min(255, configuredJevMaxChoices))
+                : 255,
+            jevMaxDocumentChars: Number.isFinite(configuredJevMaxDocumentChars)
+                ? Math.max(200, Math.min(50000, configuredJevMaxDocumentChars))
+                : 6000
         };
         // 移除启动时检查，改为在调用时实时检查
-        if (this.rerankConfig.url && this.rerankConfig.apiKey && this.rerankConfig.model) {
+        if (this.rerankConfig.useJev) {
+            const jevConfigured = this.jevClient?.isConfigured?.() === true;
+            console.log(
+                `[RAGDiaryPlugin] Jev advanced rerank is enabled ` +
+                `(configured=${jevConfigured}, maxChoices=${this.rerankConfig.jevMaxChoices}).`
+            );
+        } else if (
+            this.rerankConfig.url
+            && this.rerankConfig.apiKey
+            && this.rerankConfig.model
+        ) {
             console.log('[RAGDiaryPlugin] Rerank feature is configured.');
         }
 
@@ -540,6 +584,11 @@ class RAGDiaryPlugin {
     }
 
     async initialize(config, dependencies) {
+        this.jevClient = dependencies?.jevClient || null;
+        if (this.jevClient) {
+            console.log('[RAGDiaryPlugin] JevClient 通用决策服务已注入。');
+        }
+
         if (dependencies.vectorDBManager) {
             this.vectorDBManager = dependencies.vectorDBManager;
             console.log('[RAGDiaryPlugin] VectorDBManager 依赖已注入。');
@@ -1565,6 +1614,15 @@ class RAGDiaryPlugin {
             );
             const globalProcessedDiaries = new Set(); // 在最外层维护一个 Set
             const requestCache = this._createRequestCache(); // 🌟 单轮请求级缓存：chunks/time/fullDoc/diaryScore/tagBoost
+            if (this.riverThinkingConfig?.enabled && targetSystemMessageIndices.some(index =>
+                /\[\[VCP元思考[^\]]*\]\]/.test(this._extractTextFromContent(messages[index].content))
+            )) {
+                requestCache.riverThinking = {
+                    config: this.riverThinkingConfig,
+                    observations: [],
+                    deferred: []
+                };
+            }
             // 🌟 优化：并发处理所有目标 system 消息，显著提升多日记本场景下的 Rerank 速度
             await Promise.all(targetSystemMessageIndices.map(async (index) => {
                 console.log(`[RAGDiaryPlugin] Processing system message at index: ${index}`);
@@ -1598,6 +1656,25 @@ class RAGDiaryPlugin {
                     () => processedContent
                 );
             }));
+
+            // 所有日记门控和检索结束后再执行元思考，不等待自身造成死锁。
+            // 观测只保留在本请求；禁止单例 lastObservation 串会话。
+            if (requestCache.riverThinking) {
+                const deferredResults = await Promise.all(
+                    requestCache.riverThinking.deferred.map(async task => ({
+                        token: task.token,
+                        result: await task.run()
+                    }))
+                );
+                for (const { token, result } of deferredResults) {
+                    for (const index of targetSystemMessageIndices) {
+                        newMessages[index].content = this._replaceTextInContent(
+                            newMessages[index].content,
+                            text => text.replace(token, () => String(result.content || ''))
+                        );
+                    }
+                }
+            }
 
             // 🌟 V7: 处理收集到的多模态附件
             if (collectedAttachments.length > 0) {
@@ -1724,7 +1801,7 @@ class RAGDiaryPlugin {
             const placeholder = match[0];
             const modifiersAndParams = match[1] || '';
 
-            processingPromises.push((async () => {
+            const runMetaThinking = async () => {
                 // 静默处理元思考占位符
 
                 // 解析参数：链名称和修饰符
@@ -1800,7 +1877,22 @@ class RAGDiaryPlugin {
                         isAutoMode,
                         autoThreshold,
                         autoWhitelist,
-                        autoBlacklist
+                        autoBlacklist,
+                        requestCache?.riverThinking ? {
+                            config: requestCache.riverThinking.config,
+                            getObservation: async () => {
+                                const eligible = requestCache.riverThinking.observations
+                                    .filter(entry => entry.useGroup === useGroup)
+                                    .sort((a, b) => a.scope.localeCompare(b.scope));
+                                return eligible[0]?.prepared || null;
+                            },
+                            searchNativeCandidates: async (diaryName, vector, options) =>
+                                this.vectorDBManager.searchNativeDiaryCandidates(
+                                    diaryName,
+                                    vector,
+                                    options
+                                )
+                        } : null
                     );
 
                     // 元思考链处理完成（静默），等待最后统一替换注入
@@ -1812,7 +1904,14 @@ class RAGDiaryPlugin {
                         content: `[VCP元思考链处理失败: ${error.message}]`
                     };
                 }
-            })());
+            };
+            if (requestCache?.riverThinking) {
+                const token = `__VCP_META_PENDING_${crypto.randomUUID()}__`;
+                processedContent = processedContent.replace(placeholder, () => token);
+                requestCache.riverThinking.deferred.push({ token, run: runMetaThinking });
+            } else {
+                processingPromises.push(runMetaThinking());
+            }
         }
 
         // --- 1. 收集 [[...]] 中的 AIMemo 请求 ---
@@ -2118,7 +2217,8 @@ class RAGDiaryPlugin {
             });
 
             // ✅ 尝试从缓存获取
-            const cachedResult = this._getCachedResult(cacheKey);
+            const cachedResult = requestCache?.riverThinking && /::RiverMemo(?=$|::|:\d+(?:\.\d+)?$)/i.test(modifiers)
+                ? null : this._getCachedResult(cacheKey);
             if (cachedResult) {
                 processingPromises.push(Promise.resolve({ placeholder, content: cachedResult.content }));
                 continue; // ⭐ 跳过后续的阈值判断
@@ -2798,7 +2898,9 @@ class RAGDiaryPlugin {
         });
 
         // 2️⃣ 尝试从缓存获取
-        const cachedResult = this._getCachedResult(cacheKey);
+        // River 元思考需要本轮原生观测，不能把历史正文缓存当作有效 Sense。
+        const cachedResult = requestCache?.riverThinking && /::RiverMemo(?=$|::|:\d+(?:\.\d+)?$)/i.test(modifiers)
+            ? null : this._getCachedResult(cacheKey);
         if (cachedResult) {
             // 缓存命中时，仍需广播VCP Info（可选）
             if (this.pushVcpInfo && cachedResult.vcpInfo) {
@@ -3116,6 +3218,26 @@ class RAGDiaryPlugin {
                     ? Math.round(finalK * this.rerankConfig.multiplier)
                     : finalK
             ) + dedupBuffer;
+            let thinkingObservation = null;
+            if (requestCache?.riverThinking
+                && typeof this.vectorDBManager.prepareUnifiedMemoObservation === 'function'
+                && typeof this.vectorDBManager.tagIndex?.planMemoThinking === 'function') {
+                try {
+                    thinkingObservation = await this.vectorDBManager.prepareUnifiedMemoObservation(
+                        { text: String(userContent || ''), vector: finalQueryVector },
+                        {
+                            coreTags: ghostTags,
+                            sourceObservationConfig: {
+                                baseTagBoost: Math.max(0, Number(defaultTagWeight) || 0),
+                                coreBoostFactor: 1.33
+                            },
+                            maxTransitionRecords: requestCache.riverThinking.config.maxTransitionRecords
+                        }
+                    );
+                } catch (error) {
+                    console.warn('[RAGDiaryPlugin] River thinking observation unavailable:', error.message);
+                }
+            }
             const nativeResult =
                 await this.vectorDBManager.executeNativeRiverQuery(
                     {
@@ -3124,6 +3246,7 @@ class RAGDiaryPlugin {
                     },
                     {
                         diaryNames,
+                        preparedMemoObservation: thinkingObservation || undefined,
                         topK: riverTopK,
                         candidateK: riverOfferK,
                         coreTags: Array.isArray(ghostTags) ? ghostTags : [],
@@ -3151,6 +3274,13 @@ class RAGDiaryPlugin {
                         enabled: true
                     }
                 );
+            if (thinkingObservation && nativeResult?.artifactSig === thinkingObservation.artifact.artifactSig) {
+                requestCache.riverThinking.observations.push({
+                    scope: `${dbScopeKey}:${modifiers}`,
+                    useGroup,
+                    prepared: thinkingObservation
+                });
+            }
             candidates = this._filterContextDuplicates(
                 (nativeResult.results || []).map(item => ({
                     ...item,
@@ -3455,14 +3585,20 @@ class RAGDiaryPlugin {
             }
         }
 
-        // 🌟 V10: 联想共现发现 - 每个已召回 chunk 作为种子，在同一虚拟索引范围内搜索并提取共现结果
+        // 🌟 V10: 联想共现发现 - 每个已召回 chunk 作为种子，在同一虚拟索引范围内搜索并提取共现结果。
+        // ::RiverMemo::Associate 的二次联想同样进入 Rust RiverMemo；普通 ::Associate
+        // 暂时保留既有 KNN/TagMemo 路径，避免改变旧占位符语义。
         if (useAssociate && finalResultsForBroadcast && finalResultsForBroadcast.length > 0) {
             const targetDiaries = associateDiaries.length > 0 ? associateDiaries : diaryNames;
             const associateResults = await this._applyAssociativeDiscovery(
                 finalResultsForBroadcast,
                 targetDiaries,
                 finalK,
-                useRiverMemo ? 0 : (tagWeight ?? defaultTagWeight)
+                useRiverMemo ? null : (tagWeight ?? defaultTagWeight),
+                {
+                    useRiverMemo,
+                    riverBaseTagBoost: defaultTagWeight
+                }
             );
             if (associateResults.length > 0) {
                 finalResultsForBroadcast = [...finalResultsForBroadcast, ...associateResults];
@@ -3562,6 +3698,7 @@ class RAGDiaryPlugin {
                     useRiverMemo: useRiverMemo,
                     riverMemo: riverMemoInfoForBroadcast,
                     useRerank: useRerank,
+                    useJevRerank: useRerank && this.rerankConfig.useJev === true,
                     useRerankPlus: useRerankPlus, // 🌟 Rerank+ (RRF) 模式标识
                     rrfAlpha: rrfAlpha, // 🌟 RRF 权重参数
                     useGeodesicRerank: useGeodesicRerank, // 🌟 V8: 测地线重排标识
@@ -3881,8 +4018,12 @@ class RAGDiaryPlugin {
 
     /**
      * 🌟 V10: 联想共现发现 (Associative Co-occurrence Discovery)
-     * 将已召回的 n 个 chunk 作为种子，每个种子以当前动态 K 在目标索引中执行纯语义搜索，
-     * 产生 n 组联想结果。从中提取在 ≥2 组中共现的结果，作为"潜在认知共现"额外追加。
+     * 将已召回的 n 个 chunk 作为种子，每个种子在目标索引中执行联想搜索，
+     * 产生 n 组结果。从中提取在 ≥2 组中共现的结果，作为"潜在认知共现"额外追加。
+     *
+     * ::RiverMemo::Associate 使用 Rust Native Query Plan + RiverMemo Topology V3；
+     * 普通 ::Associate 保留既有 KNN/TagMemo 搜索。两条路径共享相同的跨种子
+     * 共现判定、原始结果排除和最终排序规则。
      *
      * 聚合模式下，种子会跨所有聚合日记本索引搜索，实现真正的跨域认知关联。
      * 结果为额外追加，不占用原始 K 配额。
@@ -3890,10 +4031,17 @@ class RAGDiaryPlugin {
      * @param {Array} seedResults - 原始召回结果（每个需包含 text 字段）
      * @param {string[]} targetDiaries - 联想搜索的目标日记本列表
      * @param {number} dynamicK - 每个种子的联想搜索深度
-     * @param {number|null} associateTagWeight - 联想搜索的 TagMemo 权重（动态计算值，null 则无 Tag 增强）
+     * @param {number|null} associateTagWeight - 旧路径的 TagMemo 权重
+     * @param {{useRiverMemo?: boolean, riverBaseTagBoost?: number}} options - 联想引擎配置
      * @returns {Promise<Array>} 共现结果数组（source='associate'）
      */
-    async _applyAssociativeDiscovery(seedResults, targetDiaries, dynamicK, associateTagWeight = null) {
+    async _applyAssociativeDiscovery(
+        seedResults,
+        targetDiaries,
+        dynamicK,
+        associateTagWeight = null,
+        options = {}
+    ) {
         if (!seedResults || seedResults.length === 0 || !targetDiaries || targetDiaries.length === 0) {
             return [];
         }
@@ -3934,11 +4082,46 @@ class RAGDiaryPlugin {
         const originalPathSet = new Set(seedResults.map(r => r.fullPath).filter(Boolean));
 
         // 3. 每个种子在同一个虚拟联合索引范围内执行搜索。
-        // KnowledgeBaseManager 会统一增强查询、合并物理索引候选并全局 Top-K，
-        // 这里不再自行遍历成员索引，避免重新引入按库候选配额。
+        // RiverMemo 分支将 ANN、候选合并、hydrate、语义去重及 Topology V3
+        // 收敛到 Rust；旧路径仍由 KnowledgeBaseManager 执行联合索引搜索。
         const selectedDiaries = [...new Set(
             targetDiaries.map(name => String(name || '').trim()).filter(Boolean)
         )];
+        const useRiverMemo = options.useRiverMemo === true;
+        const canUseNativeRiverMemo = useRiverMemo
+            && typeof this.vectorDBManager?.executeNativeRiverQuery === 'function';
+        if (useRiverMemo && !canUseNativeRiverMemo) {
+            const error = new Error('RiverMemo 联想需要原生联合查询接口');
+            error.code = 'RIVERMEMO_ASSOCIATE_UNAVAILABLE';
+            throw error;
+        }
+
+        const safeSearchK = Math.max(
+            1,
+            Math.min(1000, Math.floor(Number(dynamicK) || 10))
+        );
+        const riverConfig =
+            this.ragParams?.KnowledgeBaseManager?.riverMemo?.candidateSuperset || {};
+        const riverCandidateK = Math.max(
+            safeSearchK,
+            Math.min(
+                5000,
+                Math.max(
+                    safeSearchK * 3,
+                    Math.floor(Number(riverConfig.queryK) || 100),
+                    Math.floor(Number(riverConfig.maxUnionCandidates) || 300)
+                )
+            )
+        );
+        const riverBaseTagBoost = Math.max(
+            0,
+            Math.min(
+                1,
+                Number.isFinite(Number(options.riverBaseTagBoost))
+                    ? Number(options.riverBaseTagBoost)
+                    : 0.6
+            )
+        );
         const coOccurrenceMap = new Map(); // textKey → { count, bestScore, result }
 
         for (let seedIdx = 0; seedIdx < seedChunks.length; seedIdx++) {
@@ -3947,11 +4130,60 @@ class RAGDiaryPlugin {
 
             let allResults = [];
             try {
-                // 🌟 V10.2: 使用动态计算的 TagMemo 权重参与联想发现
-                allResults = await this.vectorDBManager.search(
-                    selectedDiaries, seed.vector, dynamicK, associateTagWeight
-                );
+                if (canUseNativeRiverMemo) {
+                    const riverResult =
+                        await this.vectorDBManager.executeNativeRiverQuery(
+                            {
+                                text: seed.text,
+                                vector: seed.vector instanceof Float32Array
+                                    ? seed.vector
+                                    : new Float32Array(seed.vector)
+                            },
+                            {
+                                diaryNames: selectedDiaries,
+                                topK: safeSearchK,
+                                candidateK: riverCandidateK,
+                                sourceObservationConfig: {
+                                    baseTagBoost: riverBaseTagBoost,
+                                    coreBoostFactor: 1.33
+                                },
+                                enabled: true,
+                                fallbackToLegacy: true
+                            }
+                        );
+                    allResults = Array.isArray(riverResult?.results)
+                        ? riverResult.results.map(result => ({
+                            ...result,
+                            _associateEngine: 'rivermemo',
+                            _associateRiverMemo: {
+                                artifactSig: riverResult.artifactSig || null,
+                                queryId: riverResult.queryId || null,
+                                omega: Number(result.omega) || 0,
+                                regime:
+                                    result.riverRegime
+                                    || riverResult.omega?.regime
+                                    || null,
+                                topologyBonus:
+                                    Number(result.topologyBonus) || 0,
+                                anchorBonus:
+                                    Number(result.anchorBonus) || 0
+                            }
+                        }))
+                        : [];
+                } else {
+                    // 兼容旧 ::Associate：使用动态 TagMemo 权重或普通 KNN。
+                    allResults = await this.vectorDBManager.search(
+                        selectedDiaries,
+                        seed.vector,
+                        safeSearchK,
+                        associateTagWeight
+                    );
+                }
             } catch (e) {
+                console.warn(
+                    `[RAGDiaryPlugin] Associate seed ${seedIdx + 1}/${seedChunks.length} ` +
+                    `${canUseNativeRiverMemo ? 'RiverMemo' : 'legacy'} search failed: ${e.message}`
+                );
                 allResults = [];
             }
 
@@ -3986,6 +4218,9 @@ class RAGDiaryPlugin {
                     ...data.result,
                     source: 'associate',
                     _associateCoCount: data.count,
+                    _associateEngine:
+                        data.result._associateEngine
+                        || (canUseNativeRiverMemo ? 'rivermemo' : 'legacy'),
                     score: data.bestScore
                 });
             }
@@ -3999,7 +4234,16 @@ class RAGDiaryPlugin {
             return (b.score || 0) - (a.score || 0);
         });
 
-        console.log(`[RAGDiaryPlugin] 🌟 Associate: ${seedChunks.length} 种子 × ${selectedDiaries.length} 索引（联合搜索）→ ${coOccurrenceMap.size} 候选 → ${associateResults.length} 共现命中 (tagWeight=${associateTagWeight?.toFixed(3) ?? 'null'})`);
+        console.log(
+            `[RAGDiaryPlugin] 🌟 Associate [${canUseNativeRiverMemo
+                ? 'RiverMemo Topology V3 Rust/Rayon'
+                : 'Legacy KNN/TagMemo'}]: ` +
+            `${seedChunks.length} 种子 × ${selectedDiaries.length} 索引（联合搜索）` +
+            `→ ${coOccurrenceMap.size} 候选 → ${associateResults.length} 共现命中 ` +
+            `(tagWeight=${canUseNativeRiverMemo
+                ? riverBaseTagBoost.toFixed(3)
+                : (associateTagWeight?.toFixed(3) ?? 'null')})`
+        );
 
         return associateResults;
     }
@@ -4505,7 +4749,143 @@ class RAGDiaryPlugin {
         return Math.ceil(chineseChars * 1.5 + otherChars * 0.25);
     }
 
+    async _rerankDocumentsWithJev(query, documents, originalK, rrfOptions = null) {
+        if (
+            !this.jevClient
+            || typeof this.jevClient.decide !== 'function'
+            || this.jevClient.isConfigured?.() !== true
+        ) {
+            console.warn(
+                '[RAGDiaryPlugin] Jev advanced rerank is enabled, but the shared JevClient is not configured. Keeping retrieval order.'
+            );
+            return documents.slice(0, originalK);
+        }
+
+        if (!Array.isArray(documents) || documents.length <= 1) {
+            return (documents || []).slice(0, originalK);
+        }
+
+        const maxChoices = Math.max(
+            2,
+            Math.min(255, Number(this.rerankConfig.jevMaxChoices) || 255)
+        );
+        const maxDocumentChars = Math.max(
+            200,
+            Number(this.rerankConfig.jevMaxDocumentChars) || 6000
+        );
+        const eligibleDocuments = documents.slice(0, maxChoices);
+        if (documents.length > eligibleDocuments.length) {
+            console.warn(
+                `[RAGDiaryPlugin] Jev rerank candidates truncated: ` +
+                `${documents.length} -> ${eligibleDocuments.length} (Choice hard limit).`
+            );
+        }
+
+        const criteria = {};
+        const documentByChoice = new Map();
+        eligibleDocuments.forEach((document, index) => {
+            const choiceId = `doc_${String(index).padStart(3, '0')}`;
+            const text = String(document?.text || '').trim();
+            const boundedText = text.length > maxDocumentChars
+                ? `${text.substring(0, maxDocumentChars)}…`
+                : text;
+            criteria[choiceId] = [
+                `候选记忆 ${index + 1}`,
+                document?.source ? `来源类型: ${document.source}` : null,
+                document?.fullPath ? `路径: ${document.fullPath}` : null,
+                `内容:\n${boundedText}`
+            ].filter(Boolean).join('\n');
+            documentByChoice.set(choiceId, document);
+        });
+
+        try {
+            const response = await this.jevClient.decide(
+                {
+                    task: 'rag_memory_rerank',
+                    query: String(query || ''),
+                    candidate_count: eligibleDocuments.length
+                },
+                {
+                    best_memory: {
+                        type: 'choice',
+                        instructions: this.rerankConfig.jevPrompt,
+                        criteria
+                    }
+                }
+            );
+            const answer = response?.answers?.best_memory;
+            const probabilities = answer?.probabilities;
+            if (
+                !answer
+                || answer.type !== 'choice'
+                || !probabilities
+                || typeof probabilities !== 'object'
+            ) {
+                throw new Error('Jev choice response is missing probabilities.');
+            }
+
+            const rerankedDocuments = Array.from(documentByChoice.entries())
+                .map(([choiceId, document], index) => ({
+                    ...document,
+                    rerank_score: Number(probabilities[choiceId]) || 0,
+                    jev_choice: choiceId,
+                    jev_selected: answer.choice === choiceId,
+                    jev_confidence: Number(answer.confidence) || 0,
+                    _jevStableIndex: index
+                }))
+                .sort((left, right) =>
+                    (right.rerank_score - left.rerank_score)
+                    || (Number(right.jev_selected) - Number(left.jev_selected))
+                    || (left._jevStableIndex - right._jevStableIndex)
+                );
+
+            rerankedDocuments.forEach((document, index) => {
+                document.rerank_rank = index + 1;
+                delete document._jevStableIndex;
+            });
+
+            if (rrfOptions) {
+                const RRF_K = 60;
+                const alpha = rrfOptions.alpha ?? 0.5;
+                rerankedDocuments.forEach(document => {
+                    const retrievalRank = document.retrieval_rank
+                        || rerankedDocuments.length;
+                    document.rrf_score =
+                        alpha * (1 / (RRF_K + document.rerank_rank))
+                        + (1 - alpha) * (1 / (RRF_K + retrievalRank));
+                });
+                rerankedDocuments.sort((left, right) =>
+                    right.rrf_score - left.rrf_score
+                );
+            }
+
+            const finalDocuments = rerankedDocuments.slice(0, originalK);
+            console.log(
+                `[RAGDiaryPlugin] Jev${rrfOptions ? '+(RRF)' : ''} rerank completed: ` +
+                `${eligibleDocuments.length} candidates -> ${finalDocuments.length}, ` +
+                `selected=${answer.choice || 'unknown'}, ` +
+                `confidence=${Number(answer.confidence || 0).toFixed(4)}.`
+            );
+            return finalDocuments;
+        } catch (error) {
+            console.error(
+                '[RAGDiaryPlugin] Jev advanced rerank failed; keeping retrieval order:',
+                error.message
+            );
+            return documents.slice(0, originalK);
+        }
+    }
+
     async _rerankDocuments(query, documents, originalK, rrfOptions = null) {
+        if (this.rerankConfig.useJev === true) {
+            return this._rerankDocumentsWithJev(
+                query,
+                documents,
+                originalK,
+                rrfOptions
+            );
+        }
+
         // JIT (Just-In-Time) check for configuration instead of relying on a startup flag
         if (!this.rerankConfig.url || !this.rerankConfig.apiKey || !this.rerankConfig.model) {
             console.warn('[RAGDiaryPlugin] Rerank called, but is not configured. Skipping.');
@@ -5283,7 +5663,7 @@ class RAGDiaryPlugin {
      */
     getContextBridge() {
         const self = this;
-        const BRIDGE_VERSION = '1.1';
+        const BRIDGE_VERSION = '1.2';
 
         return Object.freeze({
             /** 接口版本号，用于未来兼容性检查 */
@@ -5426,19 +5806,26 @@ class RAGDiaryPlugin {
             },
 
             /**
-             * 执行结构化日记检索，可选择复用 TagMemo 浪潮增强与测地线重排。
-             * 此接口只返回候选及检索元数据，不生成展示文本，也不重新向量化日记文档。
-             * TagBoost 在桥内只计算一次，并通过 preparedBoostResult 传入 KnowledgeBaseManager，
-             * 避免感应阶段和实际搜索阶段重复运行浪潮管线。
+             * 执行结构化日记检索，可优先使用 Rust 原生 RiverMemo，并在不可用时回退
+             * 到 TagMemo/普通 KNN。此接口只返回候选及检索元数据，不生成展示文本，
+             * 也不重新向量化日记文档。
+             *
+             * RiverMemo 路径复用 KnowledgeBaseManager 的显式日记本权限作用域和
+             * Native Query Plan；ANN、候选合并、向量 hydrate、语义去重与
+             * Topology V3 均在原生链路完成。TagMemo 回退路径仍只计算一次
+             * TagBoost，并通过 preparedBoostResult 复用同一次感应。
              *
              * @param {object} options
              * @param {string|string[]} options.diaryNames - 日记本/索引名称
              * @param {Array|Float32Array} options.queryVector - 已生成的查询向量
              * @param {number} [options.k=10] - 最大候选 chunk 数
-             * @param {boolean} [options.tagMemo=false] - 是否启用 TagMemo 浪潮增强
+             * @param {boolean} [options.riverMemo=false] - 是否优先启用 Rust 原生 RiverMemo
+             * @param {number} [options.candidateK] - RiverMemo 原生候选超集大小
+             * @param {string} [options.queryText=''] - RiverMemo 查询文本
+             * @param {boolean} [options.tagMemo=false] - 回退时是否启用 TagMemo 浪潮增强
              * @param {number} [options.tagWeight] - 显式 Tag 权重；省略时使用动态权重
-             * @param {boolean} [options.geodesicRerank=false] - 是否启用查询级测地线重排
-             * @param {boolean} [options.deduplicate=false] - 是否执行智能语义去重
+             * @param {boolean} [options.geodesicRerank=false] - 回退时是否启用查询级测地线重排
+             * @param {boolean} [options.deduplicate=false] - 回退时是否执行智能语义去重
              * @param {string} [options.userText=''] - 动态参数计算使用的用户文本
              * @param {string} [options.aiText=''] - 动态参数计算使用的 AI 文本
              * @param {Array} [options.coreTags=[]] - 显式核心 Tag 或幽灵节点
@@ -5449,6 +5836,9 @@ class RAGDiaryPlugin {
                     diaryNames,
                     queryVector,
                     k = 10,
+                    riverMemo = false,
+                    candidateK,
+                    queryText = '',
                     tagMemo = false,
                     tagWeight,
                     geodesicRerank = false,
@@ -5459,14 +5849,28 @@ class RAGDiaryPlugin {
                 } = options || {};
 
                 if (!queryVector || !self.vectorDBManager || typeof self.vectorDBManager.search !== 'function') {
-                    return { results: [], meta: { tagMemoUsed: false, fallbackReason: 'search-unavailable' } };
+                    return {
+                        results: [],
+                        meta: {
+                            riverMemoUsed: false,
+                            tagMemoUsed: false,
+                            fallbackReason: 'search-unavailable'
+                        }
+                    };
                 }
 
                 const names = Array.isArray(diaryNames)
                     ? [...new Set(diaryNames.map(name => String(name || '').trim()).filter(Boolean))]
                     : String(diaryNames || '').trim();
                 if ((Array.isArray(names) && names.length === 0) || !names) {
-                    return { results: [], meta: { tagMemoUsed: false, fallbackReason: 'empty-diary-scope' } };
+                    return {
+                        results: [],
+                        meta: {
+                            riverMemoUsed: false,
+                            tagMemoUsed: false,
+                            fallbackReason: 'empty-diary-scope'
+                        }
+                    };
                 }
 
                 const safeK = Math.max(1, Math.min(1000, Math.floor(Number(k) || 10)));
@@ -5475,6 +5879,68 @@ class RAGDiaryPlugin {
                 let matchedTags = [];
                 let dynamicMetrics = null;
                 let fallbackReason = null;
+
+                if (
+                    riverMemo === true &&
+                    typeof self.vectorDBManager.executeNativeRiverQuery === 'function'
+                ) {
+                    try {
+                        const safeCandidateK = Number.isFinite(Number(candidateK))
+                            ? Math.max(safeK, Math.min(5000, Math.floor(Number(candidateK))))
+                            : undefined;
+                        const nativeResult = await self.vectorDBManager.executeNativeRiverQuery(
+                            {
+                                text: String(queryText || userText || ''),
+                                vector: queryVector instanceof Float32Array
+                                    ? queryVector
+                                    : new Float32Array(queryVector)
+                            },
+                            {
+                                diaryNames: names,
+                                topK: safeK,
+                                candidateK: safeCandidateK,
+                                coreTags: Array.isArray(coreTags) ? coreTags : [],
+                                sourceObservationConfig: {
+                                    baseTagBoost: Number.isFinite(Number(tagWeight))
+                                        ? Math.max(0, Math.min(1, Number(tagWeight)))
+                                        : 0.6,
+                                    coreBoostFactor: 1.33
+                                },
+                                enabled: true,
+                                fallbackToLegacy: true
+                            }
+                        );
+
+                        return {
+                            results: Array.isArray(nativeResult?.results)
+                                ? nativeResult.results
+                                : [],
+                            meta: {
+                                riverMemoUsed: true,
+                                nativeJointQueryUsed:
+                                    nativeResult?.diagnostics?.nativeTopologyV3?.jointUsed === true,
+                                artifactSig: nativeResult?.artifactSig || null,
+                                queryId: nativeResult?.queryId || null,
+                                omega: Number(nativeResult?.omega?.omega) || 0,
+                                regime: nativeResult?.omega?.regime || null,
+                                tagMemoUsed: false,
+                                geodesicRerankUsed: false,
+                                deduplicated: true,
+                                matchedTags:
+                                    nativeResult?.queryTags?.matchedTags || [],
+                                fallbackReason: null
+                            }
+                        };
+                    } catch (error) {
+                        fallbackReason = `rivermemo-failed: ${error.message}`;
+                        console.warn(
+                            '[RAGDiaryPlugin] ContextBridge retrieveDiary RiverMemo fallback:',
+                            error.message
+                        );
+                    }
+                } else if (riverMemo) {
+                    fallbackReason = 'rivermemo-unavailable';
+                }
 
                 if (tagMemo && typeof self.vectorDBManager.applyTagBoostAsync === 'function') {
                     try {
@@ -5499,11 +5965,16 @@ class RAGDiaryPlugin {
                     } catch (error) {
                         effectiveTagWeight = null;
                         preparedBoostResult = null;
-                        fallbackReason = `tagmemo-failed: ${error.message}`;
+                        const tagMemoFailure = `tagmemo-failed: ${error.message}`;
+                        fallbackReason = fallbackReason
+                            ? `${fallbackReason}; ${tagMemoFailure}`
+                            : tagMemoFailure;
                         console.warn('[RAGDiaryPlugin] ContextBridge retrieveDiary TagMemo fallback:', error.message);
                     }
                 } else if (tagMemo) {
-                    fallbackReason = 'tagmemo-unavailable';
+                    fallbackReason = fallbackReason
+                        ? `${fallbackReason}; tagmemo-unavailable`
+                        : 'tagmemo-unavailable';
                 }
 
                 const searchOptions = preparedBoostResult ? {
@@ -5534,6 +6005,8 @@ class RAGDiaryPlugin {
                 return {
                     results: Array.isArray(results) ? results : [],
                     meta: {
+                        riverMemoUsed: false,
+                        nativeJointQueryUsed: false,
                         tagMemoUsed: !!preparedBoostResult,
                         tagWeight: preparedBoostResult ? effectiveTagWeight : null,
                         geodesicRerankUsed: !!preparedBoostResult && geodesicRerank === true,
