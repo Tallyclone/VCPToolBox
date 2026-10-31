@@ -4,5 +4,10 @@
   "vulnerabilityHuntingMode": false,
   "toolSearchEnabled": false,
   "hybridCompressEnabled": false,
-  "teamMode": false
+  "teamMode": false,
+  "goal": {
+    "defaultTokenBudgetM": 2
+  },
+  "imageCompressEnabled": false,
+  "ultraTodoEnabled": false
 }
