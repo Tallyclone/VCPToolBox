@@ -222,11 +222,51 @@ test('B站普通关键词自动走搜索，BV号自动走获取', async () => {
     );
     assert.equal(fetchCall.name, 'BilibiliFetch');
     assert.equal(fetchCall.args.url, 'BV1CC4y1a7ee');
-    assert.equal(fetchCall.args.need_subs, 'true');
-    assert.equal(fetchCall.args.danmaku_num, '20');
-    assert.equal(fetchCall.args.comment_num, '20');
+    assert.equal(fetchCall.args.need_subs, 'false');
+    assert.equal(fetchCall.args.need_pbp, 'false');
+    assert.equal(fetchCall.args.danmaku_num, '0');
+    assert.equal(fetchCall.args.comment_num, '0');
     assert.equal(fetchCall.args.snapshots, '30,120');
     assert.equal(fetchCall.args.hd_snapshot, 'true');
+});
+
+// 保护自然语言到真实插件参数的公开契约：截图轻量返回，组合请求按需取数。
+test('B站内容选择覆盖截图、组合内容、排除项和连续调用', async (t) => {
+    const { planner, decisions } = makePlanner({ configured: true });
+    const full = { need_subs: 'true', need_pbp: 'true', danmaku_num: '20', comment_num: '20' };
+    const lean = { need_subs: 'false', need_pbp: 'false', danmaku_num: '0', comment_num: '0' };
+    const cases = [
+        ['普通获取', '获取视频【BV1mEnb6LEnC】的内容。', full],
+        ['复现达里奥会话', '获取视频【https://www.bilibili.com/video/BV1mEnb6LEnC/】的画面，并在[截图 95,148,598,678,688 秒]指定的时间点截取高清画面。', { ...lean, snapshots: '95,148,598,678,688', hd_snapshot: 'true' }],
+        ['复现边检员会话', '获取视频【https://www.bilibili.com/video/BV1yDn368En2/】的画面，并在[截图 12,55,100,145,195,245,295,340 秒]指定的时间点截取高清画面。', { ...lean, snapshots: '12,55,100,145,195,245,295,340', hd_snapshot: 'true' }],
+        ['首轮内容和截图一起取', '获取视频【BV1mEnb6LEnC】的字幕、评论、弹幕和高能进度条，并在[截图 30,120 秒]截取画面。', { ...full, snapshots: '30,120', hd_snapshot: 'true' }],
+        ['截图加字幕', '获取视频【BV1mEnb6LEnC】的字幕和[截图 30 秒]。', { ...lean, need_subs: 'true', snapshots: '30', hd_snapshot: 'true' }],
+        ['截图加默认数量评论', '获取视频【BV1mEnb6LEnC】的[截图 30 秒]和热门评论。', { ...lean, comment_num: '20', snapshots: '30', hd_snapshot: 'true' }],
+        ['截图加指定数量评论', '获取视频【BV1mEnb6LEnC】的[截图 30 秒]和 5 条热门评论。', { ...lean, comment_num: '5', snapshots: '30', hd_snapshot: 'true' }],
+        ['括号中的数量约束', '获取视频【BV1mEnb6LEnC】的[截图 30 秒][评论 5 条][弹幕 10 条]。', { ...lean, comment_num: '5', danmaku_num: '10', snapshots: '30', hd_snapshot: 'true' }],
+        ['单独获取高能时间点', '获取视频【BV1mEnb6LEnC】的[截图 30 秒]和弹幕热度。', { ...lean, need_pbp: 'true', snapshots: '30', hd_snapshot: 'true' }],
+        ['只要字幕', '只要视频【BV1mEnb6LEnC】的字幕。', { ...lean, need_subs: 'true' }],
+        ['只要评论', '只获取视频【BV1mEnb6LEnC】的 5 条评论。', { ...lean, comment_num: '5' }],
+        ['多个排除项', '获取视频【BV1mEnb6LEnC】的[截图 30 秒]和高能进度条，[不要字幕、评论和弹幕]。', { ...lean, need_pbp: 'true', snapshots: '30', hd_snapshot: 'true' }],
+        ['普通获取的排除项', '获取视频【BV1mEnb6LEnC】的内容，[无需字幕][不需要评论和弹幕]。', { ...full, need_subs: 'false', comment_num: '0', danmaku_num: '0' }],
+        ['字幕已获取时只补截图', '视频【BV1mEnb6LEnC】的字幕已经有了，只补[截图 30 秒]。', { ...lean, snapshots: '30', hd_snapshot: 'true' }],
+        ['小数和重复时间点', '获取视频【BV1mEnb6LEnC】的[截图 1.5，2.75，1.5 秒]。', { ...lean, snapshots: '1.5,2.75', hd_snapshot: 'true' }],
+        ['取消截图', '获取视频【BV1mEnb6LEnC】的内容，[不要截图]。', { ...full, hd_snapshot: 'false' }],
+        ['旧版简短取消指令', '获取视频【BV1mEnb6LEnC】的内容，[不截图]。', { ...full, hd_snapshot: 'false' }],
+        ['截图时间点标签', '获取视频【BV1mEnb6LEnC】的[截图时间点 30,120 秒]。', { ...lean, snapshots: '30,120', hd_snapshot: 'true' }],
+        ['数量为零', '获取视频【BV1mEnb6LEnC】的[截图 30 秒][评论 0][弹幕 0]。', { ...lean, snapshots: '30', hd_snapshot: 'true' }],
+        ['截图后重新普通获取', '获取视频【av12345】的内容。', full]
+    ];
+    for (const [label, request, expected] of cases) {
+        await t.test(label, async () => {
+            const [call] = await planner.plan(`请使用 {联网搜索} 中的 \`B站获取\`，${request}`);
+            assert.equal(call.name, 'BilibiliFetch');
+            const { url, ...selected } = call.args;
+            assert.ok(url);
+            assert.deepEqual(selected, expected);
+        });
+    }
+    assert.equal(decisions.length, 0);
 });
 
 test('图片生成默认使用 NanoBanana2，无图片为 generate', async () => {
@@ -407,6 +447,47 @@ test('点歌默认常规播放，八种中英文演出模式确定性映射', as
     );
     assert.equal(english.args.stageMode, 'luminous');
     assert.equal(decisions.length, 0);
+});
+
+test('获取音乐内容原生映射到分布式 MusicController，无需主要内容或模型裁决', async () => {
+    const { planner, decisions } = makePlanner({ configured: true });
+    const expressions = [
+        '获取音乐内容。',
+        '请获取当前歌曲的歌词。',
+        '{日用工具} 查看正在播放的音乐信息。',
+        '{音乐播放} 查询歌词。',
+        '{日用工具} `MusicController` 获取音乐内容。',
+        '{日用工具} `MusicController` [getCurrentLyrics]',
+        '{日用工具} 获取音乐内容【当前歌曲】[星诞]'
+    ];
+    for (const expression of expressions) {
+        const calls = await planner.plan(expression, { maid: 'Nova' });
+        assert.equal(calls.length, 1, expression);
+        assert.equal(calls[0].name, 'MusicController', expression);
+        assert.deepEqual(calls[0].args, {
+            command: 'getCurrentLyrics',
+            maid: 'Nova'
+        }, expression);
+        assert.equal(calls[0].jev.thirdParty, undefined);
+    }
+    assert.equal(decisions.length, 0);
+});
+
+test('音乐内容查询不会误识别主要负载，也不会放宽其他工具的必填内容', async () => {
+    const { planner } = makePlanner();
+    const [song] = await planner.plan('播放【获取音乐内容】');
+    assert.deepEqual(song.args, { command: 'playSong', songname: '获取音乐内容' });
+
+    const [memo] = await planner.plan('主动回忆【获取当前歌曲的歌词】');
+    assert.equal(memo.name, 'LightMemo');
+    assert.equal(memo.args.query, '获取当前歌曲的歌词');
+
+    await assert.rejects(planner.plan('{日用工具} 播放'), /缺少主要内容/);
+    await assert.rejects(planner.plan('{日用工具} `SciCalculator` 获取音乐内容'), /缺少主要内容/);
+    await assert.rejects(planner.plan('{联网搜索} 获取音乐内容'), /缺少主要内容/);
+
+    const [explicitMemo] = await planner.plan('{日用工具} `LightMemo` 获取音乐内容【音乐知识】');
+    assert.equal(explicitMemo.name, 'LightMemo');
 });
 
 test('大量并发规划保持调用参数隔离且全部使用确定性模板', async () => {
@@ -668,4 +749,69 @@ test('隐式能力推断保持保守，弱信号和不完整组合必须拒绝',
         planner.plan('请生成【一只猫】'),
         /缺少能力目录/
     );
+});
+
+test('ToolCallParser 提取参数时保留首行缩进与多行代码缩进', () => {
+    const rawCall = `
+<<<[TOOL_REQUEST]>>>
+tool_name:「始」FileEditor「末」
+content:「始」
+    def hello_world():
+        print("Hello")
+「末」
+inline_code:「始」  const a = 1;「末」
+<<<[END_TOOL_REQUEST]>>>
+    `;
+
+    const [call] = ToolCallParser.parse(rawCall);
+    assert.equal(call.name, 'FileEditor');
+    // 首行前导4空格必须被完整保留，末尾单独的换行被清理
+    assert.equal(call.args.content, '    def hello_world():\n        print("Hello")');
+    // 单行参数的前导2空格也必须完整保留
+    assert.equal(call.args.inline_code, '  const a = 1;');
+});
+test('ToolCallParser 消解 JEV 虚拟工具与实体插件参数歧义，支持顺序无关双轨解析', () => {
+    // 场景 1：实体工具显式声明 tool_name 且携带 jev 参数（正序）
+    const lightMemoCall1 = `
+<<<[TOOL_REQUEST]>>>
+maid:「始」星阑「末」
+tool_name:「始」LightMemo「末」
+query:「始」双调和超曲面「末」
+jev:「始」true「末」
+<<<[END_TOOL_REQUEST]>>>
+    `;
+    const [call1] = ToolCallParser.parse(lightMemoCall1);
+    assert.equal(call1.name, 'LightMemo');
+    assert.equal(call1.args.maid, '星阑');
+    assert.equal(call1.args.query, '双调和超曲面');
+    assert.equal(call1.args.jev, 'true');
+    assert.equal(call1.args.expression, undefined);
+
+    // 场景 2：字段倒序（jev 声明在 tool_name 之前）
+    const lightMemoCall2 = `
+<<<[TOOL_REQUEST]>>>
+maid:「始」星阑「末」
+jev:「始」rrf0.7「末」
+tool_name:「始」LightMemo「末」
+query:「始」空间形式 刚性谱系「末」
+<<<[END_TOOL_REQUEST]>>>
+    `;
+    const [call2] = ToolCallParser.parse(lightMemoCall2);
+    assert.equal(call2.name, 'LightMemo');
+    assert.equal(call2.args.maid, '星阑');
+    assert.equal(call2.args.query, '空间形式 刚性谱系');
+    assert.equal(call2.args.jev, 'rrf0.7');
+    assert.equal(call2.args.expression, undefined);
+
+    // 场景 3：纯 JEV 顶层虚拟调用
+    const jevVirtualCall = `
+<<<[TOOL_REQUEST]>>>
+maid:「始」星阑「末」
+JEV:「始」{联网搜索} 【2026年最新数学进展】「末」
+<<<[END_TOOL_REQUEST]>>>
+    `;
+    const [call3] = ToolCallParser.parse(jevVirtualCall);
+    assert.equal(call3.name, 'JEV');
+    assert.equal(call3.args.maid, '星阑');
+    assert.equal(call3.args.expression, '{联网搜索} 【2026年最新数学进展】');
 });

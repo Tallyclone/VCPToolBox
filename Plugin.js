@@ -18,6 +18,7 @@ const {
     createDefaultDependencyBridgeRegistry,
     createDefaultExecutionBridgeRegistry
 } = require('./modules/pluginBridgeRegistry');
+const jevThirdPartyRegistry = require('./modules/jevThirdPartyRegistry');
 
 const PLUGIN_DIR = path.join(__dirname, 'Plugin');
 const manifestFileName = 'plugin-manifest.json';
@@ -161,6 +162,7 @@ class PluginManager extends EventEmitter {
         });
         this.dependencyBridgeRegistry = createDefaultDependencyBridgeRegistry();
         this.executionBridgeRegistry = createDefaultExecutionBridgeRegistry();
+        this.jevRegistryGeneration = 0; // 防止并发重建时旧结果覆盖新结果
     }
 
     _sanitizeToolResultForAi(result) {
@@ -1027,6 +1029,7 @@ class PluginManager extends EventEmitter {
             }
 
             this.buildVCPDescription();
+            await this.buildJevPromptRegistry('local_reload');
             this.emit('tools_changed', { reason: 'local_reload' });
 
             // 首次启动由 server.js 显式初始化静态插件；后续重载则在这里协调
@@ -1084,6 +1087,74 @@ class PluginManager extends EventEmitter {
     // New method to get all individual descriptions
     getIndividualPluginDescriptions() {
         return this.individualPluginDescriptions;
+    }
+
+    /**
+     * JEV 第三方声明注册表（实验）。只收集和校验 manifest.jev，不改变任何运行时行为；
+     * 声明错误仅标记为 invalid，永不阻断普通插件加载。
+     */
+    async buildJevPromptRegistry(reason = 'rebuild') {
+        const generation = ++this.jevRegistryGeneration;
+        try {
+            const items = [];
+            for (const manifest of this.plugins.values()) {
+                if (!manifest || manifest.jev === undefined) continue;
+                items.push({
+                    manifest,
+                    enabled: true,
+                    origin: manifest.isDistributed ? 'cloud' : 'local',
+                    serverId: manifest.serverId || null,
+                    manifestFile: manifest.basePath
+                        ? path.relative(__dirname, path.join(manifest.basePath, manifestFileName))
+                        : null
+                });
+            }
+
+            let disabledPlugins = [];
+            try {
+                disabledPlugins = await this._discoverDisabledPluginManifests();
+            } catch (error) {
+                if (this.debugMode) console.warn(`[PluginManager] JEV registry skipped disabled manifests: ${error.message}`);
+            }
+            // 禁用插件只作为“不可用素材”展示，永远不可执行。
+            for (const item of disabledPlugins) {
+                if (item.manifest.jev === undefined || this.plugins.has(item.manifest.name)) continue;
+                items.push({
+                    manifest: item.manifest,
+                    enabled: false,
+                    origin: 'local',
+                    serverId: null,
+                    manifestFile: path.relative(__dirname, item.manifestPath)
+                });
+            }
+
+            if (generation !== this.jevRegistryGeneration) return null; // 已有更新的一轮重建
+            jevThirdPartyRegistry.reloadConfig();
+            const snapshot = jevThirdPartyRegistry.build(items);
+            if (snapshot.total > 0 || this.debugMode) {
+                console.log(`[PluginManager] JEV third-party registry rebuilt (${reason}): ${snapshot.validCount} valid, ${snapshot.invalidCount} invalid.`);
+            }
+            this.emit('jev_registry_changed', {
+                reason,
+                total: snapshot.total,
+                validCount: snapshot.validCount,
+                invalidCount: snapshot.invalidCount
+            });
+            return snapshot;
+        } catch (error) {
+            console.error(`[PluginManager] Failed to build JEV third-party registry (${reason}):`, error.message);
+            return null;
+        }
+    }
+
+    getJevPromptRegistry() {
+        return jevThirdPartyRegistry.getSnapshot();
+    }
+
+    _scheduleJevRegistryRebuild(reason) {
+        this.buildJevPromptRegistry(reason).catch(error => {
+            console.error(`[PluginManager] JEV registry rebuild failed (${reason}):`, error.message);
+        });
     }
 
     getAllPlaceholderValues() {
@@ -1272,6 +1343,8 @@ class PluginManager extends EventEmitter {
         }
         // --- 透明化处理结束 ---
 
+        // 审核留言属于回执元信息，不得混入插件执行参数。
+        let approvalFeedback = '';
         // --- 人工审核逻辑 (新增) ---
         const approvalDecision = this.toolApprovalManager.getApprovalDecision(toolName, pluginSpecificArgs);
         if (approvalDecision.requiresApproval) {
@@ -1328,24 +1401,50 @@ class PluginManager extends EventEmitter {
             try {
                 const approvalResult = await approvalPromise;
                 if (approvalResult && approvalResult.silentRejected === true) {
-                    if (this.debugMode) {
-                        console.log(`[PluginManager] Tool call for "${toolName}" (ID: ${requestId}) was rejected silently. Returning empty result to AI.`);
-                    }
+                    const userFeedback = typeof approvalResult.userFeedback === 'string'
+                        ? approvalResult.userFeedback.trim()
+                        : '';
                     const silentRejectionRecord = {
                         status: 'rejected',
                         success: false,
                         silentRejected: true,
                         error_type: 'approval_rejected',
                         rejected_by_user: true,
-                        message: `Tool call "${toolName}" was rejected silently by manual approval.`
+                        message: userFeedback
+                            ? `Tool call "${toolName}" was rejected by manual approval with user feedback.`
+                            : `Tool call "${toolName}" was rejected silently by manual approval.`,
+                        ...(userFeedback ? { user_feedback: userFeedback } : {})
                     };
                     toolCallRecordStore.finishRecord(managedToolCallRecord, {
                         success: false,
                         result: silentRejectionRecord,
                         error: silentRejectionRecord.message
                     });
-                    return undefined;
+
+                    // 无用户输入：archery 语义生效，静默吞掉回执，AI 完全无感。
+                    if (!userFeedback) {
+                        if (this.debugMode) {
+                            console.log(`[PluginManager] Tool call for "${toolName}" (ID: ${requestId}) was rejected silently. Returning empty result to AI.`);
+                        }
+                        return undefined;
+                    }
+
+                    // 有用户输入：优先传递用户反馈。
+                    // 走与普通拒绝完全同构的抛错路径，让上层既有错误链产出 isError=true，
+                    // archery 分支才能把内容写回对话而不是静默终止。
+                    if (this.debugMode) {
+                        console.log(`[PluginManager] Tool call for "${toolName}" (ID: ${requestId}) was rejected with user feedback; raising rejection to surface feedback to AI.`);
+                    }
+                    throw new Error(JSON.stringify({
+                        plugin_error: `Tool call "${toolName}" was REJECTED by manual approval. User feedback: ${userFeedback}`,
+                        error_type: 'approval_rejected',
+                        rejected_by_user: true,
+                        user_feedback: userFeedback
+                    }));
                 }
+                approvalFeedback = typeof approvalResult?.userFeedback === 'string'
+                    ? approvalResult.userFeedback.trim()
+                    : '';
                 if (this.debugMode) console.log(`[PluginManager] Tool call for "${toolName}" (ID: ${requestId}) approved.`);
             } catch (error) {
                 if (this.debugMode) console.warn(`[PluginManager] Tool call for "${toolName}" (ID: ${requestId}) rejected: ${error.message}`);
@@ -1395,7 +1494,15 @@ class PluginManager extends EventEmitter {
             );
 
             if (Object.prototype.hasOwnProperty.call(executionResult, 'shortCircuitResult')) {
-                const shortCircuitResult = executionResult.shortCircuitResult;
+                const originalShortCircuitResult = executionResult.shortCircuitResult;
+                const shortCircuitResult = approvalFeedback
+                    ? this._sanitizeToolResultForAi({
+                        ...(originalShortCircuitResult && typeof originalShortCircuitResult === 'object'
+                            ? originalShortCircuitResult
+                            : { original_plugin_output: originalShortCircuitResult }),
+                        __vcpApprovalFeedback: approvalFeedback
+                    })
+                    : originalShortCircuitResult;
                 this.toolLifecycleVcpInfo.emit(lifecycleContext, 'success', {
                     result: shortCircuitResult
                 });
@@ -1454,7 +1561,9 @@ class PluginManager extends EventEmitter {
                 resultFromPlugin = resultFromPlugin.result;
             }
 
-            let finalResultObject = (typeof resultFromPlugin === 'object' && resultFromPlugin !== null) ? resultFromPlugin : { original_plugin_output: resultFromPlugin };
+            let finalResultObject = Array.isArray(resultFromPlugin)
+                ? { content: resultFromPlugin }
+                : ((typeof resultFromPlugin === 'object' && resultFromPlugin !== null) ? resultFromPlugin : { original_plugin_output: resultFromPlugin });
 
             if (maidNameFromArgs) {
                 finalResultObject.MaidName = maidNameFromArgs;
@@ -1462,6 +1571,9 @@ class PluginManager extends EventEmitter {
             finalResultObject.timestamp = getFormattedLocalTimestamp();
             filterFuzzyDiff(finalResultObject, getFormattedLocalTimestamp());
 
+            if (approvalFeedback) {
+                finalResultObject.__vcpApprovalFeedback = approvalFeedback;
+            }
             const sanitizedResult = this._sanitizeToolResultForAi(finalResultObject);
             this.toolLifecycleVcpInfo.emit(lifecycleContext, 'success', {
                 result: sanitizedResult
@@ -1492,6 +1604,9 @@ class PluginManager extends EventEmitter {
                 errorObject.timestamp = getFormattedLocalTimestamp();
             }
             filterFuzzyDiff(errorObject, getFormattedLocalTimestamp());
+            if (approvalFeedback) {
+                errorObject.__vcpApprovalFeedback = approvalFeedback;
+            }
             const sanitizedErrorObject = this._sanitizeToolResultForAi(errorObject);
             toolCallRecordStore.finishRecord(managedToolCallRecord, {
                 success: false,
@@ -1840,12 +1955,20 @@ class PluginManager extends EventEmitter {
                 if (this.debugMode && normalizedReason) {
                     console.log(`[PluginManager] Manual approval for ${requestId} included user note: ${normalizedReason.substring(0, 300)}`);
                 }
-                approval.resolve();
+                approval.resolve(normalizedReason ? { userFeedback: normalizedReason } : undefined);
             } else if (approval.notifyAiOnReject === false) {
-                if (this.debugMode && normalizedReason) {
-                    console.log(`[PluginManager] Silent manual rejection for ${requestId} included user note hidden from AI: ${normalizedReason.substring(0, 300)}`);
+                // 静默拒绝只屏蔽“无用户输入”的回执；用户在审核框中填写的反馈必须优先回传给 AI。
+                if (normalizedReason) {
+                    if (this.debugMode) {
+                        console.log(`[PluginManager] Silent manual rejection for ${requestId} carries user feedback to AI: ${normalizedReason.substring(0, 300)}`);
+                    }
+                    approval.resolve({ silentRejected: true, userFeedback: normalizedReason });
+                } else {
+                    if (this.debugMode) {
+                        console.log(`[PluginManager] Silent manual rejection for ${requestId} without user note; nothing returned to AI.`);
+                    }
+                    approval.resolve({ silentRejected: true });
                 }
-                approval.resolve({ silentRejected: true });
             } else {
                 const rejectionMessage = normalizedReason
                     ? `Manual approval was REJECTED by user. User reason: ${normalizedReason}`
@@ -1945,6 +2068,7 @@ class PluginManager extends EventEmitter {
         }
         // 注册后重建描述，以包含新插件
         this.buildVCPDescription();
+        this._scheduleJevRegistryRebuild('distributed_register');
         this.emit('tools_changed', { reason: 'distributed_register', serverId });
     }
 
@@ -1972,6 +2096,7 @@ class PluginManager extends EventEmitter {
             console.log(`[PluginManager] Unregistered ${unregisteredCount} tools from server ${serverId}.`);
             // 注销后重建描述
             this.buildVCPDescription();
+            this._scheduleJevRegistryRebuild('distributed_unregister');
         }
 
         // 新增：清理分布式静态占位符
@@ -2493,7 +2618,9 @@ class PluginManager extends EventEmitter {
                 description: freshManifest.description || '',
                 version: freshManifest.version,
                 author: freshManifest.author,
-                capabilities: mergedCapabilities
+                capabilities: mergedCapabilities,
+                // jev 声明是纯提示词素材，不影响运行实例，可随元数据热更新。
+                jev: freshManifest.jev
             });
         } else {
             freshManifest.basePath = currentManifest.basePath || path.dirname(filePath);
@@ -2513,6 +2640,7 @@ class PluginManager extends EventEmitter {
         if (!refreshResult.refreshed) return refreshResult;
 
         this.buildVCPDescription();
+        await this.buildJevPromptRegistry('manifest_metadata_refresh');
         this.emit('tools_changed', {
             reason: 'manifest_metadata_refresh',
             pluginNames: [refreshResult.pluginName],
@@ -2571,6 +2699,7 @@ class PluginManager extends EventEmitter {
 
                 if (metadataOnly && refreshedNames.length > 0) {
                     this.buildVCPDescription();
+                    await this.buildJevPromptRegistry('manifest_metadata_refresh');
                     this.emit('tools_changed', {
                         reason: 'manifest_metadata_refresh',
                         pluginNames: refreshedNames,

@@ -26,7 +26,7 @@ replace:「始」<span style="font-size:52px;">22°C</span>「末」
 <<<[DESKTOP_PUSH_END]>>>
 
 创建的widget直接运行在内存中，当用户选择收藏widget对应挂件会被持久化储存。
-被收藏的widget储存于.\VCPChat\AppData\DesktopWidgets目录，被储存的Widget允许调用同目录下的内部外挂js文件，且支持访问vchat应用群所有依赖，ipc。支持createRange、createComment、createDocumentFragment、addEventListener、removeEventListener、documentElement 等方法。
+被收藏的widget储存于{{VarVchatPath}}\AppData\DesktopWidgets目录，被储存的Widget允许调用同目录下的内部外挂js文件，且支持访问vchat应用群所有依赖，ipc。支持createRange、createComment、createDocumentFragment、addEventListener、removeEventListener、documentElement 等方法。
 
 ## 3. JS 沙箱与 Shadow DOM 开发限制
 *   **局部封闭**：DOM 增删改查、样式和事件绑定必须限制在主容器内（如 `<div id="app">`）。禁用 `document.body`、`document.head`，禁止全局 `window` 事件监听（因事件重定向无法获取真实 target），CSS 禁用 `body`/`html` 选择器且不适用全局 Tailwind。
